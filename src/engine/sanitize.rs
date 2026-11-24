@@ -1,8 +1,40 @@
-//! Text stream sanitization and runaway-repetition circuit breaker.
+//! Text stream sanitization, SSE line parsing, and runaway-repetition circuit breaker.
 //!
-//! Provides stateful runaway-repetition detection across streamed LLM deltas,
-//! combining single-character thresholding with linear-time Z-algorithm
-//! periodicity scanning over arbitrary pattern lengths.
+//! Provides shared SSE `data:` line framing and stateful runaway-repetition
+//! detection across streamed LLM deltas, combining single-character
+//! thresholding with linear-time Z-algorithm periodicity scanning over arbitrary
+//! pattern lengths.
+
+/// Parsed representation of a single SSE line.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SseLine {
+    /// Non-`data:` line (comment, event name, blank separator) or empty `data:` payload.
+    Ignore,
+    /// End-of-stream sentinel (`data: [DONE]`).
+    Done,
+    /// Decoded JSON frame from a `data:` line.
+    Json(serde_json::Value),
+    /// A `data:` line whose payload failed JSON decoding.
+    Malformed(String),
+}
+
+/// Parse a single SSE line into a structured [`SseLine`].
+pub fn parse_sse_line(line: &str) -> SseLine {
+    let Some(raw) = line.trim().strip_prefix("data:") else {
+        return SseLine::Ignore;
+    };
+    let payload = raw.trim();
+    if payload.is_empty() {
+        return SseLine::Ignore;
+    }
+    if payload == "[DONE]" {
+        return SseLine::Done;
+    }
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(val) => SseLine::Json(val),
+        Err(e) => SseLine::Malformed(e.to_string()),
+    }
+}
 
 /// Characters that appear in long consecutive runs in model output (git-diff
 /// '+' hunks, code, URLs, JSON, math).
@@ -179,5 +211,28 @@ impl RepetitionDetector {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sse_line_handles_all_variants() {
+        assert_eq!(parse_sse_line(""), SseLine::Ignore);
+        assert_eq!(parse_sse_line(": keepalive"), SseLine::Ignore);
+        assert_eq!(parse_sse_line("event: message"), SseLine::Ignore);
+        assert_eq!(parse_sse_line("data:   "), SseLine::Ignore);
+        assert_eq!(parse_sse_line("data: [DONE]"), SseLine::Done);
+        assert_eq!(parse_sse_line("data:[DONE]\r"), SseLine::Done);
+        assert!(matches!(
+            parse_sse_line(r#"data: {"choices":[]}"#),
+            SseLine::Json(v) if v["choices"].is_array()
+        ));
+        assert!(matches!(
+            parse_sse_line("data: {not json"),
+            SseLine::Malformed(_)
+        ));
     }
 }

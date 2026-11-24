@@ -1,6 +1,8 @@
 //! Autonomous multi-turn session loop and terminal outcome resolution.
 
 use futures_util::future::join_all;
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
 
 use crate::engine::{Message, ToolCall, ToolSchema};
 use crate::runner::budget::{LOOP_THRESHOLD, LOOP_WINDOW};
@@ -51,6 +53,132 @@ fn is_phase1_read(name: &str) -> bool {
 /// Tools executing in Phase 2 (Partitioned file mutations).
 fn is_phase2_write(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file" | "ast_replace")
+}
+
+/// Resolve the canonical target file key for a Phase 2 mutation call so
+/// writes to distinct files execute concurrently while writes to the same
+/// file serialize in dispatch order. Returns `None` for directory-wide or
+/// unkeyed mutations (such as workspace-wide `ast_replace`), which execute as
+/// a sequential barrier.
+fn canonical_write_key(tc: &ToolCall, workspace: Option<&Path>) -> Option<PathBuf> {
+    let args: serde_json::Value = serde_json::from_str(&tc.arguments).ok()?;
+    let raw = args.get("path").and_then(|v| v.as_str())?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let host_path = crate::platform::to_host_path(raw);
+    let joined = if host_path.is_absolute() {
+        host_path
+    } else if let Some(ws) = workspace {
+        ws.join(host_path)
+    } else {
+        host_path
+    };
+
+    let mut norm = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !norm.pop() {
+                    norm.push(comp);
+                }
+            }
+            other => norm.push(other),
+        }
+    }
+
+    if tc.name == "ast_replace" && norm.is_dir() {
+        return None;
+    }
+
+    if let Ok(canon) = std::fs::canonicalize(&norm) {
+        return Some(canon);
+    }
+
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = norm.as_path();
+    while let Some(name) = cur.file_name() {
+        tail.push(name.to_os_string());
+        if let Some(parent) = cur.parent() {
+            let probe = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            if let Ok(canon_parent) = std::fs::canonicalize(probe) {
+                let mut out = canon_parent;
+                for seg in tail.into_iter().rev() {
+                    #[cfg(windows)]
+                    let seg = std::ffi::OsString::from(seg.to_string_lossy().to_ascii_lowercase());
+                    out.push(seg);
+                }
+                return Some(out);
+            }
+            cur = parent;
+        } else {
+            break;
+        }
+    }
+
+    #[cfg(windows)]
+    let norm = PathBuf::from(norm.to_string_lossy().to_ascii_lowercase());
+    Some(norm)
+}
+
+async fn execute_phase2_writes<'a>(
+    executor: &dyn ToolExecutor,
+    phase2: Vec<(usize, &'a ToolCall)>,
+    workspace: Option<&Path>,
+) -> Vec<(usize, &'a ToolCall, ToolOutcome)> {
+    async fn run_one<'a>(
+        executor: &dyn ToolExecutor,
+        idx: usize,
+        tc: &'a ToolCall,
+    ) -> (usize, &'a ToolCall, ToolOutcome) {
+        let outcome = match executor.execute(&tc.name, &tc.arguments).await {
+            Ok(o) => o,
+            Err(e) => ToolOutcome {
+                text: format!("Error: {e}"),
+            },
+        };
+        (idx, tc, outcome)
+    }
+
+    async fn flush_wave<'a>(
+        executor: &dyn ToolExecutor,
+        wave: &mut BTreeMap<PathBuf, Vec<(usize, &'a ToolCall)>>,
+        results: &mut Vec<(usize, &'a ToolCall, ToolOutcome)>,
+    ) {
+        if wave.is_empty() {
+            return;
+        }
+        let groups = std::mem::take(wave);
+        let futs = groups.into_values().map(|calls| async move {
+            let mut group_out = Vec::with_capacity(calls.len());
+            for (idx, tc) in calls {
+                group_out.push(run_one(executor, idx, tc).await);
+            }
+            group_out
+        });
+        for group_out in join_all(futs).await {
+            results.extend(group_out);
+        }
+    }
+
+    let mut results = Vec::with_capacity(phase2.len());
+    let mut wave: BTreeMap<PathBuf, Vec<(usize, &'a ToolCall)>> = BTreeMap::new();
+    for (idx, tc) in phase2 {
+        match canonical_write_key(tc, workspace) {
+            Some(key) => wave.entry(key).or_default().push((idx, tc)),
+            None => {
+                flush_wave(executor, &mut wave, &mut results).await;
+                results.push(run_one(executor, idx, tc).await);
+            }
+        }
+    }
+    flush_wave(executor, &mut wave, &mut results).await;
+    results
 }
 
 /// Idempotent read-only tools whose results may be deduplicated: re-reading
@@ -205,10 +333,9 @@ fn dedup_tool_content(messages: &[Message], tc: &ToolCall, sanitized: &str) -> S
             continue;
         }
         return format!(
-            "[Unchanged: byte-identical to prior `{}` result earlier in this session \
-             ({} bytes). Reuse the content already in context above.]",
-            tc.name,
-            sanitized.len()
+            "[Unchanged: byte-identical to prior `{}` result earlier in this session. \
+             Reuse the content already in context above.]",
+            tc.name
         );
     }
     sanitized.to_string()
@@ -545,17 +672,9 @@ pub async fn run_session(
         });
         let phase1_results = join_all(phase1_futures).await;
 
-        // Phase 2 (Partitioned Writes - Barrier 1)
-        let mut phase2_results = Vec::with_capacity(phase2.len());
-        for (idx, tc) in phase2 {
-            let outcome = match executor.execute(&tc.name, &tc.arguments).await {
-                Ok(o) => o,
-                Err(e) => ToolOutcome {
-                    text: format!("Error: {e}"),
-                },
-            };
-            phase2_results.push((idx, tc, outcome));
-        }
+        // Phase 2 (File-Partitioned Concurrent Writes - Barrier 1)
+        let workspace_dir = options.and_then(|o| o.workspace.as_deref());
+        let phase2_results = execute_phase2_writes(executor, phase2, workspace_dir).await;
 
         // Phase 3 (Bash Barrier - Barrier 2)
         let mut phase3_results = Vec::with_capacity(phase3.len());
@@ -1011,9 +1130,9 @@ mod tests {
             second_result.content
         );
         assert!(
-            second_result
-                .content
-                .contains(&format!("({} bytes)", big.len()))
+            !second_result.content.contains("bytes)"),
+            "dedup pointer must not emit byte-count noise, got: {}",
+            second_result.content
         );
 
         let _ = std::fs::remove_dir_all(state.root());

@@ -400,7 +400,7 @@ impl FsExecutor {
         let not_found_msg = |path: &str| {
             format!(
                 "Target content not found in file: {path}. \
-                 Re-read the file with read_file around the target lines to refresh content before retrying."
+                 Verify the exact lines and relative indentation with read_file before retrying."
             )
         };
 

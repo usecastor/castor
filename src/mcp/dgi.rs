@@ -40,13 +40,17 @@ const CLASSIFY_RUBRIC: &str = concat!(
 const VERDICT_ADMIT: &str = "ADMIT";
 const VERDICT_OVERLOADED: &str = "OVERLOADED";
 
+/// Lower log-odds bound for the advisory `Review` tier (`delta_z >= -0.5`).
+/// Strong `ADMIT` predictions (`delta_z < -0.5`) proceed directly as `Admit`.
+const REVIEW_FLOOR: f64 = -0.5;
+
 /// Verdict of the DGI Gatekeeper for a dispatch prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DgiVerdict {
     /// Bounded single-concern spec: proceed without commentary.
     Admit,
-    /// Advisory DGI note: proceed, but flag for decomposition.
-    Review(u32),
+    /// Advisory DGI note: proceed, carrying the calibrated log-odds margin `delta_z`.
+    Review(f64),
     /// The model classified an overloaded dispatch: fail fast.
     Reject(Vec<String>),
 }
@@ -56,7 +60,7 @@ impl DgiVerdict {
         matches!(self, Self::Reject(_))
     }
 
-    pub fn score(&self) -> Option<u32> {
+    pub fn score(&self) -> Option<f64> {
         match self {
             Self::Review(s) => Some(*s),
             _ => None,
@@ -172,8 +176,8 @@ fn verdict_from_logprobs(
                 Ok(DgiVerdict::Reject(vec![format!(
                     "Model-classified monolithic multi-subsystem dispatch (OVERLOADED, log-odds margin {delta_z:.3} > {reject_margin})"
                 )]))
-            } else if delta_z.abs() <= reject_margin {
-                Ok(DgiVerdict::Review(1))
+            } else if delta_z >= REVIEW_FLOOR {
+                Ok(DgiVerdict::Review(delta_z))
             } else {
                 Ok(DgiVerdict::Admit)
             }
@@ -230,6 +234,8 @@ fn probe_request(
             "temperature": 0.0,
             "max_tokens": 64,
             "reasoning_effort": "none",
+            "logprobs": true,
+            "top_logprobs": 20,
             "response_format": {"type": "json_object", "schema": {
                 "type": "object", "properties": {"verdict": {"type": "string", "enum": [VERDICT_ADMIT, VERDICT_OVERLOADED]}},
                 "required": ["verdict"], "additionalProperties": false
@@ -238,9 +244,56 @@ fn probe_request(
     }
 }
 
+/// Extract a calibrated log-odds verdict from `choices[0].logprobs.content`
+/// on Chat Completions (`JsonSchemaChat`) responses. Locates the token step
+/// where the verdict value (`ADMIT` / `OVERLOADED`) begins and feeds its
+/// quote-trimmed `top_logprobs` array into [`verdict_from_logprobs`].
+fn decode_chat_logprobs(choice: &serde_json::Value, reject_margin: f64) -> Option<DgiVerdict> {
+    let steps = choice.get("logprobs")?.get("content")?.as_array()?;
+    fn normalize(tok: &str) -> &str {
+        tok.trim().trim_matches('"')
+    }
+
+    let verdict_step = steps
+        .iter()
+        .find(|step| {
+            let Some(tok) = step.get("token").and_then(|v| v.as_str()) else {
+                return false;
+            };
+            let t = normalize(tok);
+            is_choice_prefix(t, VERDICT_ADMIT, 2) || is_choice_prefix(t, VERDICT_OVERLOADED, 2)
+        })
+        .or_else(|| {
+            steps.iter().find(|step| {
+                let Some(tok) = step.get("token").and_then(|v| v.as_str()) else {
+                    return false;
+                };
+                matches!(normalize(tok), "A" | "O")
+            })
+        })?;
+
+    let top_lps = verdict_step.get("top_logprobs")?.as_array()?;
+    let normalized_lps: Vec<serde_json::Value> = top_lps
+        .iter()
+        .filter_map(|entry| {
+            let tok = entry.get("token")?.as_str()?;
+            let lp = entry.get("logprob")?.as_f64()?;
+            Some(json!({
+                "token": normalize(tok),
+                "logprob": lp,
+            }))
+        })
+        .collect();
+    if normalized_lps.is_empty() {
+        return None;
+    }
+    verdict_from_logprobs(&serde_json::Value::Array(normalized_lps), reject_margin).ok()
+}
+
 /// Decode the probe response for either shape: the guided-choice shape reads
 /// the first decoded token (with a logprobs margin when available); the chat
-/// shape reads the JSON verdict field.
+/// shape validates the JSON verdict field and scores `choices[0].logprobs.content`
+/// when present, falling back to the discrete JSON verdict when omitted.
 fn decode_probe_response(
     probe_shape: crate::engine::backend::ProbeShape,
     val: &serde_json::Value,
@@ -251,10 +304,11 @@ fn decode_probe_response(
             decode_verdict(val, reject_margin)
         }
         crate::engine::backend::ProbeShape::JsonSchemaChat => {
-            if val["choices"][0]["finish_reason"] == "length" {
+            let choice = &val["choices"][0];
+            if choice["finish_reason"] == "length" {
                 return Err("dispatch gate response exceeded its token limit".into());
             }
-            let content = val["choices"][0]["message"]["content"]
+            let content = choice["message"]["content"]
                 .as_str()
                 .ok_or("missing dispatch gate content")?;
             #[derive(serde::Deserialize)]
@@ -264,13 +318,14 @@ fn decode_probe_response(
             }
             let verdict: ProbeVerdict = serde_json::from_str(content)
                 .map_err(|e| format!("malformed dispatch gate verdict: {e}"))?;
-            match verdict.verdict.as_str() {
-                "ADMIT" => Ok(DgiVerdict::Admit),
-                "OVERLOADED" => Ok(DgiVerdict::Reject(vec![
+            let discrete = match verdict.verdict.as_str() {
+                "ADMIT" => DgiVerdict::Admit,
+                "OVERLOADED" => DgiVerdict::Reject(vec![
                     "Model-classified monolithic multi-subsystem dispatch (OVERLOADED)".into(),
-                ])),
-                _ => Err("dispatch gate verdict must be ADMIT or OVERLOADED".into()),
-            }
+                ]),
+                _ => return Err("dispatch gate verdict must be ADMIT or OVERLOADED".into()),
+            };
+            Ok(decode_chat_logprobs(choice, reject_margin).unwrap_or(discrete))
         }
     }
 }
@@ -461,23 +516,31 @@ mod tests {
 
     #[test]
     fn logprob_margin_tie_is_advisory_review() {
-        // Near-tie: delta_z = -0.7 - (-0.5) = -0.2. |−0.2| ≤ 1.5 → Review(1).
+        // Near-tie: delta_z = -0.7 - (-0.5) = -0.2 in [-0.5, 1.5] → Review(-0.2).
         let top = json!([
             {"token": " ADMIT", "logprob": -0.5},
             {"token": " OVERLOADED", "logprob": -0.7}
         ]);
-        assert_eq!(
-            verdict_from_logprobs(&top, 1.5).unwrap(),
-            DgiVerdict::Review(1)
+        let v1 = verdict_from_logprobs(&top, 1.5).unwrap();
+        assert!(
+            matches!(v1, DgiVerdict::Review(z) if (z - (-0.2)).abs() < 1e-9),
+            "expected Review(-0.2), got {v1:?}"
         );
-        // Exact boundary: delta_z = -1.5 - 0.0 = -1.5. |−1.5| = 1.5 ≤ 1.5 → Review(1).
+        // Strong ADMIT: delta_z = -1.5 - 0.0 = -1.5 < -0.5 → Admit (not flagged as Review).
         let top = json!([
             {"token": " ADMIT", "logprob": 0.0},
             {"token": " OVERLOADED", "logprob": -1.5}
         ]);
-        assert_eq!(
-            verdict_from_logprobs(&top, 1.5).unwrap(),
-            DgiVerdict::Review(1)
+        assert_eq!(verdict_from_logprobs(&top, 1.5).unwrap(), DgiVerdict::Admit);
+        // Mildly overloaded below reject_margin: delta_z = -0.2 - (-1.0) = 0.8 <= 1.5 → Review(0.8).
+        let top = json!([
+            {"token": " ADMIT", "logprob": -1.0},
+            {"token": " OVERLOADED", "logprob": -0.2}
+        ]);
+        let v2 = verdict_from_logprobs(&top, 1.5).unwrap();
+        assert!(
+            matches!(v2, DgiVerdict::Review(z) if (z - 0.8).abs() < 1e-9),
+            "expected Review(0.8), got {v2:?}"
         );
         // Just past: delta_z = 1.6 - 0.0 = 1.6 > 1.5 → Reject.
         let top = json!([
@@ -604,7 +667,10 @@ mod tests {
         let verdict = evaluate_model_probe(&base_url, "test-model", "task", 1.5, &http)
             .await
             .unwrap();
-        assert_eq!(verdict, DgiVerdict::Review(1));
+        assert!(
+            matches!(verdict, DgiVerdict::Review(z) if (z - (-0.1)).abs() < 1e-9),
+            "expected Review(-0.1), got {verdict:?}"
+        );
     }
 
     #[test]
@@ -748,5 +814,89 @@ mod tests {
             .unwrap();
         assert_eq!(verdict, DgiVerdict::Admit);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn json_schema_chat_probe_requests_logprobs_and_scores_review_band() {
+        let req = probe_request(
+            crate::engine::backend::ProbeShape::JsonSchemaChat,
+            "Ternary-Bonsai-2-9B-Q2_0",
+            "refactor subsystem",
+        );
+        assert_eq!(req["logprobs"], json!(true));
+        assert_eq!(req["top_logprobs"], json!(20));
+
+        // Near-tie in choices[0].logprobs.content (delta_z = -0.25 - (-0.50) = +0.25 <= 1.2) -> Review(0.25).
+        let chat_review = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": r#"{"verdict":"OVERLOADED"}"#},
+                "logprobs": {
+                    "content": [
+                        {"token": "{\"", "logprob": 0.0, "top_logprobs": [{"token": "{\"", "logprob": 0.0}]},
+                        {"token": "verdict", "logprob": 0.0, "top_logprobs": [{"token": "verdict", "logprob": 0.0}]},
+                        {"token": "\":\"", "logprob": 0.0, "top_logprobs": [{"token": "\":\"", "logprob": 0.0}]},
+                        {"token": "OVER", "logprob": -0.25, "top_logprobs": [
+                            {"token": "OVER", "logprob": -0.25},
+                            {"token": "AD", "logprob": -0.50}
+                        ]},
+                        {"token": "LOADED", "logprob": 0.0, "top_logprobs": [{"token": "LOADED", "logprob": 0.0}]}
+                    ]
+                }
+            }]
+        });
+        let verdict = decode_probe_response(
+            crate::engine::backend::ProbeShape::JsonSchemaChat,
+            &chat_review,
+            1.2,
+        )
+        .unwrap();
+        assert!(
+            matches!(verdict, DgiVerdict::Review(z) if (z - 0.25).abs() < 1e-9),
+            "expected Review(0.25), got {verdict:?}"
+        );
+
+        // Strong OVERLOADED margin (delta_z = -0.25 - (-1.583) = 1.333 > 1.2) -> Reject.
+        let chat_reject = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": r#"{"verdict":"OVERLOADED"}"#},
+                "logprobs": {
+                    "content": [
+                        {"token": "{\"verdict\":\"", "logprob": 0.0, "top_logprobs": [{"token": "{\"verdict\":\"", "logprob": 0.0}]},
+                        {"token": "\"OVER", "logprob": -0.25, "top_logprobs": [
+                            {"token": "\"OVER", "logprob": -0.25},
+                            {"token": "\"AD", "logprob": -1.583}
+                        ]}
+                    ]
+                }
+            }]
+        });
+        assert!(
+            decode_probe_response(
+                crate::engine::backend::ProbeShape::JsonSchemaChat,
+                &chat_reject,
+                1.2,
+            )
+            .unwrap()
+            .is_reject()
+        );
+
+        // When logprobs are omitted, discrete JSON verdict fallback applies.
+        let chat_no_lps = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": r#"{"verdict":"ADMIT"}"#}
+            }]
+        });
+        assert_eq!(
+            decode_probe_response(
+                crate::engine::backend::ProbeShape::JsonSchemaChat,
+                &chat_no_lps,
+                1.2,
+            )
+            .unwrap(),
+            DgiVerdict::Admit
+        );
     }
 }

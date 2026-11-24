@@ -256,11 +256,12 @@ pub async fn run_job_with_engine(
         if let crate::mcp::dgi::DgiVerdict::Review(score) = &dgi {
             tracing::info!(
                 session_id = %spec.session_id,
-                score = score,
-                "[dgi] task admitted under Review tier (0 < delta_z <= 1.2)"
+                delta_z = %format!("{score:.3}"),
+                "[dgi] task admitted under Review tier (-0.5 <= delta_z <= {})",
+                config.dgi_reject_margin
             );
             dgi_review_advisory = Some(format!(
-                "\n\n[DGI Advisory]\nNotice: Dispatch scope leans broad (margin in Review tier, score {score}). Maintain strict single-subsystem focus and tight verification gates to avoid reasoning ceiling exhaustion."
+                "\n\n[DGI Advisory]\nNotice: Dispatch scope leans broad (log-odds margin {score:.3} in Review tier). Maintain strict single-subsystem focus and tight verification gates to avoid reasoning ceiling exhaustion."
             ));
         }
 

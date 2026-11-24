@@ -396,13 +396,13 @@ pub(super) fn load_task_metrics_cached(
         }
 
         match status.as_str() {
-            "completed" => {
+            "completed" | "completed_with_salvage" => {
                 metrics.completed += 1;
                 if let Some(ms) = exec {
                     metrics.total_execution_ms += ms;
                 }
             }
-            "failed" => {
+            "failed" | "rejected_decomposition" => {
                 metrics.failed += 1;
                 if let Some(ms) = exec {
                     metrics.total_execution_ms += ms;
@@ -1943,6 +1943,26 @@ mod tests {
         assert_eq!(s.total_tasks_cancelled, 1);
         // 300 + 5_400_000 ms; task_c and cancelled task_d contribute nothing.
         assert_eq!(s.total_task_execution_ms, 5_400_300);
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn derive_stats_counts_salvage_and_rejected_decomposition() {
+        let state = tmp_state();
+        write(
+            &state.join("tasks/task_salvage.json"),
+            "{\"id\":\"task_salvage\",\"status\":\"completed_with_salvage\",\"started_at\":1760000000000,\"ended_at\":1760000002500}",
+        );
+        write(
+            &state.join("tasks/task_rejected.json"),
+            "{\"id\":\"task_rejected\",\"status\":\"rejected_decomposition\",\"created_at\":1760000003000,\"ended_at\":1760000003100}",
+        );
+
+        let s = derive_stats(&state, &Default::default());
+        assert_eq!(s.total_tasks_completed, 1);
+        assert_eq!(s.total_tasks_failed, 1);
+        assert_eq!(s.total_task_execution_ms, 2_500);
 
         let _ = fs::remove_dir_all(&state);
     }

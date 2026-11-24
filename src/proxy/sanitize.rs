@@ -13,7 +13,8 @@ use encoding_rs::{CoderResult, Decoder, UTF_8};
 // ---------------------------------------------------------------------------
 
 pub use crate::engine::sanitize::{
-    MIN_PATTERN_REPEATS, PATTERN_REPEAT_COUNT, Repetition, RepetitionDetector,
+    MIN_PATTERN_REPEATS, PATTERN_REPEAT_COUNT, Repetition, RepetitionDetector, SseLine,
+    parse_sse_line,
 };
 
 /// Extract non-empty streamed text deltas (reasoning, content, tool-call arguments)
@@ -219,16 +220,12 @@ impl SseSanitizer {
     /// (\[DONE\], error frames, repetition breaker) that terminate the stream,
     /// or `None` for lines that should be passed through as-is.
     fn process_line(&mut self, line: &str) -> Option<String> {
-        let trimmed = line.trim();
-        if trimmed == "data: [DONE]" {
-            self.done = true;
-            return Some("data: [DONE]\n\n".to_string());
-        }
-        if let Some(stripped) = trimmed.strip_prefix("data: ") {
-            let payload = stripped.trim();
-            if payload.starts_with('{')
-                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(payload)
-            {
+        match parse_sse_line(line) {
+            SseLine::Done => {
+                self.done = true;
+                return Some("data: [DONE]\n\n".to_string());
+            }
+            SseLine::Json(parsed) => {
                 if let Some(m) = parsed.get("model").and_then(|v| v.as_str()) {
                     self.last_model = Some(m.to_string());
                 }
@@ -270,6 +267,7 @@ impl SseSanitizer {
                     }
                 }
             }
+            SseLine::Ignore | SseLine::Malformed(_) => {}
         }
         None
     }
@@ -353,10 +351,7 @@ fn sanitize_item(item: &mut serde_json::Value, modified: &mut bool) {
 }
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::platform::now_epoch_ms() / 1000
 }
 
 // ---------------------------------------------------------------------------

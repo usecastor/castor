@@ -525,3 +525,118 @@ async fn adversarial_consolidated_turn_advisory_once_at_end_when_no_bash() {
         }
     }
 }
+
+/// (5) True File-Partitioned Concurrent Phase 2 Writes:
+/// - Writes targeting *distinct* canonical paths run concurrently.
+/// - Writes targeting the *same* canonical path (even via `./src/a.rs` vs `src/a.rs`)
+///   serialize strictly in dispatch order.
+/// - Result messages remain deterministically sorted by original tool_call index.
+#[tokio::test]
+async fn adversarial_phase2_partitioned_concurrent_and_same_file_serial_writes() {
+    struct PathTrackingExecutor {
+        records: Mutex<Vec<(String, Instant, Instant)>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for PathTrackingExecutor {
+        async fn execute(&self, name: &str, args_json: &str) -> Result<ToolOutcome, ToolError> {
+            let v: serde_json::Value = serde_json::from_str(args_json).unwrap();
+            let path = v["path"].as_str().unwrap_or("").to_string();
+            let delay = Duration::from_millis(35);
+            let start = Instant::now();
+            tokio::time::sleep(delay).await;
+            let end = Instant::now();
+            self.records
+                .lock()
+                .await
+                .push((format!("{name}:{path}"), start, end));
+            Ok(ToolOutcome {
+                text: format!("ok:{path}"),
+            })
+        }
+    }
+
+    let state = tmp_state();
+    let logger = EventLogger::new(&state, "test_phase2_partition");
+
+    // c0: write_file src/a.rs (35ms)
+    // c1: write_file src/b.rs (35ms) -> distinct file, runs concurrently with c0
+    // c2: edit_file ./src/a.rs (35ms) -> same canonical path as c0, MUST wait for c0
+    let turn1_tools = vec![
+        tc(
+            "c0",
+            0,
+            "write_file",
+            r#"{"path":"src/a.rs","content":"a1"}"#,
+        ),
+        tc(
+            "c1",
+            1,
+            "write_file",
+            r#"{"path":"src/b.rs","content":"b1"}"#,
+        ),
+        tc(
+            "c2",
+            2,
+            "edit_file",
+            r#"{"path":"./src/a.rs","target":"a1","replacement":"a2"}"#,
+        ),
+    ];
+
+    let engine = ScriptedEngine::new(vec![
+        comp("Partitioned Phase 2 writes", turn1_tools),
+        comp("Done", vec![]),
+    ]);
+    let executor = PathTrackingExecutor {
+        records: Mutex::new(Vec::new()),
+    };
+    let options = SessionOptions::with_state(state);
+    let tools = dummy_tools();
+
+    let res = run_session(
+        &engine,
+        &executor,
+        &logger,
+        "System",
+        "Run partitioned writes",
+        &tools,
+        Some(&options),
+    )
+    .await;
+    assert!(res.is_ok());
+
+    let recs = executor.records.lock().await.clone();
+    assert_eq!(recs.len(), 3);
+    let a1 = recs.iter().find(|r| r.0 == "write_file:src/a.rs").unwrap();
+    let b1 = recs.iter().find(|r| r.0 == "write_file:src/b.rs").unwrap();
+    let a2 = recs.iter().find(|r| r.0 == "edit_file:./src/a.rs").unwrap();
+
+    // Same-file serialization: edit_file ./src/a.rs starts AFTER write_file src/a.rs ends.
+    assert!(
+        a2.1 >= a1.2,
+        "Same-file writes must serialize: a1 ended {:?}, a2 started {:?}",
+        a1.2,
+        a2.1
+    );
+    // Distinct-file concurrency: b1 and a1 intervals must overlap (started before the other ended).
+    assert!(
+        b1.1 < a1.2 && a1.1 < b1.2,
+        "Distinct files in Phase 2 must overlap concurrently: a1=({:?}..{:?}), b1=({:?}..{:?})",
+        a1.1,
+        a1.2,
+        b1.1,
+        b1.2
+    );
+
+    // Deterministic index-sorted result ordering preserved: c0, c1, c2.
+    let recorded = engine.recorded_calls().await;
+    let tool_msgs: Vec<&Message> = recorded[1]
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .collect();
+    assert_eq!(tool_msgs.len(), 3);
+    assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("c0"));
+    assert_eq!(tool_msgs[1].tool_call_id.as_deref(), Some("c1"));
+    assert_eq!(tool_msgs[2].tool_call_id.as_deref(), Some("c2"));
+}

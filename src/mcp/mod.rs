@@ -397,6 +397,7 @@ impl CastorMcpServer {
              > [!TIP]\n\
              > **Castor Engine Status: ACTIVELY EXECUTING**\n\
              > Task `{task_id}` dispatched to background worker.\n\
+             - **CLI Wait**: `castor wait {task_id}`\n\
              - **Wait Command**: `{wait_cmd_win}` (WSL: `{wait_cmd_wsl}`)\n\
              - **Status Command**: `{status_cmd}`"
         );
@@ -523,7 +524,8 @@ impl CastorMcpServer {
                             text.push_str(&live);
                         }
                         text.push_str(&format!(
-                            "\nWait (Windows): {wait_win}\nWait (WSL): {wait_wsl}"
+                            "\nWait (CLI): castor wait {}\nWait (Windows): {wait_win}\nWait (WSL): {wait_wsl}",
+                            rec.id
                         ));
                         text
                     }
@@ -765,10 +767,7 @@ pub fn format_live_turn_status(
     state: &StateDir,
     rec: &crate::task::registry::TaskRecord,
 ) -> Option<String> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let now_ms = crate::platform::now_epoch_ms();
     let start_ms = rec.started_at.unwrap_or(rec.created_at);
     let elapsed_s = now_ms.saturating_sub(start_ms) / 1000;
 
