@@ -1512,7 +1512,13 @@ async fn second_dispatch_rolls_over_when_over_watermark() {
     );
     assert_eq!(first_call[0].role, "system");
     assert_eq!(first_call[1].role, "user");
-    assert_eq!(first_call[1].content, "second");
+    // Over the resume ceiling, the fresh user prompt is prepended with the
+    // prior session's last substantive answer (`prior_session_summary_block`)
+    // so the rolled session keeps the prior run's conclusions.
+    assert_eq!(
+        first_call[1].content,
+        "[Prior Session Summary]\nFirst done.\nsecond",
+    );
 
     let _ = std::fs::remove_dir_all(state.root());
 }
@@ -2100,10 +2106,16 @@ async fn in_flight_context_ceiling_disables_tools_and_lands_final() {
             .contains("Working context budget has reached 90%"),
         "expected ceiling directive, got: {last_user:?}"
     );
-    assert!(
-        tools_sent.is_empty(),
-        "tool dispatch must be disabled on the ceiling turn, but sent {tools_sent:?}"
+    // The ceiling turn keeps the *full* tool schema list (byte-identical KV
+    // prefix) — "disabling" means slipped tool calls are never *executed*
+    // (see `in_flight_context_ceiling_blocks_slipped_tool_calls`), not that
+    // the tool list is emptied.
+    assert_eq!(
+        tools_sent.len(),
+        1,
+        "ceiling turn must pass the full tool list unchanged, got {tools_sent:?}"
     );
+    assert_eq!(tools_sent[0].name, "bash");
 
     let events = logger.read_all();
     assert!(
@@ -2158,10 +2170,15 @@ async fn in_flight_context_ceiling_uses_engine_prompt_tokens() {
         !calls[0].2.is_empty(),
         "turn 1 should carry tools before ceiling trips"
     );
-    assert!(
-        calls[1].2.is_empty(),
-        "turn 2 must disable tools once engine prompt_tokens >= 90%"
+    // Turn 2 (ceiling) keeps the *full* tool list unchanged (byte-identical KV
+    // prefix); slipped tool calls it emits are never executed.
+    assert_eq!(
+        calls[1].2.len(),
+        1,
+        "turn 2 must pass the full tool list once engine prompt_tokens >= 90%, got {:?}",
+        calls[1].2
     );
+    assert_eq!(calls[1].2[0].name, "bash");
     let _ = std::fs::remove_dir_all(&state_root);
 }
 

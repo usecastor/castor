@@ -375,11 +375,7 @@ impl EngineProfile {
         let model_id = match config.model.as_deref() {
             None | Some("auto") => match models_list.as_slice() {
                 [single] => single.clone(),
-                [] => {
-                    return Err(
-                        "cannot auto-bind a model: /v1/models reported no models".into(),
-                    )
-                }
+                [] => return Err("cannot auto-bind a model: /v1/models reported no models".into()),
                 many => {
                     let shown = many.join(", ");
                     return Err(format!(
@@ -439,11 +435,7 @@ fn max_model_len_from_any_entry(models_json: Option<&Value>) -> Option<u32> {
 }
 
 /// GET `url`, expect a successful response, and parse the JSON body.
-async fn fetch_json(
-    client: &reqwest::Client,
-    config: &Config,
-    url: &str,
-) -> Result<Value, String> {
+async fn fetch_json(client: &reqwest::Client, config: &Config, url: &str) -> Result<Value, String> {
     let mut request = client.get(url);
     if let Some(key) = &config.api_key {
         request = request.bearer_auth(key);
@@ -456,7 +448,10 @@ async fn fetch_json(
     if !status.is_success() {
         return Err(format!("upstream HTTP {status} from {url}"));
     }
-    response.json().await.map_err(|e| format!("malformed JSON from {url}: {e}"))
+    response
+        .json()
+        .await
+        .map_err(|e| format!("malformed JSON from {url}: {e}"))
 }
 
 #[cfg(test)]
@@ -482,7 +477,6 @@ mod tests {
             openalex_email: None,
             openalex_api_key: None,
             boot_timeout_secs: 180,
-            probe_budget: 4,
             dgi_reject_margin: 1.5,
             dgi_bypass_warm_session: false,
             reasoning_open_tag: concat!("<th", "ink>").to_string(),
@@ -521,7 +515,10 @@ mod tests {
         let base = serve(
             Router::new()
                 .route("/v1/models", get(|| async { Json(vllm_models_json()) }))
-                .route("/version", get(|| async { Json(json!({"version": "0.31.0"})) })),
+                .route(
+                    "/version",
+                    get(|| async { Json(json!({"version": "0.31.0"})) }),
+                ),
         )
         .await;
         let cfg = test_config(Some(format!("{base}/v1")), Some("auto".into()));
@@ -555,7 +552,10 @@ mod tests {
     async fn discover_llama_cpp_from_health() {
         let base = serve(
             Router::new()
-                .route("/v1/health", get(|| async { Json(json!({"status": "ok"})) }))
+                .route(
+                    "/v1/health",
+                    get(|| async { Json(json!({"status": "ok"})) }),
+                )
                 .route(
                     "/v1/models",
                     get(|| async {
@@ -633,7 +633,10 @@ mod tests {
         let base = serve(
             Router::new()
                 .route("/v1/models", get(|| async { Json(vllm_models_json()) }))
-                .route("/version", get(|| async { Json(json!({"version": "0.31.0"})) })),
+                .route(
+                    "/version",
+                    get(|| async { Json(json!({"version": "0.31.0"})) }),
+                ),
         )
         .await;
         let mut cfg = test_config(Some(format!("{base}/v1")), Some("qwen3.8-27b".into()));

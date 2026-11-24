@@ -88,8 +88,8 @@ impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for FileSink {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tests::tmp_state;
+    use super::*;
     use serde_json::Value;
 
     #[test]

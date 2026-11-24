@@ -138,7 +138,9 @@ fn parse_lang(alias: &str) -> Result<SupportLang, AstError> {
         "c++" => Ok(SupportLang::Cpp),
         "htm" => Ok(SupportLang::Html),
         "csharp" => Ok(SupportLang::CSharp),
-        _ => Err(AstError::Language(format!("unsupported language '{alias}'"))),
+        _ => Err(AstError::Language(format!(
+            "unsupported language '{alias}'"
+        ))),
     }
 }
 
@@ -409,7 +411,13 @@ pub fn html_validation_text(content: &str) -> String {
                 k += 1;
             }
             let start = k;
-            while k < n && (if hex { bytes[k].is_ascii_hexdigit() } else { bytes[k].is_ascii_digit() }) {
+            while k < n
+                && (if hex {
+                    bytes[k].is_ascii_hexdigit()
+                } else {
+                    bytes[k].is_ascii_digit()
+                })
+            {
                 k += 1;
             }
             (k > start && matches!(bytes.get(k), Some(b';'))).then_some(k + 1)
@@ -463,6 +471,198 @@ pub fn html_validation_text(content: &str) -> String {
         out.push_str(&content[last..n]);
     }
     out
+}
+
+/// Languages whose declaration syntax the outline can index. Prose and
+/// markup/config formats (Markdown, JSON, YAML, TOML, HTML, CSS, …) resolve
+/// to `None` here and produce no outline.
+const OUTLINE_LANGS: &[SupportLang] = &[
+    SupportLang::Rust,
+    SupportLang::Python,
+    SupportLang::JavaScript,
+    SupportLang::Tsx,
+    SupportLang::TypeScript,
+    SupportLang::Go,
+    SupportLang::C,
+    SupportLang::Cpp,
+    SupportLang::Java,
+    SupportLang::CSharp,
+    SupportLang::Lua,
+    SupportLang::Bash,
+    SupportLang::Ruby,
+    SupportLang::Php,
+    SupportLang::Swift,
+    SupportLang::Kotlin,
+    SupportLang::Scala,
+    SupportLang::Dart,
+    SupportLang::Solidity,
+    SupportLang::Haskell,
+    SupportLang::Elixir,
+    SupportLang::Nix,
+];
+
+/// Declaration node kinds recognized by [`outline_after_line`], spanning the
+/// Rust, Python, JS/TS, C-family, and JVM grammars bundled with ast-grep.
+const OUTLINE_DECL_KINDS: &[&str] = &[
+    "function_item",
+    "fn_item",
+    "struct_item",
+    "enum_item",
+    "impl_item",
+    "trait_item",
+    "mod_item",
+    "type_item",
+    "function_definition",
+    "class_definition",
+    "function_declaration",
+    "class_declaration",
+    "method_definition",
+    "method_declaration",
+    "interface_declaration",
+    "type_alias_declaration",
+    "enum_declaration",
+    "type_declaration",
+    "struct_specifier",
+    "class_specifier",
+];
+
+/// Maximum number of outline items emitted for a single unread tail.
+const MAX_OUTLINE_ITEMS: usize = 40;
+
+/// Maximum tree depth (root = 0) the outline DFS descends to. The budget of
+/// three edges is what lets the walk reach methods nested one scope below a
+/// top-level type: `module → class_definition → block → function_definition`
+/// (Python) and `program → class_declaration → class_body → method_definition`
+/// (JS/TS, C#, Java) both put the method at depth 3, while a top-level
+/// function's own body stays at depth ≥ 3 and is never expanded.
+const MAX_OUTLINE_DEPTH: usize = 3;
+
+/// Container declaration kinds the walk descends *into* (beyond just
+/// recording them): the enclosing scopes whose bodies hold the methods the
+/// outline is meant to surface.
+const OUTLINE_CONTAINER_KINDS: &[&str] = &[
+    "impl_item",
+    "trait_item",
+    "class_definition",
+    "class_declaration",
+    "mod_item",
+    "namespace_definition",
+];
+
+/// A declaration that carries a body of statements rather than nested
+/// declarations (a function or method). The walk records these but does not
+/// descend into them, so local/nested function bodies stay out of the
+/// outline. Non-declaration wrapper nodes (`source_file`, `module`,
+/// `program`, `block`, `class_body`, …) and the container kinds above are
+/// always descended into, within [`MAX_OUTLINE_DEPTH`].
+fn is_leaf_declaration(kind: &str) -> bool {
+    OUTLINE_DECL_KINDS.contains(&kind) && !OUTLINE_CONTAINER_KINDS.contains(&kind)
+}
+
+/// Build a symbol outline of the unread tail of `content` (the lines whose
+/// 1-based line number is `>= after_line_1based`).
+///
+/// The path is resolved to a language via [`infer_lang_by_extension`];
+/// extensions that are not in [`OUTLINE_LANGS`] (prose and config formats
+/// such as Markdown, JSON, YAML, TOML, HTML, CSS) return `None`.
+///
+/// The tree is parsed with `lang.ast_grep(content)` and walked DFS up to
+/// [`MAX_OUTLINE_DEPTH`]. Nodes that are `is_error()`/`is_missing()` or of
+/// kind `ERROR`/`UNDEFINED`/`MISSING` are skipped entirely (tree-sitter error
+/// recovery still yields the real declarations around a broken region, so
+/// they are outlined while the error nodes themselves never appear). Each
+/// declaration-kind node whose 1-based start line is `>= after_line_1based`
+/// becomes an item: its first source line trimmed, whitespace collapsed,
+/// trailing `{`/`:` stripped, and truncated at 120 chars, prefixed by
+/// `L{1-based line}:` and indented two spaces per nesting depth.
+///
+/// At most [`MAX_OUTLINE_ITEMS`] items are emitted; the remainder is
+/// summarized with a single `... (N more declarations)` line. Returns
+/// `None` when the unread tail holds no declarations.
+pub fn outline_after_line(path: &Path, content: &str, after_line_1based: usize) -> Option<String> {
+    let lang = match infer_lang_by_extension(path) {
+        Some(l) if OUTLINE_LANGS.contains(&l) => l,
+        _ => return None,
+    };
+    let doc = lang.ast_grep(content);
+    let mut items: Vec<String> = Vec::new();
+    let mut total = 0usize;
+
+    fn first_line_signature(text: &str) -> String {
+        let first = text.split('\n').next().unwrap_or("");
+        let collapsed: String = first.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut sig = collapsed
+            .trim()
+            .trim_end_matches(['{', ':'])
+            .trim()
+            .to_string();
+        if sig.is_empty() {
+            sig = "<declaration>".to_string();
+        }
+        if sig.chars().count() > 120 {
+            sig = format!("{}…", sig.chars().take(119).collect::<String>().trim_end());
+        }
+        sig
+    }
+
+    fn visit(
+        node: &Node<ast_grep_core::tree_sitter::StrDoc<SupportLang>>,
+        depth: usize,
+        after_line_1based: usize,
+        items: &mut Vec<String>,
+        total: &mut usize,
+    ) {
+        if node.is_error()
+            || node.is_missing()
+            || node.kind() == "ERROR"
+            || node.kind() == "UNDEFINED"
+            || node.kind() == "MISSING"
+        {
+            return;
+        }
+        let kind = node.kind();
+        let kind = kind.as_ref();
+        if OUTLINE_DECL_KINDS.contains(&kind) {
+            let line_1based = node.start_pos().line() + 1;
+            if line_1based >= after_line_1based {
+                *total += 1;
+                if items.len() < MAX_OUTLINE_ITEMS {
+                    items.push(format!(
+                        "{}L{}: {}",
+                        "  ".repeat(depth),
+                        line_1based,
+                        first_line_signature(node.text().as_ref())
+                    ));
+                }
+            }
+            // A function/method body holds statements, not nested
+            // declarations of interest, so do not descend into it.
+            if is_leaf_declaration(kind) {
+                return;
+            }
+        }
+        if depth < MAX_OUTLINE_DEPTH {
+            for child in node.children() {
+                visit(&child, depth + 1, after_line_1based, items, total);
+            }
+        }
+    }
+
+    visit(&doc.root(), 0, after_line_1based, &mut items, &mut total);
+    if total == 0 {
+        return None;
+    }
+    if total > MAX_OUTLINE_ITEMS {
+        items.push(format!(
+            "  ... ({} more declarations)",
+            total - MAX_OUTLINE_ITEMS
+        ));
+    }
+    Some(format!(
+        "\n[Outline of unread lines {}.. (index only — read target lines before editing):\n{}\n]",
+        after_line_1based,
+        items.join("\n")
+    ))
 }
 
 /// Diagnostic details for a detected syntax error.
@@ -525,11 +725,7 @@ fn collect_syntax_errors(
         } else {
             raw_snippet.to_string()
         };
-        errors.push(SyntaxErrorDetail {
-            line,
-            col,
-            snippet,
-        });
+        errors.push(SyntaxErrorDetail { line, col, snippet });
         return;
     }
     for child in node.children() {
@@ -1070,11 +1266,7 @@ mod tests {
                 "function Comp() { return <div>Hello</div>; }",
                 "function Comp() { return <div><span></div>; }",
             ),
-            (
-                "module.mjs",
-                "export const x = 42;",
-                "export const x = ;",
-            ),
+            ("module.mjs", "export const x = 42;", "export const x = ;"),
             (
                 "legacy.cjs",
                 "module.exports = { x: 42 };",
@@ -1100,11 +1292,7 @@ mod tests {
                 "int add(int a, int b) { return a + b; }",
                 "int broken( { return 0; }",
             ),
-            (
-                "native.h",
-                "int add(int a, int b);",
-                "int broken( ;",
-            ),
+            ("native.h", "int add(int a, int b);", "int broken( ;"),
             (
                 "native.cpp",
                 "int add(int a, int b) { return a + b; }",
@@ -1211,28 +1399,16 @@ mod tests {
             "Model Rationale &amp; Intent"
         );
         // Multiple bare `&` are all escaped.
-        assert_eq!(
-            html_validation_text("A & B & C"),
-            "A &amp; B &amp; C"
-        );
+        assert_eq!(html_validation_text("A & B & C"), "A &amp; B &amp; C");
     }
 
     #[test]
     fn html_validation_text_preserves_valid_references() {
         // Existing character references (named and numeric) are left intact, so
         // the escape is idempotent and never double-escapes a valid reference.
-        assert_eq!(
-            html_validation_text("A &amp; B"),
-            "A &amp; B"
-        );
-        assert_eq!(
-            html_validation_text("C &nbsp; &copy;"),
-            "C &nbsp; &copy;"
-        );
-        assert_eq!(
-            html_validation_text("D &#65; &#x41;"),
-            "D &#65; &#x41;"
-        );
+        assert_eq!(html_validation_text("A &amp; B"), "A &amp; B");
+        assert_eq!(html_validation_text("C &nbsp; &copy;"), "C &nbsp; &copy;");
+        assert_eq!(html_validation_text("D &#65; &#x41;"), "D &#65; &#x41;");
     }
 
     #[test]
@@ -1259,14 +1435,8 @@ mod tests {
         );
         // (c) Pure multi-byte text with no `&` at all is a no-op identity —
         //     the whole string round-trips exactly (this is the mojibake case).
-        assert_eq!(
-            html_validation_text("Café 😀 中文"),
-            "Café 😀 中文"
-        );
-        assert_eq!(
-            html_validation_text("测试"),
-            "测试"
-        );
+        assert_eq!(html_validation_text("Café 😀 中文"), "Café 😀 中文");
+        assert_eq!(html_validation_text("测试"), "测试");
     }
 
     #[test]
@@ -1300,5 +1470,174 @@ mod tests {
         let content = "<<<\n";
         let err = validate_file_syntax(path, content).unwrap_err();
         assert!(matches!(err, AstError::SyntaxFailure(_)), "{err}");
+    }
+
+    #[test]
+    fn outline_after_line_extracts_nested_declarations_ignoring_errors() {
+        // Lines 1-10 are a clean `struct` + `impl` block; the region after
+        // line 10 contains a broken statement (`let broken = ;;;`) that
+        // tree-sitter recovers as an ERROR node. The outline must report the
+        // `impl` and its nested method with exact 1-based line numbers, must
+        // outline the valid declaration that follows the broken region, and
+        // must never emit the ERROR node itself.
+        let content = concat!(
+            "pub struct Foo {\n",               // 1
+            "    pub field: i32,\n",            // 2
+            "}\n",                              // 3
+            "\n",                               // 4
+            "impl Foo {\n",                     // 5
+            "    pub fn bar(&self) -> i32 {\n", // 6
+            "        self.field\n",             // 7
+            "    }\n",                          // 8
+            "}\n",                              // 9
+            "\n",                               // 10
+            "let broken = ;;;\n",               // 11 (broken region → ERROR node)
+            "fn inner_after_error() {}\n",      // 12
+            "\n",                               // 13
+            "pub mod inner {\n",                // 14
+            "    pub fn deep() {}\n",           // 15
+            "}\n",                              // 16
+        );
+        let path = Path::new("src/foo.rs");
+        let out = outline_after_line(path, content, 1)
+            .expect("a Rust file with declarations in the tail must outline");
+        assert!(out.contains("[Outline of unread lines 1.."), "{out}");
+        // Exact 1-based line numbers for the top-level items, the method
+        // nested one scope deeper, and the declaration after the error.
+        assert!(out.contains("  L1: pub struct Foo"), "{out}");
+        assert!(out.contains("  L5: impl Foo"), "{out}");
+        assert!(out.contains("    L6: pub fn bar(&self) -> i32"), "{out}");
+        assert!(out.contains("  L12: fn inner_after_error()"), "{out}");
+        assert!(out.contains("  L14: pub mod inner"), "{out}");
+        assert!(out.contains("    L15: pub fn deep()"), "{out}");
+        // The broken statement is an ERROR node: it must not be outlined.
+        assert!(!out.contains("L11"), "ERROR node must be skipped: {out}");
+        for bad in ["ERROR", "UNDEFINED", "MISSING"] {
+            assert!(!out.contains(bad), "outline must skip error nodes: {out}");
+        }
+    }
+
+    #[test]
+    fn outline_after_line_caps_at_max_items_with_remainder_summary() {
+        // 100 function declarations after the read window: the outline must
+        // stop at 40 items and summarize the remaining 60.
+        let content = (0..100)
+            .map(|i| format!("fn f_{i:02}() {{ }}\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        let path = Path::new("src/many.rs");
+        let out = outline_after_line(path, &content, 1).expect("outline");
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.trim_start().starts_with("L"))
+                .count(),
+            MAX_OUTLINE_ITEMS,
+            "exactly {MAX_OUTLINE_ITEMS} L-items expected: {out}"
+        );
+        assert!(
+            out.contains("... (60 more declarations)"),
+            "remaining summary expected: {out}"
+        );
+        assert!(out.contains("L1: fn f_00()"), "{out}");
+        assert!(out.contains("L40: fn f_39()"), "{out}");
+    }
+
+    #[test]
+    fn outline_after_line_returns_none_for_unsupported_extensions() {
+        // Prose and config formats produce no outline, no error.
+        let md = (1..=50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(outline_after_line(Path::new("notes.md"), &md, 1), None);
+        assert_eq!(outline_after_line(Path::new("notes.txt"), &md, 1), None);
+        let json = (1..=50)
+            .map(|i| format!("\"k{i}\": {i},"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(outline_after_line(Path::new("data.json"), &json, 1), None);
+        assert_eq!(outline_after_line(Path::new("data.yaml"), &json, 1), None);
+        assert_eq!(outline_after_line(Path::new("data.toml"), &json, 1), None);
+        assert_eq!(outline_after_line(Path::new("page.html"), &json, 1), None);
+        assert_eq!(outline_after_line(Path::new("page.css"), &json, 1), None);
+    }
+
+    #[test]
+    fn outline_after_line_returns_none_when_tail_has_no_declarations() {
+        // The unread tail covers only the body and closing brace of the last
+        // function — no declaration starts within it, so there is nothing to
+        // outline.
+        let content = concat!(
+            "fn first() {\n",   // 1
+            "    let a = 1;\n", // 2
+            "    let b = 2;\n", // 3
+            "    a + b\n",      // 4
+            "}\n",              // 5
+            "fn second() {\n",  // 6
+            "    0\n",          // 7
+            "}\n",              // 8
+        );
+        assert_eq!(
+            outline_after_line(Path::new("src/tail.rs"), content, 7),
+            None
+        );
+        assert_eq!(
+            outline_after_line(Path::new("src/tail.rs"), content, 9),
+            None
+        );
+
+        // Sanity: starting the tail at the declaration itself outlines it.
+        let out = outline_after_line(Path::new("src/tail.rs"), content, 6)
+            .expect("a declaration starting in the tail must be outlined");
+        assert!(out.contains("L6: fn second()"), "{out}");
+    }
+
+    #[test]
+    fn outline_after_line_collapses_whitespace_and_strips_opening_brace() {
+        // A multi-space-separated signature is collapsed to single spaces and
+        // loses its trailing `{`.
+        let content = concat!(
+            "pub fn   spaced(a:   i32,   b:   i32)   ->   i32  {\n", // 1
+            "    a + b\n",                                           // 2
+            "}\n",                                                   // 3
+            "\n",                                                    // 4
+            "fn after() {}\n",                                       // 5
+        );
+        let out = outline_after_line(Path::new("src/sp.rs"), content, 1).expect("outline");
+        assert!(
+            out.contains("L1: pub fn spaced(a: i32, b: i32) -> i32"),
+            "{out}"
+        );
+        assert!(out.contains("L5: fn after()"), "{out}");
+    }
+
+    #[test]
+    fn outline_after_line_truncates_oversized_signatures() {
+        let long_param = "a: i32".repeat(40);
+        let content = format!("fn long_one({long_param}) {{}}\n");
+        assert!(content.len() > 120);
+        let out = outline_after_line(Path::new("src/long.rs"), &content, 1).expect("outline");
+        let sig_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("L1:"))
+            .unwrap();
+        // The item is a top-level declaration (depth 1): 2-space indent, then
+        // the `L1: ` marker, then the signature.
+        assert!(
+            sig_line.starts_with("  L1: "),
+            "expected depth-1 indent, got: {sig_line}"
+        );
+        let sig = sig_line.trim_start_matches("  L1: ");
+        // The raw signature far exceeds 120 chars, so it must be truncated to
+        // at most 120 and flagged with an ellipsis.
+        assert!(
+            sig.chars().count() <= 120,
+            "signature must be truncated to 120 chars (got {}): {sig_line}",
+            sig.chars().count()
+        );
+        assert!(
+            sig.ends_with('…'),
+            "truncated signature must end with ellipsis: {sig_line}"
+        );
     }
 }

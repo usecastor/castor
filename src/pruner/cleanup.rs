@@ -592,8 +592,10 @@ pub fn record_last_prune(state_dir: &Path, now_ms: u64) -> std::io::Result<()> {
     fs::write(last_prune_path, now_ms.to_string())
 }
 
-/// Spawns an automatic, non-blocking background pruning pass on boot if `.last_prune`
+/// Spawns an automatic, non-blocking background pass on boot if `.last_prune`
 /// is older than 24 hours.
+/// Only prunes `.scratch` artifacts and stale lock tombstones — never deletes
+/// `sessions/`, `tasks/`, `telemetry/`, or `evo/` ledgers.
 /// Returns a `JoinHandle` if a thread was spawned, or `None` if pruning was not needed.
 pub fn maybe_auto_prune(state_dir: &Path) -> Option<std::thread::JoinHandle<()>> {
     let now = now_millis();
@@ -611,6 +613,20 @@ pub fn maybe_auto_prune(state_dir: &Path) -> Option<std::thread::JoinHandle<()>>
                 if needs_auto_prune(&state_dir_buf, now_inner) {
                     let policy = super::PrunePolicy::default();
                     let mut p = super::plan(&state_dir_buf, &policy);
+                    // Preserve session, task, telemetry, and evo ledgers on auto-prune.
+                    p.sessions.clear();
+                    p.tasks.clear();
+                    p.telemetry.clear();
+                    p.evo.clear();
+                    p.fingerprint = compute_fingerprint(
+                        &state_dir_buf,
+                        &p.sessions,
+                        &p.tasks,
+                        &p.telemetry,
+                        &p.evo,
+                        &p.scratch,
+                        &p.tombstones,
+                    );
                     if !p.is_empty() {
                         let _ = super::apply(&state_dir_buf, &mut p);
                     }

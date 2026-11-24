@@ -1,21 +1,22 @@
 //! Telemetry: a single event stream plus derived statistics.
 //!
-//! Locked decision: there is exactly ONE event stream. The tracing-JSONL
-//! ledger (`<state>/telemetry/events.jsonl`) is the ledger; there is NO
-//! second stats writer. Statistics are *derived* on demand by walking the
+//! There is exactly ONE event stream. The tracing-JSONL ledger
+//! (`<state>/telemetry/events.jsonl`) is the ledger; there is NO second
+//! stats writer. Statistics are *derived* on demand by walking the
 //! existing ledgers (`sessions/*/events.jsonl` + `tasks/*.json`)
 //! rather than maintained by a parallel writer.
 //!
 //! Derivation is best-effort: missing or corrupt ledger lines are skipped
 //! silently (the ledgers are the authority; this module is a read-only
-//! projection over them).
+//! projection over them). Each derivation also persists its result to
+//! `<state>/telemetry/stats.json` (see [`rollup::derive_stats`]).
 //!
 //! Submodules:
 //! - [`emit`] — tracing-subscriber initialization + the `FileSink` JSONL writer.
 //! - [`derive`] — parsing a single session's ledger into per-session aggregates,
 //!   fanned out across the session directories in parallel chunks.
 //! - [`rollup`] — fold the per-session aggregates + task records into [`Stats`],
-//!   render the dashboard card, and write `stats.json`.
+//!   render the dashboard card, and persist `stats.json` on every derivation.
 
 use std::collections::BTreeMap;
 

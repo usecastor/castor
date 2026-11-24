@@ -168,4 +168,3 @@ mod tests {
         assert!(!is_severed_stop("no close tag", close));
     }
 }
-

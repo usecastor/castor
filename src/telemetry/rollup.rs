@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::*;
 use super::derive::{
-    get_file_meta, parse_chunk_of_sessions, parse_session_events, process_session_dirs_and_update,
-    read_dir_or_empty, utc_day, FastTask, SessionAgg,
+    FastTask, SessionAgg, get_file_meta, parse_chunk_of_sessions, parse_session_events,
+    process_session_dirs_and_update, read_dir_or_empty, utc_day,
 };
+use super::*;
 
 #[derive(Default)]
 pub(super) struct SessionRollup {
@@ -113,7 +113,11 @@ impl SessionRollup {
     }
 }
 
-pub(super) fn add_session_to_rollup(rollup: &mut SessionRollup, session: &SessionAgg, opts: &StatsOptions) {
+pub(super) fn add_session_to_rollup(
+    rollup: &mut SessionRollup,
+    session: &SessionAgg,
+    opts: &StatsOptions,
+) {
     rollup.total_sessions += 1;
     rollup.total_turns += session.turns;
     rollup.total_prompt_tokens += session.prompt_tokens;
@@ -430,6 +434,12 @@ pub(super) struct TaskMetrics {
 ///
 /// Missing or corrupt lines are skipped silently — this is a derivation,
 /// not an authority.
+///
+/// Every derivation persists its result to `<state_dir>/telemetry/stats.json`
+/// (best-effort, atomic write-temp-then-rename) so the stats file stays
+/// current on each `castor stats` invocation, each MCP `stats` action, and
+/// each completed worker session — not only when a caller invokes
+/// [`write_stats_json`] explicitly.
 pub fn derive_stats(state_dir: &Path, opts: &StatsOptions) -> Stats {
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -460,8 +470,11 @@ pub fn derive_stats(state_dir: &Path, opts: &StatsOptions) -> Stats {
         TelemetryCache::default()
     };
 
-    let (session_rollup, sessions_updated) =
+    let (mut session_rollup, sessions_updated) =
         load_session_rollups_cached(&session_dirs, opts, num_threads, &mut cache.sessions);
+    if opts.since_ms.is_none() {
+        fold_archived_baseline(state_dir, &mut session_rollup);
+    }
     let (task_metrics, tasks_updated) =
         load_task_metrics_cached(&task_files, opts.since_ms, num_threads, &mut cache.tasks);
 
@@ -589,7 +602,64 @@ pub fn derive_stats(state_dir: &Path, opts: &StatsOptions) -> Stats {
     stats.first_recorded_session = stats.first_ms.map(|ms| iso_from_ms(ms as u64));
     stats.last_recorded_session = stats.last_ms.map(|ms| iso_from_ms(ms as u64));
 
+    // Persist the derivation to `<state_dir>/telemetry/stats.json` (atomic
+    // write-temp-then-rename). Best-effort: a failed write never breaks the
+    // derivation path — the returned value remains the authority.
+    let _ = write_stats_json(state_dir, &stats);
+
     stats
+}
+
+/// Optional archived baseline totals for sessions no longer present under
+/// `<state_dir>/sessions/`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ArchivedBaseline {
+    first_ms: Option<i128>,
+    sessions: u64,
+    turns: u64,
+    prompt_tokens: u64,
+    cached_tokens: u64,
+    cache_eligible_prompt_tokens: u64,
+    completion_tokens: u64,
+    reasoning_tokens: u64,
+    tool_calls: u64,
+    tool_errors: u64,
+    duration_ms: u64,
+    inference_compute_ms: f64,
+    tool_calls_by_name: BTreeMap<String, u64>,
+    tool_errors_by_name: BTreeMap<String, u64>,
+}
+
+fn fold_archived_baseline(state_dir: &Path, rollup: &mut SessionRollup) {
+    let path = state_dir.join("telemetry").join("archived_baseline.json");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(base) = serde_json::from_str::<ArchivedBaseline>(&raw) else {
+        return;
+    };
+    rollup.total_sessions += base.sessions;
+    rollup.total_turns += base.turns;
+    rollup.total_prompt_tokens += base.prompt_tokens;
+    rollup.total_cached_tokens += base.cached_tokens;
+    rollup.total_cache_eligible_prompt_tokens += base.cache_eligible_prompt_tokens;
+    rollup.total_completion_tokens += base.completion_tokens;
+    rollup.total_reasoning_tokens += base.reasoning_tokens;
+    rollup.total_tool_calls += base.tool_calls;
+    rollup.total_tool_errors += base.tool_errors;
+    rollup.duration_sum += base.duration_ms;
+    rollup.duration_count += base.sessions;
+    rollup.inference_compute_ms += base.inference_compute_ms;
+    if let Some(fms) = base.first_ms {
+        rollup.first_ms = Some(rollup.first_ms.map_or(fms, |prev| prev.min(fms)));
+    }
+    for (k, v) in base.tool_calls_by_name {
+        *rollup.tool_calls.entry(k).or_insert(0) += v;
+    }
+    for (k, v) in base.tool_errors_by_name {
+        *rollup.tool_errors.entry(k).or_insert(0) += v;
+    }
 }
 
 /// Write the derived stats to `<state_dir>/telemetry/stats.json` (atomic
@@ -841,11 +911,7 @@ pub fn format_stats_card_styled(stats: &Stats, color: bool) -> String {
             p.reset
         ));
     } else {
-        out.push_str(&format!(
-            "  {:<22} {:>14}\n",
-            "Tasks",
-            "0"
-        ));
+        out.push_str(&format!("  {:<22} {:>14}\n", "Tasks", "0"));
     }
 
     if stats.inference_compute_ms > 0 {
@@ -906,11 +972,7 @@ pub fn format_stats_card_styled(stats: &Stats, color: bool) -> String {
             p.reset
         ));
     } else {
-        out.push_str(&format!(
-            "  {:<22} {:>14}\n",
-            "Tool Calls",
-            "0"
-        ));
+        out.push_str(&format!("  {:<22} {:>14}\n", "Tool Calls", "0"));
     }
     out.push('\n');
 
@@ -1254,10 +1316,10 @@ impl Default for TelemetryCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::tests::{tmp_state, write};
     use super::super::derive::parse_timestamp_ms;
     use super::super::iso_from_ms;
+    use super::super::tests::{tmp_state, write};
+    use super::*;
     use serde_json::json;
 
     #[test]
@@ -1771,6 +1833,82 @@ mod tests {
             s1.total_cache_eligible_prompt_tokens
         );
         assert_eq!(s2.total_tasks_completed, s1.total_tasks_completed);
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    /// Every `derive_stats` call persists its result to
+    /// `<state_dir>/telemetry/stats.json`, so the file on disk tracks the
+    /// latest derivation without a separate writer.
+    #[test]
+    fn derive_stats_persists_stats_json() {
+        let state = tmp_state();
+        let stats_path = state.join("telemetry/stats.json");
+        assert!(
+            !stats_path.exists(),
+            "stats.json must not pre-exist: {stats_path:?}"
+        );
+
+        write(
+            &state.join("sessions/s1/events.jsonl"),
+            "{\"type\":\"dispatch\",\"turn\":1,\"timestamp\":\"2026-10-06T10:00:00.000Z\",\"metrics\":{\"prompt_tokens\":1000,\"completion_tokens\":100}}\n",
+        );
+
+        let s1 = derive_stats(&state, &Default::default());
+        assert_eq!(s1.total_sessions, 1);
+        assert!(
+            stats_path.exists(),
+            "derive_stats must persist telemetry/stats.json"
+        );
+        let on_disk: Stats =
+            serde_json::from_str(&fs::read_to_string(&stats_path).unwrap()).unwrap();
+        assert_eq!(on_disk.total_sessions, 1);
+        assert_eq!(on_disk.total_prompt_tokens, 1000);
+        assert_eq!(on_disk.total_completion_tokens, 100);
+
+        // A second derivation rewrites the file with the updated totals.
+        write(
+            &state.join("sessions/s2/events.jsonl"),
+            "{\"type\":\"dispatch\",\"turn\":1,\"timestamp\":\"2026-10-06T11:00:00.000Z\",\"metrics\":{\"prompt_tokens\":2000,\"completion_tokens\":200}}\n",
+        );
+        let s2 = derive_stats(&state, &Default::default());
+        assert_eq!(s2.total_sessions, 2);
+        let on_disk2: Stats =
+            serde_json::from_str(&fs::read_to_string(&stats_path).unwrap()).unwrap();
+        assert_eq!(on_disk2.total_sessions, 2);
+        assert_eq!(on_disk2.total_prompt_tokens, 3000);
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn derive_stats_folds_archived_baseline() {
+        let state = tmp_state();
+        write(
+            &state.join("sessions/s1/events.jsonl"),
+            "{\"type\":\"dispatch\",\"turn\":1,\"timestamp\":\"2026-10-06T10:00:00.000Z\",\"metrics\":{\"prompt_tokens\":1000,\"completion_tokens\":100}}\n",
+        );
+        write(
+            &state.join("telemetry/archived_baseline.json"),
+            r#"{"first_ms":1788562680000,"sessions":10,"turns":200,"prompt_tokens":50000,"cached_tokens":45000,"cache_eligible_prompt_tokens":50000,"completion_tokens":2000,"reasoning_tokens":1000,"tool_calls":15,"tool_errors":1,"duration_ms":60000,"inference_compute_ms":30000.0,"tool_calls_by_name":{"bash":15},"tool_errors_by_name":{"bash":1}}"#,
+        );
+
+        let stats = derive_stats(&state, &Default::default());
+        assert_eq!(stats.total_sessions, 11);
+        assert_eq!(stats.total_turns, 201);
+        assert_eq!(stats.total_prompt_tokens, 51000);
+        assert_eq!(stats.total_completion_tokens, 2100);
+        assert_eq!(stats.tool_calls.get("bash").copied(), Some(15));
+
+        let windowed = derive_stats(
+            &state,
+            &StatsOptions {
+                since_ms: Some(1_791_000_000_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(windowed.total_sessions, 1);
+        assert_eq!(windowed.total_turns, 1);
 
         let _ = fs::remove_dir_all(&state);
     }

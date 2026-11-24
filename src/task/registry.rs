@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::state::StateDir;
-use crate::task::semaphore::{pid_alive, TaskSemaphore};
+use crate::task::semaphore::{TaskSemaphore, pid_alive};
 
 /// Hard cap on the elastic turn budget.
 pub const MAX_ELASTIC_TURNS: u32 = 200;
@@ -546,7 +546,9 @@ impl TaskRegistry {
                         // Cross-OS / PID namespace grace: if the heartbeat is still
                         // fresh, do not reap even if pid_alive is false (e.g. PID
                         // belongs to another namespace or OS boundary).
-                        Some(_) if now.saturating_sub(rec.heartbeat) < STALE_HEARTBEAT_MS => continue,
+                        Some(_) if now.saturating_sub(rec.heartbeat) < STALE_HEARTBEAT_MS => {
+                            continue;
+                        }
                         Some(_) => {
                             rec.status = TaskStatus::Failed;
                             rec.reason = Some("process terminated / system reboot".into());
@@ -922,16 +924,26 @@ mod tests {
 
         // Boot reaper: reaps exactly the two genuine orphans (a, b); leaves c,
         // d, and the terminal e alone.
-        assert_eq!(reg.reap_orphans_disk().await, 2, "only the two orphans should be reaped");
+        assert_eq!(
+            reg.reap_orphans_disk().await,
+            2,
+            "only the two orphans should be reaped"
+        );
 
         let ra = reg.get(&a).await.unwrap();
         assert_eq!(ra.status, TaskStatus::Failed);
-        assert_eq!(ra.reason.as_deref(), Some("process terminated / system reboot"));
+        assert_eq!(
+            ra.reason.as_deref(),
+            Some("process terminated / system reboot")
+        );
         assert!(ra.ended_at.is_some());
 
         let rb = reg.get(&b).await.unwrap();
         assert_eq!(rb.status, TaskStatus::Cancelled);
-        assert_eq!(rb.reason.as_deref(), Some("worker never started / process terminated"));
+        assert_eq!(
+            rb.reason.as_deref(),
+            Some("worker never started / process terminated")
+        );
         assert!(rb.ended_at.is_some());
 
         let rc = reg.get(&c).await.unwrap();
@@ -946,7 +958,11 @@ mod tests {
         assert_eq!(re.status, TaskStatus::Completed);
 
         // Idempotent: a second pass reaps nothing new.
-        assert_eq!(reg.reap_orphans_disk().await, 0, "a second boot pass must be a no-op");
+        assert_eq!(
+            reg.reap_orphans_disk().await,
+            0,
+            "a second boot pass must be a no-op"
+        );
     }
 
     #[tokio::test]
@@ -1036,7 +1052,10 @@ mod tests {
         assert_eq!(reaped, 1);
         let rec = reg.get(task_id).await.unwrap();
         assert!(rec.status.is_terminal());
-        assert_eq!(rec.reason.as_deref(), Some("worker never started / process terminated"));
+        assert_eq!(
+            rec.reason.as_deref(),
+            Some("worker never started / process terminated")
+        );
         assert!(rec.ended_at.is_some());
     }
 
@@ -1121,7 +1140,10 @@ mod tests {
         .unwrap();
 
         let reaped = reg.reap_slots().await;
-        assert_eq!(reaped, 2, "only slot 0 (terminal task) and slot 2 (dead owner) should be reclaimed");
+        assert_eq!(
+            reaped, 2,
+            "only slot 0 (terminal task) and slot 2 (dead owner) should be reclaimed"
+        );
         assert!(
             !sem.slot_path(0).exists(),
             "terminal-task slot must be reclaimed"

@@ -125,7 +125,6 @@ The exact list below is the present-state inventory from
 | `CASTOR_DGI_REJECT_MARGIN` | `1.5` | DGI gatekeeper log-odds reject margin: reject only when `logP(OVERLOADED) − logP(ADMIT)` exceeds this. |
 | `CASTOR_DGI_BYPASS_WARM_SESSION` | `true` | Skip the DGI probe for continuations that already have a non-empty session. |
 | `CASTOR_DGI_TIMEOUT_SECS` | `30` | Timeout for the DGI 1-forward-pass logit probe. |
-| `CASTOR_PROBE_BUDGET` | `6` | Consecutive non-mutating `bash` probes before a probe-budget advisory is injected. |
 | `CASTOR_TURN_TIMEOUT_SECS` | `600` | Per-turn wall-clock watchdog timeout; `0` disables. |
 | `CASTOR_MAX_TURN_REASONING_TOKENS` | `16384` | Per-turn reasoning token budget before a "stall" is declared; `0` disables. |
 | `CASTOR_REASONING_OPEN_TAG` | `<th` + `ink>` | Reasoning block open tag delimiter (source-assembled to avoid the reserved token sequence in this codebase). |

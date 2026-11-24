@@ -303,7 +303,12 @@ impl WebClient {
         Ok(out)
     }
 
-    async fn search_brave(&self, q: &str, key: &str, limit: usize) -> Result<Vec<SearchResult>, WebError> {
+    async fn search_brave(
+        &self,
+        q: &str,
+        key: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, WebError> {
         let mut url = reqwest::Url::parse(&self.brave_base)
             .map_err(|e| WebError::Brave(format!("invalid base url: {e}")))?;
         // Brave's Search API accepts a `count` query parameter (1..=20). Set it
@@ -530,15 +535,12 @@ fn has_nul_byte(bytes: &[u8]) -> bool {
 async fn read_body_capped(resp: &mut reqwest::Response, url: &str) -> Result<Vec<u8>, WebError> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
-        let chunk = resp
-            .chunk()
-            .await
-            .map_err(|e| WebError::Http {
-                method: "GET".into(),
-                url: url.to_string(),
-                status: 0,
-                reason: e.to_string(),
-            })?;
+        let chunk = resp.chunk().await.map_err(|e| WebError::Http {
+            method: "GET".into(),
+            url: url.to_string(),
+            status: 0,
+            reason: e.to_string(),
+        })?;
         match chunk {
             None => return Ok(buf),
             Some(c) => {
@@ -902,7 +904,10 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        json_body(&format!(r#"{{"web":{{"results":[{}]}}}}"#, results.join(",")))
+        json_body(&format!(
+            r#"{{"web":{{"results":[{}]}}}}"#,
+            results.join(",")
+        ))
     }
 
     #[tokio::test]
@@ -911,10 +916,7 @@ pub(crate) mod tests {
         let base = start(app).await;
         let c = WebClient::with_base_urls(Some(format!("{base}/searxng")), None);
         // Request 2 → only 2 of the returned results are surfaced.
-        let out = c
-            .web_search("rust", None, None, Some(2))
-            .await
-            .unwrap();
+        let out = c.web_search("rust", None, None, Some(2)).await.unwrap();
         assert_eq!(out.results.len(), 2, "expected the limit to cap results");
         assert_eq!(out.results[0].url, "https://sx.example/0");
         assert_eq!(out.results[1].url, "https://sx.example/1");
@@ -930,7 +932,11 @@ pub(crate) mod tests {
             .web_search("tokio", Some("bkey"), None, Some(5))
             .await
             .unwrap();
-        assert_eq!(out.results.len(), 5, "expected the provider count to cap results");
+        assert_eq!(
+            out.results.len(),
+            5,
+            "expected the provider count to cap results"
+        );
         assert_eq!(out.results[0].url, "https://brave.example/0");
         assert_eq!(out.results[4].url, "https://brave.example/4");
     }
@@ -998,7 +1004,10 @@ pub(crate) mod tests {
     async fn brave_with_key_path() {
         let base = start(router()).await;
         let c = WebClient::with_base_urls(None, Some(format!("{base}/brave")));
-        let out = c.web_search("tokio", Some("bkey"), None, None).await.unwrap();
+        let out = c
+            .web_search("tokio", Some("bkey"), None, None)
+            .await
+            .unwrap();
         assert_eq!(out.provider, "brave");
         assert_eq!(out.results.len(), 1);
         assert_eq!(out.results[0].title, "Brave Result");
@@ -1013,7 +1022,10 @@ pub(crate) mod tests {
             Some(format!("{base}/searxng")),
             Some(format!("{base}/brave")),
         );
-        let out = c.web_search("empty", Some("bkey"), None, None).await.unwrap();
+        let out = c
+            .web_search("empty", Some("bkey"), None, None)
+            .await
+            .unwrap();
         assert_eq!(out.provider, "brave");
         assert_eq!(out.results.len(), 1);
         assert_eq!(out.results[0].title, "Brave Result");
@@ -1029,7 +1041,10 @@ pub(crate) mod tests {
             Some(format!("http://127.0.0.1:{port}")),
             Some(format!("{base}/brave")),
         );
-        let out = c.web_search("rust", Some("bkey"), None, None).await.unwrap();
+        let out = c
+            .web_search("rust", Some("bkey"), None, None)
+            .await
+            .unwrap();
         assert_eq!(out.provider, "brave");
         assert_eq!(out.results.len(), 1);
         assert_eq!(out.results[0].title, "Brave Result");

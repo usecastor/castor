@@ -8,13 +8,18 @@ use crate::runner::events::EventLogger;
 use crate::runner::messages::msg;
 
 /// Shared zero-invalidation stall retry: preserves the exact message prefix
-/// and `reasoning_effort`, logs `turn_stall_retry`, and appends `nudge` at the tail.
+/// and `reasoning_effort`, logs `turn_stall_retry`, and appends `nudge` at the
+/// tail. When `turn_timeout_secs > 0` the retry call is itself wrapped in the
+/// same wall-clock timeout as the primary call, so a hung retry is surfaced as
+/// a typed `EngineError::Http { status: 408, .. }` (Request Timeout) instead of
+/// blocking the session forever.
 #[allow(clippy::too_many_arguments)] // shared single-call stall retry helper
 async fn retry_with_nudge(
     engine: &dyn ChatEngine,
     messages: &[Message],
     tools: &[ToolSchema],
     effort: Option<&str>,
+    turn_timeout_secs: u64,
     logger: &EventLogger,
     turn: u32,
     reason: &str,
@@ -35,7 +40,24 @@ async fn retry_with_nudge(
     let _ = logger.append(event);
     let mut retry_messages = messages.to_vec();
     retry_messages.push(msg("user", nudge));
-    engine.chat(&retry_messages, tools, true, effort).await
+    let retry = engine.chat(&retry_messages, tools, true, effort);
+    if turn_timeout_secs > 0 {
+        match tokio::time::timeout(std::time::Duration::from_secs(turn_timeout_secs), retry).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                warn!(
+                    turn = turn,
+                    "turn retry stalled on wall-clock timeout ({}s)", turn_timeout_secs
+                );
+                Err(EngineError::Http {
+                    status: 408,
+                    body: format!("Turn retry timed out after {turn_timeout_secs}s"),
+                })
+            }
+        }
+    } else {
+        retry.await
+    }
 }
 
 pub(crate) const REPETITION_RETRY_NUDGE: &str = "[System: Previous response entered a repetition loop. Stop repeating prior phrasing and immediately emit your next tool call or final response.]";
@@ -73,6 +95,7 @@ pub(crate) async fn chat_with_watchdog(
                     messages,
                     tools,
                     effort,
+                    turn_timeout_secs,
                     logger,
                     turn,
                     "timeout",
@@ -104,6 +127,7 @@ pub(crate) async fn chat_with_watchdog(
                 messages,
                 tools,
                 effort,
+                turn_timeout_secs,
                 logger,
                 turn,
                 "repetition_loop",
@@ -138,6 +162,7 @@ pub(crate) async fn chat_with_watchdog(
             messages,
             tools,
             effort,
+            turn_timeout_secs,
             logger,
             turn,
             "reasoning_token_budget",

@@ -13,8 +13,11 @@ const DEFAULT_TIMEOUT_SECS: u64 = 15;
 /// The default `User-Agent` (mailto) identifier OpenAlex expects for polite
 /// scraping. The version segment is derived from the crate at compile time so
 /// OpenAlex attributes load to the concrete release.
-const DEFAULT_USER_AGENT: &str =
-    concat!("Castor/", env!("CARGO_PKG_VERSION"), " (mailto:castor@local.dev)");
+const DEFAULT_USER_AGENT: &str = concat!(
+    "Castor/",
+    env!("CARGO_PKG_VERSION"),
+    " (mailto:castor@local.dev)"
+);
 
 /// Errors produced by [`PaperClient`].
 #[derive(Debug, Error)]
@@ -360,8 +363,8 @@ fn parse_openalex_work(val: &serde_json::Value) -> Option<PaperEntity> {
 mod tests {
     use super::*;
     use axum::Router;
-    use axum::http::request::Parts;
     use axum::http::StatusCode;
+    use axum::http::request::Parts;
     use axum::response::IntoResponse;
     use axum::routing::get;
 
@@ -583,7 +586,10 @@ mod tests {
         );
         assert_eq!(
             ua,
-            format!("Castor/{} (mailto:castor@local.dev)", env!("CARGO_PKG_VERSION")),
+            format!(
+                "Castor/{} (mailto:castor@local.dev)",
+                env!("CARGO_PKG_VERSION")
+            ),
             "default user agent should be the crate-versioned mailto, got: {ua:?}"
         );
     }

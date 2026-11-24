@@ -33,6 +33,52 @@ pub fn base64_encode(data: &[u8]) -> String {
     BASE64_STANDARD.encode(data)
 }
 
+/// Search context shared by the two `fallback_search` passes: the query, a
+/// pre-folded ASCII lowercase form used by the case-insensitive pass (empty
+/// on the exact-case pass), the result cap, and the base directory from
+/// which match prefixes are computed.
+#[derive(Clone)]
+struct SearchCtx {
+    query: String,
+    lowered: String,
+    case_insensitive: bool,
+    max_results: usize,
+    base: PathBuf,
+}
+
+impl SearchCtx {
+    /// Exact-case context for a query.
+    fn exact(query: &str, max_results: usize, base: &Path) -> Self {
+        Self {
+            query: query.to_string(),
+            lowered: String::new(),
+            case_insensitive: false,
+            max_results,
+            base: base.to_path_buf(),
+        }
+    }
+
+    /// ASCII case-insensitive context for a query.
+    fn case_insensitive(query: &str, max_results: usize, base: &Path) -> Self {
+        Self {
+            query: query.to_string(),
+            lowered: query.to_ascii_lowercase(),
+            case_insensitive: true,
+            max_results,
+            base: base.to_path_buf(),
+        }
+    }
+}
+
+/// Accumulated results of a search walk: the matched lines (sorted
+/// deterministically before truncation by the caller) and the binary files
+/// skipped along the way.
+#[derive(Default)]
+struct WalkOut {
+    matches: Vec<String>,
+    skipped: Vec<String>,
+}
+
 /// The filesystem tool executor. Cheaply [`Clone`]able because both fields are
 /// value types: [`SandboxPolicy`] is a plain data holder (root lists + an
 /// `AccessClass`), and the resolution base is an `Option<PathBuf>`. Cloning is
@@ -52,20 +98,14 @@ impl FsExecutor {
     /// touched.
     pub fn new(root: &Path) -> Result<Self, FsError> {
         let policy = SandboxPolicy::workspace_only(root);
-        Ok(Self {
-            policy,
-            base: None,
-        })
+        Ok(Self { policy, base: None })
     }
 
     /// Construct with an explicit [`SandboxPolicy`] (e.g. the production policy
     /// built by [`crate::tools::CompositeExecutor::with_config`], which adds the
     /// read-only state dir and, on Linux, the system read roots).
     pub fn with_policy(policy: SandboxPolicy) -> Self {
-        Self {
-            policy,
-            base: None,
-        }
+        Self { policy, base: None }
     }
 
     /// Set the base directory against which *relative* paths are resolved (the
@@ -89,15 +129,13 @@ impl FsExecutor {
     /// the active task cwd when one is set, otherwise the primary write root
     /// (the workspace).
     fn root(&self) -> &Path {
-        self.base
-            .as_deref()
-            .unwrap_or_else(|| {
-                self.policy
-                    .write_roots()
-                    .first()
-                    .map(|p| p.as_path())
-                    .unwrap_or_else(|| Path::new("."))
-            })
+        self.base.as_deref().unwrap_or_else(|| {
+            self.policy
+                .write_roots()
+                .first()
+                .map(|p| p.as_path())
+                .unwrap_or_else(|| Path::new("."))
+        })
     }
 
     /// Resolve `input` for a **read** operation (RW ∪ RO roots allowed).
@@ -211,23 +249,63 @@ impl FsExecutor {
         let start = raw_start.saturating_sub(1).min(total);
         let end = raw_end.min(total).max(start);
         let slice = &lines[start..end];
-        let numbered: Vec<String> = slice
-            .iter()
-            .enumerate()
-            .map(|(i, line)| {
-                let content = truncate_line(line, MAX_READ_LINE_CHARS);
-                format!("{}: {}", start + i + 1, content)
-            })
-            .collect();
-        let showing_start = if slice.is_empty() { start } else { start + 1 };
-        Ok(format!(
+        // Byte-budgeted read window: number lines in order, accumulating each
+        // line's display width (line-number prefix + truncated content + one
+        // separator byte) until the budget is reached. At least one line is
+        // always included (a single line is capped at `MAX_READ_LINE_CHARS`, so
+        // it can never blow the budget on its own). This guarantees `read_file`
+        // output stays bounded, so a read can never be the trigger for a
+        // middle-deleting spill (see `spill_tool_output`) — the tool now returns
+        // a cleanly truncated window plus, under the `ast` feature, an outline
+        // of the unread tail instead of a raw oversized blob.
+        const MAX_READ_OUTPUT_BYTES: usize = 13_500;
+        let mut numbered: Vec<String> = Vec::new();
+        let mut acc: usize = 0;
+        for (i, line) in slice.iter().enumerate() {
+            let content = truncate_line(line, MAX_READ_LINE_CHARS);
+            let n = format!("{}: {}", start + i + 1, content);
+            let cost = n.len() + 1; // the trailing "\n" separator
+            if !numbered.is_empty() && acc + cost > MAX_READ_OUTPUT_BYTES {
+                break;
+            }
+            numbered.push(n);
+            acc += cost;
+        }
+        let actual_end = start + numbered.len();
+        let showing_start = if numbered.is_empty() {
+            start
+        } else {
+            start + 1
+        };
+        let out = format!(
             "{} (total: {} lines, showing: {}-{})\n{}",
             resolved.display(),
             total,
             showing_start,
-            end,
+            actual_end,
             numbered.join("\n")
-        ))
+        );
+        // When the `ast` feature is active and the read window stops short of
+        // the end of the file, append a compact symbol outline of the unread
+        // tail so a truncated read still surfaces the remaining top-level and
+        // nested declarations as an index. Only code-language extensions have
+        // a grammar behind the outline; prose and config formats (`.md`,
+        // `.json`, …) produce nothing. The output is shadowed with a mutable
+        // copy so the base binding stays immutable when the feature is off.
+        #[cfg(feature = "ast")]
+        let out = {
+            let mut out = out;
+            if !is_pdf
+                && !is_image
+                && actual_end < total
+                && let Some(outline) =
+                    crate::tools::ast::outline_after_line(&resolved, &content, actual_end + 1)
+            {
+                out.push_str(&outline);
+            }
+            out
+        };
+        Ok(out)
     }
 
     fn write_file(&self, path: &str, content: &str, overwrite: bool) -> Result<String, FsError> {
@@ -454,9 +532,7 @@ impl FsExecutor {
         // parent directory: `path` names exactly what should be searched, so
         // matches are constrained to that one file (sibling files are excluded).
         if resolved.is_file() {
-            if self.is_inside_git_repo(&resolved)
-                && !self.is_git_ignored(&resolved)
-            {
+            if self.is_inside_git_repo(&resolved) && !self.is_git_ignored(&resolved) {
                 return self.git_grep_file(query, &resolved, max_results);
             }
             return self.search_single_file(query, &resolved, max_results);
@@ -536,6 +612,11 @@ impl FsExecutor {
     /// Run `git grep` with an explicit pathspec (or `None` to search the whole
     /// worktree). Shared by the directory-based [`Self::git_grep`] and the
     /// single-file [`Self::git_grep_file`] entry points.
+    ///
+    /// The primary pass is exact-case (`-F`). When it matches nothing and the
+    /// pattern contains ASCII letters, a case-insensitive second pass (`-i`)
+    /// runs; its matches are returned with a `[No exact-case matches; showing
+    /// case-insensitive matches:]` header so the caller can tell the two apart.
     fn git_grep_with_pathspec(
         &self,
         query: &str,
@@ -554,6 +635,26 @@ impl FsExecutor {
             .output()?;
 
         if output.status.code() == Some(1) {
+            // Exact-case miss. Fall back to a case-insensitive pass when the
+            // pattern has any casing to vary.
+            if pattern_is_ascii_alpha(query) {
+                let mut ci_args = args.clone();
+                let dash_e = ci_args.iter().position(|a| *a == "-e").unwrap();
+                ci_args.insert(dash_e, "-i");
+                let ci_output = std::process::Command::new("git")
+                    .args(&ci_args)
+                    .current_dir(self.root())
+                    .output()?;
+                if ci_output.status.code() != Some(1) && ci_output.status.success() {
+                    let ci_stdout = String::from_utf8_lossy(&ci_output.stdout);
+                    if !ci_stdout.trim().is_empty() {
+                        return Ok(format!(
+                            "[No exact-case matches; showing case-insensitive matches:]\n{}",
+                            self.format_git_grep_output(&ci_stdout, query, max_results)
+                        ));
+                    }
+                }
+            }
             return Ok("No matches found.".into());
         }
         if !output.status.success() {
@@ -562,11 +663,16 @@ impl FsExecutor {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(self.format_git_grep_output(&stdout, query, max_results))
+    }
+
+    /// Deterministically format raw `git grep` output: lexicographically
+    /// sorted lines (multi-threaded `git grep` emits matches in a
+    /// non-deterministic order; sorting before truncation keeps the first
+    /// `max_results` matches stable across repeated invocations), per-line
+    /// truncation, and a trailing count header.
+    fn format_git_grep_output(&self, stdout: &str, query: &str, max_results: usize) -> String {
         let mut lines: Vec<&str> = stdout.lines().collect();
-        // Multi-threaded `git grep` can emit matches in a
-        // non-deterministic order. Sort the raw lines lexicographically
-        // BEFORE truncation so the first `max_results` matches are stable
-        // across repeated invocations (warm Turn-1 prefix for KV caching).
         lines.sort();
         let matches: Vec<String> = lines
             .iter()
@@ -586,95 +692,86 @@ impl FsExecutor {
                 lines.len() - max_results
             );
         }
-        Ok(out)
+        out
     }
 
+    /// Filesystem-walk search (non-git workspaces and gitignored trees).
+    /// Two-pass: an exact-case walk first; when it finds nothing and the
+    /// pattern contains ASCII letters, a case-insensitive walk (ASCII
+    /// case-folding) runs second, and its matches are returned under the
+    /// `[No exact-case matches; showing case-insensitive matches:]` header.
+    /// Matches from both passes are lexicographically sorted before
+    /// truncation so the emitted order is deterministic regardless of
+    /// platform directory-enumeration order.
     fn fallback_search(
         &self,
         query: &str,
         search_dir: &Path,
         max_results: usize,
     ) -> Result<String, FsError> {
-        let mut matches: Vec<String> = Vec::new();
-        let mut skipped: Vec<String> = Vec::new();
-        self.walk_search(
-            search_dir,
-            search_dir,
-            query,
-            max_results,
-            &mut matches,
-            &mut skipped,
-        )?;
+        let ctx = SearchCtx::exact(query, max_results, search_dir);
+        let exact = self.walk(&ctx, search_dir)?;
 
+        let mut ci = WalkOut::default();
+        if exact.matches.is_empty() && pattern_is_ascii_alpha(query) {
+            // A fresh `WalkOut`: binary files were already counted during the
+            // exact pass, so the CI pass must not double-report them.
+            ci = self.walk(
+                &SearchCtx::case_insensitive(query, max_results, search_dir),
+                search_dir,
+            )?;
+        }
+
+        let (ci_mode, matches) = if !ci.matches.is_empty() {
+            (true, &ci.matches)
+        } else {
+            (false, &exact.matches)
+        };
+
+        // A pattern matched by neither pass (and with no skipped binaries to
+        // report) yields the canonical no-match string, matching the git path.
+        if matches.is_empty() && exact.skipped.is_empty() {
+            return Ok("No matches found.".into());
+        }
+
+        let mut out = String::new();
+        if ci_mode {
+            out.push_str("[No exact-case matches; showing case-insensitive matches:]\n");
+        }
         use std::fmt::Write;
-        let mut out = format!("{} match(es) for '{query}':\n", matches.len());
-        for m in &matches {
+        let _ = writeln!(out, "{} match(es) for '{query}':", matches.len());
+        for m in matches {
             let _ = writeln!(out, "  {m}");
         }
-        if !skipped.is_empty() {
-            let _ = writeln!(out, "  ({} binary files skipped)", skipped.len());
+        if !exact.skipped.is_empty() && matches.is_empty() {
+            let _ = writeln!(out, "  ({} binary files skipped)", exact.skipped.len());
         }
         Ok(out)
     }
 
-    /// Search a single file by reading it directly and matching line-by-line.
-    /// Used as the non-git fallback when `search_code` is given a file path.
-    /// The match prefix is the file's workspace-relative path, so output stays
-    /// consistent with the directory-walk format.
-    fn search_single_file(
-        &self,
-        query: &str,
-        file: &Path,
-        max_results: usize,
-    ) -> Result<String, FsError> {
-        let rel = file.strip_prefix(self.root()).unwrap_or(file);
-        let rel_str = rel.to_string_lossy().to_string();
-        let content = fs::read_to_string(file)?;
-        let mut matches: Vec<String> = Vec::new();
-        for (i, line) in content.lines().enumerate() {
-            if matches.len() >= max_results {
-                break;
-            }
-            if line.contains(query) {
-                matches.push(format!(
-                    "{rel_str}:{}:{}",
-                    i + 1,
-                    truncate_line(line, MAX_SEARCH_LINE_CHARS)
-                ));
-            }
-        }
-
-        use std::fmt::Write;
-        let mut out = format!("{} match(es) for '{query}':\n", matches.len());
-        for m in &matches {
-            let _ = writeln!(out, "  {m}");
-        }
-        Ok(out)
-    }
-
-    fn walk_search(
-        &self,
-        base: &Path,
-        current: &Path,
-        query: &str,
-        max_results: usize,
-        matches: &mut Vec<String>,
-        skipped: &mut Vec<String>,
-    ) -> Result<(), FsError> {
-        if matches.len() >= max_results {
-            return Ok(());
+    /// Shared recursive walk behind both [`Self::fallback_search`] passes and
+    /// [`Self::search_single_file`]. Files are matched line-by-line; a
+    /// [`SearchCtx`] with `case_insensitive` set switches the per-line test to
+    /// ASCII case-folding against its pre-folded query. Directory entries are
+    /// enumerated into a sorted `Vec` (by `file_name()`) before recursing so
+    /// the walk order is deterministic and independent of the platform's raw
+    /// enumeration. Each match is recorded as `rel:1-based line:line text`,
+    /// truncated to [`MAX_SEARCH_LINE_CHARS`]. The walk stops adding matches
+    /// once the context's cap is reached (it is truncated by the caller
+    /// anyway); `out` therefore never overflows the cap.
+    fn walk(&self, ctx: &SearchCtx, current: &Path) -> Result<WalkOut, FsError> {
+        let mut out = WalkOut::default();
+        if out.matches.len() >= ctx.max_results {
+            return Ok(out);
         }
         let dir_iter = match fs::read_dir(current) {
             Ok(e) => e,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(out),
         };
-        // Collect the OS directory enumeration into a Vec and sort
-        // by file_name() so the fallback search order is deterministic
-        // (independent of platform directory enumeration order).
         let mut entries: Vec<fs::DirEntry> = dir_iter.filter_map(|e| e.ok()).collect();
         entries.sort_by_key(|e| e.file_name().to_string_lossy().into_owned());
         for entry in entries {
-            if matches.len() >= max_results {
+            if out.matches.len() >= ctx.max_results {
                 break;
             }
             let name = entry.file_name().to_string_lossy().to_string();
@@ -684,13 +781,15 @@ impl FsExecutor {
             let full = entry.path();
             let ft = entry.file_type()?;
             if ft.is_dir() {
-                self.walk_search(base, &full, query, max_results, matches, skipped)?;
+                let sub = self.walk(ctx, &full)?;
+                out.matches.extend(sub.matches);
+                out.skipped.extend(sub.skipped);
             } else if ft.is_file() {
                 let size = entry.metadata()?.len();
                 if size < 500_000 {
                     if is_binary_extension(&name) {
-                        let rel = full.strip_prefix(base).unwrap_or(&full);
-                        skipped.push(format!(
+                        let rel = full.strip_prefix(&ctx.base).unwrap_or(&full);
+                        out.skipped.push(format!(
                             "{} (skipped-binary: extension '{}')",
                             rel.to_string_lossy(),
                             name
@@ -698,14 +797,19 @@ impl FsExecutor {
                         continue;
                     }
                     if let Ok(content) = fs::read_to_string(&full) {
-                        let rel = full.strip_prefix(base).unwrap_or(&full);
+                        let rel = full.strip_prefix(&ctx.base).unwrap_or(&full);
                         let rel_str = rel.to_string_lossy().to_string();
                         for (i, line) in content.lines().enumerate() {
-                            if matches.len() >= max_results {
+                            if out.matches.len() >= ctx.max_results {
                                 break;
                             }
-                            if line.contains(query) {
-                                matches.push(format!(
+                            let hit = if ctx.case_insensitive {
+                                line.to_ascii_lowercase().contains(ctx.lowered.as_str())
+                            } else {
+                                line.contains(&ctx.query)
+                            };
+                            if hit {
+                                out.matches.push(format!(
                                     "{rel_str}:{}:{}",
                                     i + 1,
                                     truncate_line(line, MAX_SEARCH_LINE_CHARS)
@@ -716,7 +820,88 @@ impl FsExecutor {
                 }
             }
         }
-        Ok(())
+        out.matches.sort();
+        out.matches.truncate(ctx.max_results);
+        Ok(out)
+    }
+
+    /// Search a single file by reading it directly and matching line-by-line.
+    /// Used as the non-git fallback when `search_code` is given a file path.
+    /// The match prefix is the file's workspace-relative path, so output stays
+    /// consistent with the directory-walk format.
+    ///
+    /// Like [`Self::fallback_search`], the match is two-pass: exact-case
+    /// first, then an ASCII case-insensitive retry when nothing exact-case was
+    /// found and the query has ASCII letters, under the same fallback header.
+    fn search_single_file(
+        &self,
+        query: &str,
+        file: &Path,
+        max_results: usize,
+    ) -> Result<String, FsError> {
+        let rel = file.strip_prefix(self.root()).unwrap_or(file);
+        let rel_str = rel.to_string_lossy().to_string();
+        let content = fs::read_to_string(file)?;
+        let ci = pattern_is_ascii_alpha(query);
+
+        let collect = |case_insensitive: bool| -> Vec<String> {
+            let lower = if case_insensitive {
+                Some(query.to_ascii_lowercase())
+            } else {
+                None
+            };
+            let mut hits: Vec<String> = Vec::new();
+            for (i, line) in content.lines().enumerate() {
+                if hits.len() >= max_results {
+                    break;
+                }
+                let hit = match &lower {
+                    Some(q) => line.to_ascii_lowercase().contains(q.as_str()),
+                    None => line.contains(query),
+                };
+                if hit {
+                    hits.push(format!(
+                        "{rel_str}:{}:{}",
+                        i + 1,
+                        truncate_line(line, MAX_SEARCH_LINE_CHARS)
+                    ));
+                }
+            }
+            hits.sort();
+            hits.truncate(max_results);
+            hits
+        };
+
+        let exact = collect(false);
+        let mut ci_matches = Vec::new();
+        if exact.is_empty() && ci {
+            ci_matches = collect(true);
+        }
+
+        // A truly absent pattern (exact and, when applicable, case-insensitive
+        // both empty) reports the canonical no-match string so the model sees
+        // the same result whether the search ran through `git grep` or this
+        // per-file walk.
+        if exact.is_empty() && ci_matches.is_empty() {
+            return Ok("No matches found.".into());
+        }
+
+        let (ci_mode, matches) = if !ci_matches.is_empty() {
+            (true, &ci_matches)
+        } else {
+            (false, &exact)
+        };
+
+        let mut out = String::new();
+        if ci_mode {
+            out.push_str("[No exact-case matches; showing case-insensitive matches:]\n");
+        }
+        use std::fmt::Write;
+        let _ = writeln!(out, "{} match(es) for '{query}':", matches.len());
+        for m in matches {
+            let _ = writeln!(out, "  {m}");
+        }
+        Ok(out)
     }
 
     fn atomic_write(&self, target: &Path, content: &str) -> Result<(), FsError> {
@@ -818,6 +1003,15 @@ fn is_binary_extension(name: &str) -> bool {
             | "sqlite"
             | "db"
     )
+}
+
+/// Whether a search pattern contains at least one ASCII alphabetic character.
+/// The case-insensitive fallback path only activates for patterns of this
+/// shape: a purely numeric or symbol-only pattern has no alternate casing to
+/// retry, and a pattern whose distinguishing characters are non-ASCII is not
+/// case-folded by the ASCII fallback.
+fn pattern_is_ascii_alpha(pattern: &str) -> bool {
+    pattern.bytes().any(|b| b.is_ascii_alphabetic())
 }
 
 fn line_ending_style(text: &str) -> Option<&'static str> {
@@ -1127,7 +1321,10 @@ mod tests {
             "report the constraint",
             "Lead Architect / user",
         ] {
-            assert!(msg.contains(needle), "model-facing denial missing '{needle}': {msg}");
+            assert!(
+                msg.contains(needle),
+                "model-facing denial missing '{needle}': {msg}"
+            );
         }
     }
 
@@ -1157,7 +1354,9 @@ mod tests {
         let ex = FsExecutor::with_policy(policy);
         let target = state.join("x.txt");
 
-        let err = ex.write_file(&target.to_string_lossy(), "x\n", true).unwrap_err();
+        let err = ex
+            .write_file(&target.to_string_lossy(), "x\n", true)
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("is read-only"), "{msg}");
         assert!(msg.contains("Do NOT attempt to bypass"), "{msg}");
@@ -1303,21 +1502,32 @@ mod tests {
             py_err.to_string().contains("No write performed"),
             "expected 'No write performed', got: {py_err}"
         );
-        assert!(!root.join("bad.py").exists(), "file must not be created on disk");
+        assert!(
+            !root.join("bad.py").exists(),
+            "file must not be created on disk"
+        );
 
         // 2. TypeScript with broken syntax
         let ts_err = ex
-            .write_file("bad.ts", "interface User { name: string age: number; }", true)
+            .write_file(
+                "bad.ts",
+                "interface User { name: string age: number; }",
+                true,
+            )
             .unwrap_err();
         assert!(ts_err.to_string().contains("SyntaxValidationError"));
-        assert!(!root.join("bad.ts").exists(), "file must not be created on disk");
+        assert!(
+            !root.join("bad.ts").exists(),
+            "file must not be created on disk"
+        );
 
         // 3. JSON with broken syntax
-        let json_err = ex
-            .write_file("bad.json", "{\"key\": ,}", true)
-            .unwrap_err();
+        let json_err = ex.write_file("bad.json", "{\"key\": ,}", true).unwrap_err();
         assert!(json_err.to_string().contains("SyntaxValidationError"));
-        assert!(!root.join("bad.json").exists(), "file must not be created on disk");
+        assert!(
+            !root.join("bad.json").exists(),
+            "file must not be created on disk"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1328,28 +1538,44 @@ mod tests {
         let root = test_root("write_syntax_ok");
         let ex = executor(&root);
 
-        ex.write_file("good.rs", "pub fn sum(a: i32, b: i32) -> i32 { a + b }\n", true)
-            .unwrap();
+        ex.write_file(
+            "good.rs",
+            "pub fn sum(a: i32, b: i32) -> i32 { a + b }\n",
+            true,
+        )
+        .unwrap();
         assert!(root.join("good.rs").exists());
 
         ex.write_file("good.py", "def sum(a, b):\n    return a + b\n", true)
             .unwrap();
         assert!(root.join("good.py").exists());
 
-        ex.write_file("good.ts", "export const sum = (a: number, b: number): number => a + b;\n", true)
-            .unwrap();
+        ex.write_file(
+            "good.ts",
+            "export const sum = (a: number, b: number): number => a + b;\n",
+            true,
+        )
+        .unwrap();
         assert!(root.join("good.ts").exists());
 
-        ex.write_file("good.go", "package main\nfunc sum(a, b int) int { return a + b }\n", true)
-            .unwrap();
+        ex.write_file(
+            "good.go",
+            "package main\nfunc sum(a, b int) int { return a + b }\n",
+            true,
+        )
+        .unwrap();
         assert!(root.join("good.go").exists());
 
         ex.write_file("good.json", "{\"status\": \"ok\", \"count\": 42}\n", true)
             .unwrap();
         assert!(root.join("good.json").exists());
 
-        ex.write_file("good.html", "<!DOCTYPE html><html><body><h1>Title</h1></body></html>\n", true)
-            .unwrap();
+        ex.write_file(
+            "good.html",
+            "<!DOCTYPE html><html><body><h1>Title</h1></body></html>\n",
+            true,
+        )
+        .unwrap();
         assert!(root.join("good.html").exists());
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1423,7 +1649,7 @@ mod tests {
 
     /// The fallback `search_code` path (filesystem walk) must return
     /// matches in a deterministic order that is independent of the platform's
-    /// raw directory-enumeration order. `walk_search` collects each directory's
+    /// raw directory-enumeration order. `walk` collects each directory's
     /// entries into a `Vec` and sorts by `file_name()` before recursing, so the
     /// emitted order is stable (depth-first, siblings sorted).
     #[test]
@@ -1459,6 +1685,80 @@ mod tests {
         let out = ex.read_file("min.js", 1, None).unwrap();
         assert!(out.contains("... [line truncated]"));
         assert!(out.len() < 3000);
+    }
+
+    /// Parse the upper bound (`Y`) from the `showing: X-Y` header line.
+    fn showing_end(out: &str) -> usize {
+        let rest = out
+            .split_once("showing: ")
+            .expect("header carries the window")
+            .1;
+        let (_, tail) = rest.split_once('-').expect("window is `X-Y`");
+        tail.split(')')
+            .next()
+            .expect("window end is numeric")
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn read_file_byte_budget_stops_cleanly_without_spilling() {
+        let root = test_root("read_byte_budget");
+        let file = root.join("big.rs");
+        // 800 short function lines whose raw content totals well over 25 KB, so
+        // the default 800-line window would far exceed the 13.5 KB byte budget.
+        let content = (1..=800)
+            .map(|i| format!("pub fn f{i}(a: u64, b: u64) -> u64 {{ a.wrapping_add(b) }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            content.len() > 25_000,
+            "fixture should exceed 25 KB: {}",
+            content.len()
+        );
+        fs::write(&file, &content).unwrap();
+        let ex = executor(&root);
+
+        let out = ex.read_file("big.rs", 1, None).unwrap();
+
+        // The byte budget stops the numbered window well before line 800.
+        let actual_end = showing_end(&out);
+        assert!(
+            actual_end < 800,
+            "byte budget must truncate the window: actual_end={actual_end}"
+        );
+        assert!(actual_end >= 1, "at least one line must always be returned");
+        // The whole output (header + numbered lines + outline) stays under the
+        // 16 KiB spill threshold, so a read can never trigger a middle-deleting
+        // spill of its own output.
+        assert!(
+            out.len() < 16_384,
+            "output of {} bytes must stay below the 16 KiB spill threshold",
+            out.len()
+        );
+        // The numbered lines are contiguous from 1..=actual_end with no gaps:
+        // each appears as `"\n{n}: "` at a line start (the leading newline
+        // disambiguates `"5: "` from a `"15: "` prefix).
+        for n in 1..=actual_end {
+            assert!(
+                out.contains(&format!("\n{n}: ")),
+                "expected numbered line {n} to be present contiguously"
+            );
+        }
+        // The first line past the window is not included as a numbered line.
+        assert!(
+            !out.contains(&format!("\n{}: ", actual_end + 1)),
+            "line {} must not be a numbered line",
+            actual_end + 1
+        );
+        // Under the `ast` feature, the unread tail is surfaced as an outline
+        // starting at `actual_end + 1` (no raw middle-deletion).
+        if cfg!(feature = "ast") {
+            assert!(
+                out.contains(&format!("[Outline of unread lines {}..", actual_end + 1)),
+                "outline must start at actual_end+1; got: {out}"
+            );
+        }
     }
 
     #[test]
@@ -1503,7 +1803,10 @@ mod tests {
         let mut p = fs::metadata(&file).unwrap().permissions();
         p.set_mode(0o644);
         fs::set_permissions(&file, p).unwrap();
-        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
 
         let ex = executor(&root);
         // Rewrite the existing file: its 0644 mode must survive.
@@ -1611,5 +1914,225 @@ mod tests {
             "sibling file must not appear in a single-file git search: {file_out}"
         );
         assert!(file_out.contains("1 match(es)"), "{file_out}");
+    }
+
+    // ----------------------------------------------------------------
+    // Adversarial outline & case-insensitive fallback tests
+    // ----------------------------------------------------------------
+
+    /// Test 1: A complete read (`end == total`) appends no outline block, even
+    /// for a code-language file.
+    #[cfg(feature = "ast")]
+    #[test]
+    fn outline_no_block_on_complete_read() {
+        let root = test_root("outline_complete_rs");
+        let rust = root.join("lib.rs");
+        let rust_src = (1..=5)
+            .map(|i| format!("fn f_{i}() {{ let x = {i}; }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rust, &rust_src).unwrap();
+
+        let root2 = test_root("outline_complete_py");
+        let py = root2.join("mod.py");
+        let py_src = (1..=5)
+            .map(|i| format!("def f_{i}():\n    return {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&py, &py_src).unwrap();
+
+        // Complete read of a Rust file: no outline.
+        let ex = executor(&root);
+        let total_rust = rust_src.lines().count();
+        let out = ex.read_file("lib.rs", 1, Some(total_rust)).unwrap();
+        assert!(
+            !out.contains("[Outline of unread lines"),
+            "complete Rust read must not append an outline: {out}"
+        );
+
+        // Complete read of a Python file: no outline.
+        let ex2 = executor(&root2);
+        let total_py = py_src.lines().count();
+        let out2 = ex2.read_file("mod.py", 1, Some(total_py)).unwrap();
+        assert!(
+            !out2.contains("[Outline of unread lines"),
+            "complete Python read must not append an outline: {out2}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
+    }
+
+    /// Test 2: A truncated read of a Rust file whose unread tail holds an
+    /// `impl Foo { fn bar() {} }` plus a broken region extracts `impl Foo` and
+    /// the nested `fn bar` with accurate 1-based line numbers while the ERROR
+    /// node from the broken region is ignored.
+    #[cfg(feature = "ast")]
+    #[test]
+    fn outline_truncated_read_nested_and_broken() {
+        let root = test_root("outline_nested");
+        let file = root.join("widget.rs");
+        // Lines 1-10 are the already-read prologue. The unread tail
+        // (lines 11+) carries the `impl` with a nested method, then a
+        // top-level `let`, which is invalid as a Rust item and recovers as an
+        // ERROR node.
+        let content = concat!(
+            "// prologue line 1\n",  // 1
+            "// prologue line 2\n",  // 2
+            "// prologue line 3\n",  // 3
+            "// prologue line 4\n",  // 4
+            "// prologue line 5\n",  // 5
+            "// prologue line 6\n",  // 6
+            "// prologue line 7\n",  // 7
+            "// prologue line 8\n",  // 8
+            "// prologue line 9\n",  // 9
+            "// prologue line 10\n", // 10
+            "impl Foo {\n",          // 11
+            "    fn bar() {\n",      // 12
+            "        0\n",           // 13
+            "    }\n",               // 14
+            "}\n",                   // 15
+            "\n",                    // 16
+            "let broken = ;;;\n",    // 17 (top-level `let` → ERROR node)
+        );
+        fs::write(&file, content).unwrap();
+
+        let ex = executor(&root);
+        // Reading only lines 1..10 leaves the rest unread → outline appended.
+        let out = ex.read_file("widget.rs", 1, Some(10)).unwrap();
+        assert!(
+            out.contains("[Outline of unread lines 11.."),
+            "truncated read must append an outline for the unread tail: {out}"
+        );
+        // `impl Foo` (line 11) is a top-level container: 2-space indent.
+        assert!(out.contains("  L11: impl Foo"), "impl item expected: {out}");
+        // The nested method sits two scopes deeper (source_file → impl_item →
+        // block → function_item = depth 3): 6-space indent, exact line.
+        assert!(
+            out.contains("      L12: fn bar()"),
+            "nested method with correct depth/line expected: {out}"
+        );
+        // The broken top-level `let` is an ERROR node: it must never appear
+        // as an outline item, and no error-kind marker may leak.
+        assert!(!out.contains("L17"), "ERROR node must be skipped: {out}");
+        assert!(!out.contains("broken"), "ERROR text must be skipped: {out}");
+        for bad in ["ERROR", "UNDEFINED", "MISSING"] {
+            assert!(!out.contains(bad), "error node kind leaked: {out}");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test 3: A truncated read of an unsupported (prose/config) file appends
+    /// no outline and does not error.
+    #[test]
+    fn outline_unsupported_file_no_block_no_error() {
+        let root = test_root("outline_md");
+        let md = root.join("notes.md");
+        let md_src = (1..=50)
+            .map(|i| format!("# Heading {i}\n\nSome prose line {i}.\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&md, &md_src).unwrap();
+
+        let ex = executor(&root);
+        let out = ex.read_file("notes.md", 1, Some(10)).unwrap();
+        assert!(
+            !out.contains("[Outline of unread lines"),
+            "a .md file must not produce an outline: {out}"
+        );
+        assert!(out.contains("showing: 1-10"), "{out}");
+
+        let root2 = test_root("outline_json");
+        let json = root2.join("data.json");
+        let json_src = (1..=60)
+            .map(|i| format!("  \"key{i}\": {i},"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let json_full = format!("{{\n{json_src}\n}}");
+        fs::write(&json, &json_full).unwrap();
+        let ex2 = executor(&root2);
+        let out2 = ex2.read_file("data.json", 1, Some(10)).unwrap();
+        assert!(
+            !out2.contains("[Outline of unread lines"),
+            "a .json file must not produce an outline: {out2}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
+    }
+
+    /// Test 4: A file with 100 functions after the read window caps the
+    /// outline at 40 items plus a `(60 more declarations)` summary.
+    #[cfg(feature = "ast")]
+    #[test]
+    fn outline_caps_at_40_with_more_summary() {
+        let root = test_root("outline_cap");
+        let file = root.join("many.rs");
+        // A short header (2 lines) then 100 functions, so functions 1-100
+        // all fall in the unread tail after reading lines 1..2.
+        let mut src = String::from("// header\n// header2\n");
+        for i in 0..100 {
+            src.push_str(&format!("fn f_{i:02}() {{ }}\n"));
+        }
+        fs::write(&file, &src).unwrap();
+
+        let ex = executor(&root);
+        let out = ex.read_file("many.rs", 1, Some(2)).unwrap();
+        assert!(
+            out.contains("[Outline of unread lines 3.."),
+            "expected outline header: {out}"
+        );
+        // Exactly 40 declaration lines, each indented at top level (2 spaces).
+        let decl_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("  L") && l.chars().nth(2) == Some('L') && l.contains(": fn"))
+            .collect();
+        assert_eq!(
+            decl_lines.len(),
+            40,
+            "outline must be capped at 40 declaration items: {out}"
+        );
+        assert!(
+            out.contains("... (60 more declarations)"),
+            "remaining count summary expected: {out}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test 5: Searching for a lowercased name when the file holds a
+    /// CamelCase version returns the case-insensitive match with the fallback
+    /// header; a truly nonexistent string still returns "No matches found."
+    #[test]
+    fn search_code_case_insensitive_fallback() {
+        let root = test_root("search_ci_fallback");
+        let file = root.join("module.js");
+        fs::write(&file, "function MyFunction(a) {\n  return a;\n}\n").unwrap();
+        let ex = executor(&root);
+
+        // Lowercase query against a CamelCase identifier → CI match + header.
+        let out = ex.search_code("myfunction", "module.js", 100).unwrap();
+        assert!(
+            out.contains("[No exact-case matches; showing case-insensitive matches:]"),
+            "expected the CI fallback header: {out}"
+        );
+        assert!(out.contains("MyFunction"), "CI match must surface: {out}");
+        assert!(out.contains("match(es) for 'myfunction'"), "{out}");
+
+        // A truly nonexistent string (with ASCII letters) → no matches.
+        let out_none = ex
+            .search_code("zzzdefinitelyabsent", "module.js", 100)
+            .unwrap();
+        assert!(
+            out_none.contains("No matches found."),
+            "truly absent string must report no matches: {out_none}"
+        );
+        assert!(
+            !out_none.contains("case-insensitive matches"),
+            "no header when the CI pass also finds nothing: {out_none}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -418,6 +418,15 @@ pub async fn run_job_with_engine(
         }
         Err(e) => {
             let err_msg = format!("failed to initialize executor: {e}");
+            // Terminal event guarantee: `session_start` was already logged
+            // above, so append a `final` / `failed` event here too — the
+            // event ledger must never end without a terminal event on an
+            // error exit (the pruner's terminal-set check relies on this).
+            let _ = logger.append(json!({
+                "type": "final",
+                "status": "failed",
+                "reason": err_msg.clone(),
+            }));
             let _ = registry
                 .transition(&spec.task_id, TaskStatus::Failed, Some(err_msg.clone()))
                 .await;
@@ -445,7 +454,6 @@ pub async fn run_job_with_engine(
         .with_turn_watchdog(config.turn_timeout_secs, config.max_turn_reasoning_tokens);
     options.workspace = Some(workspace_root.clone());
     options.reasoning_effort = spec.reasoning_effort.clone();
-    options.probe_budget = config.probe_budget;
     // 0 when unset → the session-history watermark is disabled (zero behavior
     // change for callers that don't configure a context budget).
     options.max_context = max_ctx as usize;
@@ -493,10 +501,25 @@ pub async fn run_job_with_engine(
             // Defensive sweep: our lease is bound to a now-terminal task, so
             // the reaper reclaims any orphaned slot this worker left behind.
             sem.clear_reclaimable();
+            // Refresh `telemetry/stats.json` from the final session ledger so
+            // the stats file stays current after every completed or failed
+            // session (best-effort: a write failure never breaks the worker).
+            let _ = crate::telemetry::rollup::derive_stats(state.root(), &Default::default());
             Ok(session_res.final_text)
         }
         Err(e) => {
             let err_msg = e.to_string();
+            // Terminal event guarantee: a `run_session` error exit returns
+            // before its own `final` event is written, so append a
+            // `final` / `failed` event here — the event ledger must never end
+            // without a terminal event (the pruner's terminal-set check
+            // relies on this). Written before `derive_stats` so the stats
+            // rollup sees it.
+            let _ = logger.append(json!({
+                "type": "final",
+                "status": "failed",
+                "reason": err_msg.clone(),
+            }));
             let _ = registry
                 .transition(&spec.task_id, TaskStatus::Failed, Some(err_msg.clone()))
                 .await;
@@ -505,6 +528,10 @@ pub async fn run_job_with_engine(
             // Defensive sweep: our lease is bound to a now-terminal task, so
             // the reaper reclaims any orphaned slot this worker left behind.
             sem.clear_reclaimable();
+            // Refresh `telemetry/stats.json` from the final session ledger so
+            // the stats file stays current after every completed or failed
+            // session (best-effort: a write failure never breaks the worker).
+            let _ = crate::telemetry::rollup::derive_stats(state.root(), &Default::default());
             Err(err_msg)
         }
     }
@@ -624,6 +651,73 @@ mod tests {
             "session_start must carry reasoning_effort=null when unset: {session_start}"
         );
         assert!(events.iter().any(|e| e["type"] == "final"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When a worker session terminates, the telemetry rollup re-derives the
+    /// stats and persists `<state_dir>/telemetry/stats.json`, so the stats
+    /// file stays current after every completed or failed session.
+    #[tokio::test]
+    async fn run_job_persists_telemetry_stats_json_on_session_end() {
+        let (state, dir) = tmp_state();
+        let registry = TaskRegistry::new(&state);
+
+        let task_id = registry
+            .create("telemetry stats test", dir.to_str().unwrap(), "sess_tel")
+            .await
+            .unwrap();
+
+        let spec = JobSpec {
+            task_id: task_id.clone(),
+            prompt: "telemetry stats test".to_string(),
+            cwd: dir.to_str().unwrap().to_string(),
+            session_id: "sess_tel".to_string(),
+            reasoning_effort: None,
+            extensions: None,
+            skills: None,
+            test_command: None,
+            turns_budget: Some(10),
+            timeout_ms: None,
+        };
+
+        let engine = ScriptedEngine {
+            responses: tokio::sync::Mutex::new(VecDeque::from(vec![Completion {
+                content: "Task successfully finished.".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: Some("stop".to_string()),
+                metrics: Metrics {
+                    ttft_ms: None,
+                    total_ms: 10.0,
+                    tokens_per_sec: None,
+                    prompt_tokens: None,
+                    cached_tokens: None,
+                    completion_tokens: None,
+                    reasoning_tokens: None,
+                },
+            }])),
+        };
+
+        let loaded = crate::config::load().expect("load default config");
+        let mut config = loaded.config;
+        config.state_dir = dir.clone();
+
+        let res = run_job_with_engine(&spec, &state, &config, &engine)
+            .await
+            .unwrap();
+        assert_eq!(res, "Task successfully finished.");
+
+        // The terminal session is projected into `telemetry/stats.json`.
+        let stats_path = state.root().join("telemetry/stats.json");
+        assert!(
+            stats_path.exists(),
+            "session termination must persist telemetry/stats.json"
+        );
+        let stats: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&stats_path).unwrap()).unwrap();
+        assert_eq!(stats["total_sessions"], 1);
+        assert_eq!(stats["total_tasks_completed"], 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

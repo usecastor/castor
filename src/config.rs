@@ -140,9 +140,6 @@ pub struct Config {
     /// Secret: never print the value.
     pub openalex_api_key: Option<String>,
     pub boot_timeout_secs: u64,
-    /// Consecutive non-mutating bash probes before a probe-budget advisory
-    /// is injected.
-    pub probe_budget: usize,
     /// DGI gatekeeper log-odds reject margin: reject only when
     /// `logP(OVERLOADED) - logP(ADMIT)` exceeds this (env-only).
     pub dgi_reject_margin: f64,
@@ -207,7 +204,6 @@ pub struct Sources {
     pub openalex_email: Source,
     pub openalex_api_key: Source,
     pub boot_timeout_secs: Source,
-    pub probe_budget: Source,
     pub dgi_reject_margin: Source,
     pub dgi_bypass_warm_session: Source,
     pub reasoning_open_tag: Source,
@@ -261,7 +257,6 @@ struct FileConfig {
     openalex_email: Option<String>,
     openalex_api_key: Option<String>,
     boot_timeout_secs: Option<u64>,
-    probe_budget: Option<usize>,
     profile: Option<String>,
     #[serde(default)]
     profiles: std::collections::HashMap<String, PartialProfile>,
@@ -286,7 +281,6 @@ pub struct PartialProfile {
     pub openalex_email: Option<String>,
     pub openalex_api_key: Option<String>,
     pub boot_timeout_secs: Option<u64>,
-    pub probe_budget: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -557,11 +551,6 @@ pub fn load_with(get_env: impl Fn(&str) -> Option<String>) -> Result<LoadedConfi
         180,
     );
 
-    // Probe budget: env > file > default (4).
-    let env_probe_budget: Option<usize> = env_u32("CASTOR_PROBE_BUDGET")?.map(|v| v as usize);
-    let (probe_budget, src_probe_budget) =
-        pick_usize(env_probe_budget, file.and_then(|f| f.probe_budget), 4);
-
     // DGI tuning knobs: env-only settings (no config.json keys).
     let (dgi_reject_margin, src_dgi_reject_margin) =
         pick_f64(env_f64("CASTOR_DGI_REJECT_MARGIN")?, 1.5);
@@ -613,7 +602,6 @@ pub fn load_with(get_env: impl Fn(&str) -> Option<String>) -> Result<LoadedConfi
             openalex_email,
             openalex_api_key,
             boot_timeout_secs,
-            probe_budget,
             dgi_reject_margin,
             dgi_bypass_warm_session,
             reasoning_open_tag,
@@ -642,7 +630,6 @@ pub fn load_with(get_env: impl Fn(&str) -> Option<String>) -> Result<LoadedConfi
             openalex_email: src_openalex_email,
             openalex_api_key: src_openalex_api_key,
             boot_timeout_secs: src_boot_timeout_secs,
-            probe_budget: src_probe_budget,
             dgi_reject_margin: src_dgi_reject_margin,
             dgi_bypass_warm_session: src_dgi_bypass_warm_session,
             reasoning_open_tag: src_reasoning_open_tag,
@@ -687,7 +674,6 @@ fn file_with_profile(file: &FileConfig, profile: Option<&PartialProfile>) -> Fil
                 .clone()
                 .or_else(|| p.openalex_api_key.clone()),
             boot_timeout_secs: file.boot_timeout_secs.or(p.boot_timeout_secs),
-            probe_budget: file.probe_budget.or(p.probe_budget),
             profile: file.profile.clone(),
             profiles: file.profiles.clone(),
         },
@@ -805,12 +791,6 @@ pub fn format_loaded(loaded: &LoadedConfig) -> String {
         "boot_timeout_secs",
         &c.boot_timeout_secs.to_string(),
         s.boot_timeout_secs,
-    );
-    row(
-        &mut out,
-        "probe_budget",
-        &c.probe_budget.to_string(),
-        s.probe_budget,
     );
     row(
         &mut out,
@@ -1441,28 +1421,6 @@ mod tests {
     }
 
     #[test]
-    fn precedence_probe_budget() {
-        let l = load_case(
-            &[("CASTOR_PROBE_BUDGET", "8")],
-            Some(r#"{"probe_budget":6}"#),
-        );
-        assert_eq!(
-            (l.config.probe_budget, l.sources.probe_budget),
-            (8, Source::Env)
-        );
-        let l = load_case(&[], Some(r#"{"probe_budget":6}"#));
-        assert_eq!(
-            (l.config.probe_budget, l.sources.probe_budget),
-            (6, Source::File)
-        );
-        let l = load_case(&[], None);
-        assert_eq!(
-            (l.config.probe_budget, l.sources.probe_budget),
-            (4, Source::Default)
-        );
-    }
-
-    #[test]
     fn port_override_via_env() {
         let l = load_case(
             &[("CASTOR_PORT_PROXY", "9999")],
@@ -1794,7 +1752,14 @@ mod tests {
             script.display()
         );
 
-        let absent = resolve_default_launch_command_from(Some(&other_cwd), Some(&other_cwd));
+        // The "absent" probe must be hermetic: the temp dir can itself sit
+        // inside a repo that contains the real swarm script (e.g. WSL
+        // workspaces), so anchor the probe one level above the workspace.
+        let outside = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root has a parent")
+            .join("castor-absent-probe");
+        let absent = resolve_default_launch_command_from(Some(&outside), Some(&outside));
         assert!(absent.is_none());
     }
 

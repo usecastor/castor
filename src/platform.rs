@@ -220,11 +220,7 @@ pub fn normalize_command_string(cmd: &str) -> String {
         if ch == '\\' {
             match chars.peek() {
                 Some(&next)
-                    if next == ' '
-                        || next == '"'
-                        || next == '\''
-                        || next == '$'
-                        || next == '`' =>
+                    if next == ' ' || next == '"' || next == '\'' || next == '$' || next == '`' =>
                 {
                     out.push('\\');
                     out.push(next);

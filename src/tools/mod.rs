@@ -24,10 +24,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-#[cfg(feature = "paper")]
-use self::paper::PaperClient;
 use self::extensions::ExtensionBridge;
 use self::fs::FsExecutor;
+#[cfg(feature = "paper")]
+use self::paper::PaperClient;
 use self::web::WebClient;
 use crate::engine::ToolSchema;
 use crate::runner::{ToolError, ToolExecutor, ToolOutcome};
@@ -347,10 +347,7 @@ impl ToolExecutor for CompositeExecutor {
                 // The active task cwd (canonicalized by `with_cwd`) is the
                 // child's working directory when set; an unset cwd falls back
                 // to the workspace root, so an omitted cwd is a no-op.
-                let cwd = self
-                    .cwd
-                    .as_deref()
-                    .unwrap_or(&self.workspace_root);
+                let cwd = self.cwd.as_deref().unwrap_or(&self.workspace_root);
                 match shell::run_async(cmd, cwd, timeout).await {
                     Ok(out) => {
                         let mut text = String::new();
@@ -618,7 +615,9 @@ mod tests {
 
         // Unset cwd: a relative path resolves against the workspace root,
         // where `marker.txt` does not exist, so the read is refused.
-        let before = executor.execute("read_file", r#"{"path":"marker.txt"}"#).await;
+        let before = executor
+            .execute("read_file", r#"{"path":"marker.txt"}"#)
+            .await;
         assert!(
             matches!(&before, Err(ToolError::Execute { .. })),
             "expected read_file to fail with cwd unset (resolves to {}): {before:?}",
@@ -628,7 +627,9 @@ mod tests {
         // Live cwd: the same relative read now resolves against the subdirectory
         // and returns the file. Proves the worker's `with_cwd` call is effective.
         let executor = executor.with_cwd(sub);
-        let after = executor.execute("read_file", r#"{"path":"marker.txt"}"#).await;
+        let after = executor
+            .execute("read_file", r#"{"path":"marker.txt"}"#)
+            .await;
         match after {
             Ok(out) => assert!(
                 out.text.contains("hello-cwd"),
@@ -646,8 +647,8 @@ mod tests {
         // Check schemas list (feature-aware: 8 default, +2 under `ast`,
         // +1 under `paper`).
         let schemas = executor.tool_schemas();
-        let expected = 8
-            + {
+        let expected =
+            8 + {
                 #[cfg(feature = "ast")]
                 {
                     2
@@ -656,8 +657,7 @@ mod tests {
                 {
                     0
                 }
-            }
-            + {
+            } + {
                 #[cfg(feature = "paper")]
                 {
                     1

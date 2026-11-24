@@ -7,7 +7,7 @@
 //! - [`context`] — token budgeting, in-flight ceilings, and session history persistence.
 //! - [`salvage`] — reasoning budget ceiling detection and markdown salvage reporting.
 //! - [`watchdog`] — wall-clock timeout watchdog and token monitoring.
-//! - [`budget`] — turn budget, probe budget, and landing window constants.
+//! - [`budget`] — loop-detector window and threshold constants.
 //! - [`skeleton`] — tool output spilling and deterministic workspace skeleton generation.
 //! - [`loop_detector`] — action-hash sliding window loop breaker.
 //! - [`events`] — session JSONL event logging.
@@ -34,8 +34,6 @@ use thiserror::Error;
 
 use crate::engine::{EngineClient, EngineError, Message, ToolSchema};
 use crate::state::StateDir;
-
-use budget::DEFAULT_PROBE_BUDGET;
 
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
@@ -73,11 +71,7 @@ pub trait ChatEngine: Send + Sync {
 
     /// Exact prompt token count via the engine's tokenizer endpoint when
     /// available; `None` falls back to `usage.prompt_tokens` / local sizing.
-    async fn count_tokens(
-        &self,
-        _messages: &[Message],
-        _tools: &[ToolSchema],
-    ) -> Option<usize> {
+    async fn count_tokens(&self, _messages: &[Message], _tools: &[ToolSchema]) -> Option<usize> {
         None
     }
 }
@@ -94,11 +88,7 @@ impl ChatEngine for EngineClient {
         EngineClient::chat(self, messages, tools, stream, reasoning_effort).await
     }
 
-    async fn count_tokens(
-        &self,
-        messages: &[Message],
-        tools: &[ToolSchema],
-    ) -> Option<usize> {
+    async fn count_tokens(&self, messages: &[Message], tools: &[ToolSchema]) -> Option<usize> {
         EngineClient::count_tokens(self, messages, tools).await
     }
 }
@@ -166,9 +156,6 @@ pub struct SessionOptions {
     /// neither `reasoning_effort` nor `chat_template_kwargs` and the
     /// server-side default applies (zero behaviour change).
     pub reasoning_effort: Option<String>,
-    /// Consecutive non-mutating bash probes before the probe-budget advisory
-    /// is injected. Defaults to 4.
-    pub probe_budget: usize,
     /// The engine's max context (in tokens). Drives two in-session gates:
     ///
     /// - **75% resume watermark** — a resumed session rolls to a fresh
@@ -225,7 +212,6 @@ impl SessionOptions {
             state: Some(state),
             workspace: None,
             reasoning_effort: None,
-            probe_budget: DEFAULT_PROBE_BUDGET,
             max_context: 0,
             reasoning_open_tag: None,
             reasoning_close_tag: None,
@@ -242,7 +228,6 @@ impl SessionOptions {
             state: None,
             workspace: Some(workspace),
             reasoning_effort: None,
-            probe_budget: DEFAULT_PROBE_BUDGET,
             max_context: 0,
             reasoning_open_tag: None,
             reasoning_close_tag: None,

@@ -13,10 +13,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::Value;
 
-use super::rollup::{
-    add_session_to_rollup, CachedSession, SessionRollup,
-};
 use super::StatsOptions;
+use super::rollup::{CachedSession, SessionRollup, add_session_to_rollup};
 
 /// Per-UTC-day event aggregates for one session (the per-session half of a
 /// daily bucket; the session-level fields are merged in by `derive_stats`).

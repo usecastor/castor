@@ -15,6 +15,9 @@ export CTX=long
 export PTH_FA=1
 export MAX_SEQS=${MAX_SEQS:-4}
 export MAX_LEN=${MAX_LEN:-150000}
+# Leave ~3.8 GiB headroom on 24 GiB WDDM/WSL2 hosts (dwm + desktop + DeltaNet workspace)
+# so vLLM does not spill into Shared GPU Memory over PCIe.
+export GPU_UTIL=${GPU_UTIL:-0.84}
 export PREFIX_CACHE=1
 export VISION=1
 export EMBED_UVA=${EMBED_UVA:-1}
