@@ -30,7 +30,7 @@ Operating contract for the Cloud Lead Architect (Claude Code / Antigravity Gemin
 
 1. **Zero-Turn Wait Contract**:
    - Fast tasks (<15s) complete synchronously and return results in Turn 1.
-   - Long tasks (>=15s) yield a task ID and `wait_command` (`curl -fsS ... http://127.0.0.1:18021/task/<id>/wait?timeout_s=3600`).
+   - Long tasks (>=15s) yield a task ID and wait_command (`castor wait <id>` or `curl -fsS ... http://127.0.0.1:18021/task/<id>/wait?timeout_s=3600`).
    - Run the wait command in the background (`run_in_background: true`) so interaction is never blocked. It costs $0 tokens and automatically wakes the agent upon task completion.
 2. **Anti-Polling Invariant**:
    - Never poll task status or loop querying `castor_task(action: "status")`.

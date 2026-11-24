@@ -122,7 +122,7 @@ The exact list below is the present-state inventory from
 | `CASTOR_MAX_CONCURRENT_TASKS` | `4` | Cross-process execution slots (disk-lease semaphore). Defaults to the Swarm baseline `MAX_SEQS=4`; user-defined profiles (e.g. `turbo`=2, `bonsai`=1) or an explicit env/file value override this. Each worker additionally token-budgets the pool at `max_context` so concurrent streams never overcommit the aggregate KV footprint. |
 | `CASTOR_WORKSPACE_SKELETON` | `true` | Prepend a compact workspace-skeleton block to the system prompt (warm Turn-1 prefix for KV prefix caching). |
 | `CASTOR_TOOL_SPILL_BYTES` | `16384` | Max bytes of a single tool output before it is spilled to disk (head/tail preview kept in conversation). |
-| `CASTOR_DGI_REJECT_MARGIN` | `1.5` | DGI gatekeeper log-odds reject margin: reject only when `logP(OVERLOADED) − logP(ADMIT)` exceeds this. |
+| `CASTOR_DGI_REJECT_MARGIN` | `1.2` | DGI gatekeeper log-odds reject margin: reject only when `logP(OVERLOADED) − logP(ADMIT)` exceeds this. |
 | `CASTOR_DGI_BYPASS_WARM_SESSION` | `true` | Skip the DGI probe for continuations that already have a non-empty session. |
 | `CASTOR_DGI_TIMEOUT_SECS` | `30` | Timeout for the DGI 1-forward-pass logit probe. |
 | `CASTOR_TURN_TIMEOUT_SECS` | `600` | Per-turn wall-clock watchdog timeout; `0` disables. |
@@ -153,13 +153,15 @@ Use structural AST tools, not string matching, for syntactic discovery and refac
   replacement and `write_file` writes directly.
 
 ### 3.3 Edit primitives
-- `edit_file` — exact-substring, uniqueness-guarded, per-region line-ending
-  preservation. Under the `ast` feature the rewritten content additionally passes
-  an in-memory AST syntax gate before commit; without the feature there is no
-  syntax validation and the edit is a plain substring replacement.
+- `edit_file` — 4-tier resilient edit matcher (exact substring, CRLF/LF
+  normalized, whitespace-trimmed, and relative-indentation alignment with
+  candidate line hints on ambiguity), uniqueness-guarded, per-region
+  line-ending preservation. Under the `ast` feature the rewritten content
+  additionally passes an in-memory AST syntax gate before commit; without the
+  feature there is no syntax validation and the edit performs matching without
+  AST checks.
 - `write_file` — full file write, atomic via temporary file swap, guarded by
   the in-memory AST syntax gate when `ast` is active.
-- Fuzzy matching is not supported; modifications use exact substrings.
 
 ### 3.4 Module layout
 
@@ -189,7 +191,7 @@ src/
   task/
     mod.rs               # Task management subsystem
     registry.rs          # Task lifecycle, disk mirror synchronization, and persistence
-    wait.rs              # Long-poll HTTP wait endpoint (:18021)
+    wait.rs              # Long-poll HTTP wait endpoint (:18021) and `castor wait` CLI
     semaphore.rs         # File-backed cross-process slot semaphore
   proxy/
     mod.rs               # Stream proxy server (:18022)
@@ -199,6 +201,7 @@ src/
     backend.rs           # Serving backend capability matrix (llama.cpp / vLLM / OpenAI)
     lifecycle.rs         # Engine boot, canary verification, and auto-heal
     provider.rs          # OpenAI / vLLM streaming chat client
+    sanitize.rs          # Shared SSE line parser and Z-scan repetition circuit breaker
     supervisor.rs        # Engine supervisor (start/stop/status, auto-heal supervision)
     detached.rs          # Detached engine process supervision
   runner/
@@ -208,6 +211,7 @@ src/
   tools/
     mod.rs               # Composite tool executor (lean 8-tool core + feature-gated ast/paper) implementing runner::ToolExecutor
     fs.rs                # Filesystem tools (read, write, edit, list, search)
+    graph.rs             # [feature: ast] Code Property Graph (CPG) & Personalized PageRank Turn-1 context retrieval
     sandbox.rs           # Zero-trust path containment and workspace security policy
     shell.rs             # Safe bash executor and lexical command scanner (regex/segment tokenizer; not a code AST parser; git ops and Python run here)
     ast.rs               # [feature: ast] Structural AST search and replace via native ast-grep
@@ -224,7 +228,7 @@ src/
     lineage.rs           # DAG of scored commits and parent pointers
     optimizer.rs         # Reflective batch evaluation against task suites
     watchdog.rs          # Lineage stagnation and health detector
-evals/                   # Tier A offline replay, golden test tasks, and DGI 187-prompt benchmark
+evals/                   # Tier A offline replay, golden test tasks, and DGI 1,053-prompt benchmark
 skills/                  # Reusable SKILL.md workflow recipes
 ```
 

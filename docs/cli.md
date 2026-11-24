@@ -15,6 +15,9 @@ castor server start
 # Operational telemetry dashboard (JSONL event ledger → live TUI)
 castor stats [-s 24h] [-d] [-j]
 
+# Wait for a background task to complete (long-poll HTTP + disk fallback)
+castor wait <task-id> [--timeout-s 3600]
+
 # Inspect effective configuration (env > config.json > defaults)
 castor config
 
@@ -22,7 +25,7 @@ castor config
 castor clean [--yes]
 ```
 
-Additional subcommands include `castor status` (zero-turn HTTP wait server on `:18021`) and `castor proxy` (SSE stream proxy on `:18022`). See [`src/cli.rs`](../src/cli.rs) for full CLI definitions.
+Additional subcommands include `castor wait` (long-poll task completion with cross-OS disk fallback), `castor status` (zero-turn HTTP wait server on `:18021`), `castor trace` (local execution visualizer on `:18030`), and `castor proxy` (SSE stream proxy on `:18022`). See [`src/cli.rs`](../src/cli.rs) for full CLI definitions.
 
 `castor stats` is the source of the savings figures shown in the project README. Run it
 against your own ledger to measure your own savings.
