@@ -325,7 +325,7 @@ impl EngineClient {
         let mut completion_tokens: Option<u64> = None;
         let mut reasoning_tokens: Option<u64> = None;
         let mut tool_calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
-        let mut detector = crate::proxy::sanitize::RepetitionDetector::new();
+        let mut detector = crate::engine::sanitize::RepetitionDetector::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| EngineError::Sse(e.to_string()))?;
@@ -365,30 +365,17 @@ impl EngineClient {
                     return Err(EngineError::Sse(format!("upstream error: {error}")));
                 }
                 if let Some(usage) = frame.get("usage") {
-                    // Engine-reported usage chunk: completion tokens take
-                    // precedence over the local char estimate; prompt tokens
-                    // are carried through for the session ledger.
-                    if let Some(c) = usage.get("completion_tokens").and_then(Value::as_u64) {
+                    let parsed = parse_usage_tokens(usage);
+                    if let Some(c) = parsed.completion_tokens {
                         completion_tokens = Some(c);
                     }
-                    if let Some(p) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+                    if let Some(p) = parsed.prompt_tokens {
                         prompt_tokens = Some(p);
                     }
-                    if let Some(r) = usage
-                        .get("completion_tokens_details")
-                        .and_then(|d| d.get("reasoning_tokens"))
-                        .and_then(Value::as_u64)
-                    {
+                    if let Some(r) = parsed.reasoning_tokens {
                         reasoning_tokens = Some(r);
                     }
-                    if let Some(k) = usage
-                        .get("prompt_tokens_details")
-                        .and_then(|d| d.get("cached_tokens"))
-                        .and_then(Value::as_u64)
-                        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
-                        .or_else(|| usage.get("cached_prompt_tokens").and_then(Value::as_u64))
-                        .or_else(|| usage.get("cache_read_tokens").and_then(Value::as_u64))
-                    {
+                    if let Some(k) = parsed.cached_tokens {
                         cached_tokens = Some(k);
                     }
                 }
@@ -537,25 +524,11 @@ impl EngineClient {
                 tool_calls.insert(i, slot);
             }
         }
-        let usage = body.get("usage");
-        let prompt_tokens = usage
-            .and_then(|u| u.get("prompt_tokens"))
-            .and_then(Value::as_u64);
-        let cached_tokens = usage.and_then(|u| {
-            u.get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(Value::as_u64)
-                .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_u64))
-                .or_else(|| u.get("cached_prompt_tokens").and_then(Value::as_u64))
-                .or_else(|| u.get("cache_read_tokens").and_then(Value::as_u64))
-        });
-        let completion_tokens = usage
-            .and_then(|u| u.get("completion_tokens"))
-            .and_then(Value::as_u64);
-        let reasoning_tokens = usage
-            .and_then(|u| u.get("completion_tokens_details"))
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(Value::as_u64);
+        let parsed = body.get("usage").map(parse_usage_tokens).unwrap_or_default();
+        let prompt_tokens = parsed.prompt_tokens;
+        let cached_tokens = parsed.cached_tokens;
+        let completion_tokens = parsed.completion_tokens;
+        let reasoning_tokens = parsed.reasoning_tokens;
         let ttft = if content.is_empty() && tool_calls.is_empty() {
             None
         } else {
@@ -586,7 +559,40 @@ impl EngineClient {
     }
 }
 
-fn repetition_loop_err(rep: crate::proxy::sanitize::Repetition) -> EngineError {
+/// Extracted token usage metrics: (prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedUsageTokens {
+    pub prompt_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+}
+
+/// Parse engine token usage metrics supporting 4-level fallback for cached prompt tokens.
+pub fn parse_usage_tokens(usage: &Value) -> ParsedUsageTokens {
+    let prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64);
+    let cached_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
+        .or_else(|| usage.get("cached_prompt_tokens").and_then(Value::as_u64))
+        .or_else(|| usage.get("cache_read_tokens").and_then(Value::as_u64));
+    let completion_tokens = usage.get("completion_tokens").and_then(Value::as_u64);
+    let reasoning_tokens = usage
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(Value::as_u64);
+
+    ParsedUsageTokens {
+        prompt_tokens,
+        cached_tokens,
+        completion_tokens,
+        reasoning_tokens,
+    }
+}
+
+fn repetition_loop_err(rep: crate::engine::sanitize::Repetition) -> EngineError {
     let preview: String = rep.pattern.chars().take(120).collect();
     EngineError::RepetitionLoop {
         kind: rep.r#type,

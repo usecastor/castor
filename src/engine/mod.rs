@@ -4,6 +4,7 @@ pub mod backend;
 mod detached;
 pub mod lifecycle;
 pub mod provider;
+pub mod sanitize;
 pub(crate) mod supervisor;
 
 pub use backend::{
@@ -12,3 +13,4 @@ pub use backend::{
 };
 pub use lifecycle::{EngineLifecycle, LifecycleError};
 pub use provider::{Completion, EngineClient, EngineError, Message, Metrics, ToolCall, ToolSchema};
+pub use sanitize::{Repetition, RepetitionDetector};
