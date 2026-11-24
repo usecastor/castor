@@ -577,6 +577,35 @@ mod run_tests {
     }
 
     #[test]
+    fn timeout_returns_promptly_and_preserves_output_with_grandchild_pipe_holders() {
+        let dir = tmp_dir("timeout_pipe_drain");
+        let cmd = "echo PRE_TIMEOUT_STDOUT; echo PRE_TIMEOUT_STDERR >&2; sleep 30 | cat";
+        let out = run(cmd, &dir, Duration::from_millis(300)).unwrap();
+        assert_eq!(out.exit_code, 124);
+        assert!(
+            out.stdout.contains("PRE_TIMEOUT_STDOUT"),
+            "pre-timeout stdout must be preserved: {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("PRE_TIMEOUT_STDERR"),
+            "pre-timeout stderr must be preserved: {:?}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("[Command timed out after 300ms]"),
+            "missing timeout marker: {:?}",
+            out.stderr
+        );
+        assert!(
+            out.duration_ms < 3000.0,
+            "timed-out pipeline must return promptly (<3000ms), took {}ms",
+            out.duration_ms
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn output_cap_truncates() {
         let dir = tmp_dir("cap");
         let out = run(

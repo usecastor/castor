@@ -99,6 +99,72 @@ pub fn kill_process_tree(pid: u32) {
     }
 }
 
+/// RAII guard for a Windows Job Object configured with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Assigning a spawned child process
+/// ensures the Windows kernel terminates the entire process tree (including
+/// MSYS2 / Git Bash pipeline grandchildren) on [`Self::terminate`] or drop.
+#[cfg(windows)]
+pub struct ProcessJob {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for ProcessJob {}
+#[cfg(windows)]
+unsafe impl Sync for ProcessJob {}
+
+#[cfg(windows)]
+impl ProcessJob {
+    /// Create a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and
+    /// assign `process_handle` to it. Returns `None` if the OS refuses job
+    /// creation or assignment.
+    pub fn attach(process_handle: std::os::windows::io::RawHandle) -> Option<Self> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&raw const info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 || AssignProcessToJobObject(job, process_handle as _) == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self { handle: job })
+        }
+    }
+
+    /// Terminate every process currently assigned to this job object.
+    pub fn terminate(&self, exit_code: u32) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        unsafe {
+            let _ = TerminateJobObject(self.handle, exit_code);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
 /// Translates a path to the host environment's native path format.
 ///
 /// In WSL/Linux:

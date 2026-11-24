@@ -16,6 +16,10 @@ use super::scanner::ShellPolicyError;
 /// Per-stream capture ceiling (256KB buffer cap).
 pub(crate) const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 
+/// Maximum time to wait for stdout/stderr pipe readers to drain after killing a
+/// timed-out process tree before aborting the reader tasks.
+const POST_KILL_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Maximum lines of stdout to retain on success (exit 0) before semantic truncation.
 pub const SUCCESS_MAX_STDOUT_LINES: usize = 20;
 
@@ -102,11 +106,16 @@ pub enum ShellError {
     Spawn(#[from] std::io::Error),
 }
 
-/// Drains an async stream into a byte-capped buffer, continuing to read
-/// (and discarding) past the cap so the child's pipe never deadlocks.
-async fn capture_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
-    let mut out = Vec::new();
-    let mut truncated = false;
+/// Drains an async stream incrementally into a byte-capped shared buffer,
+/// continuing to read (and discarding) past the cap so the child's pipe never
+/// deadlocks. Writing incrementally preserves already-captured output if the
+/// reader task is aborted after [`POST_KILL_DRAIN_TIMEOUT`].
+async fn capture_capped<R: tokio::io::AsyncRead + Unpin>(
+    mut r: R,
+    cap: usize,
+    out_buf: Arc<std::sync::Mutex<Vec<u8>>>,
+    trunc_flag: Arc<AtomicBool>,
+) {
     let mut buf = [0u8; 8192];
     loop {
         let n = match r.read(&mut buf).await {
@@ -114,17 +123,17 @@ async fn capture_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -
             Ok(n) => n,
             Err(_) => break,
         };
-        if out.len() >= cap {
-            truncated = true;
+        let mut guard = out_buf.lock().unwrap();
+        if guard.len() >= cap {
+            trunc_flag.store(true, Ordering::SeqCst);
         } else {
-            let room = cap - out.len();
-            out.extend_from_slice(&buf[..n.min(room)]);
+            let room = cap - guard.len();
+            guard.extend_from_slice(&buf[..n.min(room)]);
             if n > room {
-                truncated = true;
+                trunc_flag.store(true, Ordering::SeqCst);
             }
         }
     }
-    (out, truncated)
 }
 
 #[cfg(target_os = "linux")]
@@ -287,6 +296,10 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
     }
 
     let mut child = cmd_builder.spawn()?;
+    #[cfg(windows)]
+    let _job = child
+        .raw_handle()
+        .and_then(crate::platform::ProcessJob::attach);
     let pid = child.id().unwrap_or(0);
 
     let stdout = child.stdout.take().expect("piped stdout");
@@ -297,20 +310,16 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
     let out_trunc = Arc::new(AtomicBool::new(false));
     let err_trunc = Arc::new(AtomicBool::new(false));
 
-    let out_task = {
+    let mut out_task = {
         let (buf, flag) = (Arc::clone(&out_buf), Arc::clone(&out_trunc));
         tokio::spawn(async move {
-            let (b, t) = capture_capped(stdout, MAX_CAPTURE_BYTES).await;
-            *buf.lock().unwrap() = b;
-            flag.store(t, Ordering::SeqCst);
+            capture_capped(stdout, MAX_CAPTURE_BYTES, buf, flag).await;
         })
     };
-    let err_task = {
+    let mut err_task = {
         let (buf, flag) = (Arc::clone(&err_buf), Arc::clone(&err_trunc));
         tokio::spawn(async move {
-            let (b, t) = capture_capped(stderr, MAX_CAPTURE_BYTES).await;
-            *buf.lock().unwrap() = b;
-            flag.store(t, Ordering::SeqCst);
+            capture_capped(stderr, MAX_CAPTURE_BYTES, buf, flag).await;
         })
     };
 
@@ -363,15 +372,29 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
                 }
             }
             #[cfg(windows)]
-            if pid > 0 {
-                crate::platform::kill_process_tree(pid);
+            {
+                if let Some(ref job) = _job {
+                    job.terminate(124);
+                }
+                if pid > 0 {
+                    crate::platform::kill_process_tree(pid);
+                }
                 let _ = child.kill().await;
             }
             #[cfg(not(any(unix, windows)))]
             {
                 let _ = child.kill().await;
             }
-            let _ = tokio::join!(out_task, err_task);
+            let drain_fut = async {
+                let _ = tokio::join!(&mut out_task, &mut err_task);
+            };
+            if tokio::time::timeout(POST_KILL_DRAIN_TIMEOUT, drain_fut)
+                .await
+                .is_err()
+            {
+                out_task.abort();
+                err_task.abort();
+            }
             let out = std::mem::take(&mut *out_buf.lock().unwrap());
             let mut err = String::from_utf8_lossy(&std::mem::take(&mut *err_buf.lock().unwrap()))
                 .into_owned();
@@ -443,5 +466,35 @@ mod tests {
         assert!(err.contains("stderr err 21"));
         assert!(!err.contains("stderr err 20\n"));
         assert!(err.contains("[... 20 stderr lines elided ...]"));
+    }
+
+    #[tokio::test]
+    async fn capture_capped_preserves_bytes_when_aborted_on_open_pipe() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        writer.write_all(b"CAPTURED_BEFORE_HANG\n").await.unwrap();
+        writer.flush().await.unwrap();
+
+        let out_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let trunc_flag = Arc::new(AtomicBool::new(false));
+        let mut task = {
+            let (buf, flag) = (Arc::clone(&out_buf), Arc::clone(&trunc_flag));
+            tokio::spawn(async move {
+                capture_capped(reader, MAX_CAPTURE_BYTES, buf, flag).await;
+            })
+        };
+
+        // Keep `writer` alive (simulating an escaped grandchild holding the pipe open).
+        let drain_res = tokio::time::timeout(Duration::from_millis(100), &mut task).await;
+        assert!(
+            drain_res.is_err(),
+            "pipe should remain open while writer lives"
+        );
+        task.abort();
+
+        let captured = String::from_utf8_lossy(&out_buf.lock().unwrap()).into_owned();
+        assert_eq!(captured, "CAPTURED_BEFORE_HANG\n");
+        drop(writer);
     }
 }
