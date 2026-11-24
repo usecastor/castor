@@ -411,8 +411,8 @@ mod tests {
                 std::path::PathBuf::from("/mnt/d/LLM_Ecosystem")
             );
             assert_eq!(
-                to_host_path("c:/users/apath"),
-                std::path::PathBuf::from("/mnt/c/users/apath")
+                to_host_path("c:/users/alice"),
+                std::path::PathBuf::from("/mnt/c/users/alice")
             );
             assert_eq!(
                 to_host_path("/mnt/d/LLM_Ecosystem"),
@@ -434,8 +434,8 @@ mod tests {
                 std::path::PathBuf::from("D:\\LLM_Ecosystem")
             );
             assert_eq!(
-                to_host_path("/mnt/c/users/apath"),
-                std::path::PathBuf::from("C:\\users\\apath")
+                to_host_path("/mnt/c/users/alice"),
+                std::path::PathBuf::from("C:\\users\\alice")
             );
             assert_eq!(
                 to_host_path("relative/path"),
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn test_to_windows_path() {
         assert_eq!(to_windows_path("/mnt/d/LLM_Ecosystem"), "D:\\LLM_Ecosystem");
-        assert_eq!(to_windows_path("/mnt/c/Users/Apath"), "C:\\Users\\Apath");
+        assert_eq!(to_windows_path("/mnt/c/Users/Alice"), "C:\\Users\\Alice");
         assert_eq!(to_windows_path("/mnt/d"), "D:\\");
         assert_eq!(to_windows_path("/mnt/d/"), "D:\\");
         assert_eq!(to_windows_path("D:\\LLM_Ecosystem"), "D:\\LLM_Ecosystem");
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn test_to_wsl_path() {
         assert_eq!(to_wsl_path("D:\\LLM_Ecosystem"), "/mnt/d/LLM_Ecosystem");
-        assert_eq!(to_wsl_path("c:/users/apath"), "/mnt/c/users/apath");
+        assert_eq!(to_wsl_path("c:/users/alice"), "/mnt/c/users/alice");
         assert_eq!(to_wsl_path("D:\\"), "/mnt/d");
         assert_eq!(to_wsl_path("/mnt/d/LLM_Ecosystem"), "/mnt/d/LLM_Ecosystem");
         assert_eq!(to_wsl_path("relative/path"), "relative/path");
