@@ -584,8 +584,8 @@ pub(crate) async fn llama_readiness(
     let model = config
         .model
         .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or("missing model in config")?;
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "auto");
     for endpoint in ["health", "models"] {
         let url = api_url(config, endpoint)?;
         let mut request = client.get(&url);
@@ -633,23 +633,48 @@ pub(crate) async fn llama_readiness(
             let models = value["data"]
                 .as_array()
                 .ok_or_else(|| format!("missing model list from {url}: {body}"))?;
-            if !models.iter().any(|entry| {
-                let id_match = entry["id"]
-                    .as_str()
-                    .map(|s| s.eq_ignore_ascii_case(model))
-                    .unwrap_or(false);
-                let alias_match = entry["aliases"]
-                    .as_str()
-                    .map(|s| {
-                        s.split(|c: char| c.is_whitespace() || c == ',')
-                            .any(|alias| alias.eq_ignore_ascii_case(model))
-                    })
-                    .unwrap_or(false);
-                id_match || alias_match
-            }) {
-                return Err(format!(
-                    "configured model {model:?} not listed at {url}: {body}; set llama-server --alias to match CASTOR_MODEL"
-                ));
+            match model {
+                None => {
+                    let ids: Vec<&str> = models
+                        .iter()
+                        .filter_map(|entry| entry["id"].as_str())
+                        .collect();
+                    match ids.as_slice() {
+                        [_single] => {}
+                        [] => {
+                            return Err(format!(
+                                "cannot auto-bind a model: {url} reported no models"
+                            ));
+                        }
+                        many => {
+                            let shown = many.join(", ");
+                            return Err(format!(
+                                "cannot auto-bind a model: engine serves multiple models [{shown}]; \
+                                 pin CASTOR_MODEL to one of them"
+                            ));
+                        }
+                    }
+                }
+                Some(model) => {
+                    if !models.iter().any(|entry| {
+                        let id_match = entry["id"]
+                            .as_str()
+                            .map(|s| s.eq_ignore_ascii_case(model))
+                            .unwrap_or(false);
+                        let alias_match = entry["aliases"]
+                            .as_str()
+                            .map(|s| {
+                                s.split(|c: char| c.is_whitespace() || c == ',')
+                                    .any(|alias| alias.eq_ignore_ascii_case(model))
+                            })
+                            .unwrap_or(false);
+                        id_match || alias_match
+                    }) {
+                        return Err(format!(
+                            "configured model {model:?} not listed at {url}: {body}; set llama-server --alias to match CASTOR_MODEL"
+                        ));
+                    }
+                }
             }
         }
     }
@@ -878,6 +903,44 @@ mod tests {
             err.contains("CASTOR_MODEL=qwen3-27b"),
             "expected CASTOR_MODEL advice, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn llama_readiness_auto_binds_single_model_when_model_unset() {
+        let state = tmp_state();
+        let app = Router::new()
+            .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+            .route(
+                "/v1/health",
+                get(|| async { Json(json!({"status": "ok"})) }),
+            )
+            .route(
+                "/v1/models",
+                get(|| async {
+                    Json(json!({
+                        "data": [{"id": "Qwen2.5-Coder-3B-Instruct-Q5_K_M", "owned_by": "llama.cpp", "max_model_len": 65536}]
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let mut cfg = test_config(&state, None, None);
+        cfg.engine_type = Some("llama.cpp".into());
+        cfg.model = None;
+        cfg.base_url = Some(format!("{base}/v1"));
+        assert!(llama_readiness(&cfg, &client).await.is_ok());
+
+        cfg.model = Some("auto".into());
+        assert!(llama_readiness(&cfg, &client).await.is_ok());
     }
 
     #[tokio::test]

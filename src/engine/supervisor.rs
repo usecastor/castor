@@ -149,12 +149,21 @@ fn token() -> io::Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+fn effective_model(config: &Config) -> &str {
+    config
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("auto")
+}
+
 fn verify(owner: &Owner, config: &Config) -> Result<(), LifecycleError> {
     if super::backend::api_url(config, "")
         .map_err(LifecycleError::Readiness)?
         .trim_end_matches('/')
         != owner.endpoint
-        || config.model.as_deref() != Some(owner.model.as_str())
+        || effective_model(config) != owner.model.as_str()
     {
         return Err(LifecycleError::Stop(
             "llama.cpp ownership endpoint/model does not match configuration".into(),
@@ -218,11 +227,7 @@ pub(crate) async fn start(
         .map_err(LifecycleError::Readiness)?
         .trim_end_matches('/')
         .to_string();
-    let model = config
-        .model
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| LifecycleError::Readiness("missing model in config".into()))?;
+    let model = effective_model(config);
     if let Some(owner) = read_owner(state)? {
         // A stale record is diagnostic evidence, not permission to launch or kill.
         verify(&owner, config)?;

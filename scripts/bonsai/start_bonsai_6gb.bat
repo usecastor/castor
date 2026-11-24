@@ -11,13 +11,23 @@ REM   3. llama-server (llama.cpp CUDA): Pinnacle engine. Zero PyTorch overhead,
 REM      native Turing FlashAttention (-fa on), quantized KV cache (-ctk q4_0/q8_0),
 REM      zero-VRAM host dynamic n-gram speculative decoding (-lcd), and native OpenAI API.
 REM
-REM VRAM BUDGET BREAKDOWN (~5.26 GB total on 6GB VRAM):
-REM   Model weights (Qwen2.5-Coder-3B Q5_K_M or Phi-4-mini Q4_K_M):  ~2.20 - 2.50 GB
-REM   KV Cache (-c 24576 -ctk q8_0 -ctv q8_0):                       ~1.80 GB (or ~0.9 GB in q4_0)
+REM VRAM BUDGET BREAKDOWN (6GB VRAM, GTX 1660 Ti):
+REM   Qwen2.5-Coder-3B GQA KV math (36 layers, 2 KV heads, head_dim 128 = 18,432 elems/tok):
+REM     - 32,768 ctx (-ctk q8_0 -ctv q8_0): ~604 MB (~612 MiB) KV -> ~3.29 GB total (>2.4 GB headroom)
+REM     - 65,536 ctx (-ctk q4_0 -ctv q4_0): ~604 MB (~648 MiB) KV -> ~3.33 GB total (>2.4 GB headroom)
+REM     - 131,072 ctx (-ctk q4_0 -ctv q4_0): ~1.21 GB (~1.27 GiB) KV -> ~3.96 GB total (>1.8 GB headroom)
+REM   Model weights (Qwen2.5-Coder-3B Q5_K_M):                        ~2.24 GB
 REM   CUDA context + activation / scratch buffers:                   ~0.45 GB
 REM   ----------------------------------------------------------------
-REM   Total Net GPU Footprint:                                       ~4.75 GB
-REM   Safety Headroom:                                               ~1.39 GB (leaves room for DWM/desktop)
+REM   Total Net GPU Footprint (64K Q4_0 KV):                         ~3.33 GB
+REM   Safety Headroom:                                               ~2.67 GB (leaves room for DWM/desktop)
+REM
+REM Alternative Phi-4-mini (3.8B, 32 layers, 8 KV heads, head_dim 128, -c 32768 -ctk q4_0 -ctv q4_0):
+REM   Model weights (Phi-4-mini-instruct-Q4_K_M):                    ~2.50 GB
+REM   KV Cache (-c 32768 -ctk q4_0 -ctv q4_0):                       ~1.13 GiB
+REM   CUDA context + activation buffers:                             ~0.45 GB
+REM   ----------------------------------------------------------------
+REM   Total Net GPU Footprint:                                       ~4.08 GB (100%% GPU resident)
 REM
 REM Alternative 7B Dense Model (-c 8192, Q4_K_M):
 REM   Model weights (Qwen2.5-Coder-7B-Q4_K_M):                       ~4.68 GB
@@ -44,25 +54,25 @@ if not exist "%BIN%" (
 )
 :bin_found
 
-REM Model auto-selection (prefers 3B/3.8B Pareto frontier, then 7B, then Bonsai 27B)
+REM Model auto-selection (prefers Qwen2.5-Coder-3B 64K Pareto frontier, then Phi-4-mini 32K, then 7B, then Bonsai 27B)
 set MODEL=
-if exist ".\models\Phi-4-mini-instruct-Q4_K_M.gguf" (
-    set "MODEL=.\models\Phi-4-mini-instruct-Q4_K_M.gguf"
-    set CTX=24576
-    set CTK=q8_0
-    set CTV=q8_0
-    set NGL=99
-) else if exist ".\models\Qwen2.5-Coder-3B-Instruct-Q5_K_M.gguf" (
+if exist ".\models\Qwen2.5-Coder-3B-Instruct-Q5_K_M.gguf" (
     set "MODEL=.\models\Qwen2.5-Coder-3B-Instruct-Q5_K_M.gguf"
-    set CTX=32768
-    set CTK=q8_0
-    set CTV=q8_0
+    set CTX=65536
+    set CTK=q4_0
+    set CTV=q4_0
     set NGL=99
 ) else if exist ".\models\Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf" (
     set "MODEL=.\models\Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf"
+    set CTX=65536
+    set CTK=q4_0
+    set CTV=q4_0
+    set NGL=99
+) else if exist ".\models\Phi-4-mini-instruct-Q4_K_M.gguf" (
+    set "MODEL=.\models\Phi-4-mini-instruct-Q4_K_M.gguf"
     set CTX=32768
-    set CTK=q8_0
-    set CTV=q8_0
+    set CTK=q4_0
+    set CTV=q4_0
     set NGL=99
 ) else if exist ".\models\Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf" (
     set "MODEL=.\models\Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
@@ -85,9 +95,9 @@ set UBATCH=512
 
 if "%MODEL%"=="" (
     set "MODEL=.\models\Qwen2.5-Coder-3B-Instruct-Q5_K_M.gguf"
-    set CTX=24576
-    set CTK=q8_0
-    set CTV=q8_0
+    set CTX=65536
+    set CTK=q4_0
+    set CTV=q4_0
     set NGL=99
 )
 
@@ -102,9 +112,9 @@ if not exist "%MODEL%" (
     echo [NOTICE] Model weights not found at %MODEL%
     echo Please download a supported GGUF model into .\models\
     echo Recommended for 6GB VRAM (GTX 1660 Ti):
-    echo   1. Phi-4-mini-instruct-Q4_K_M.gguf (2.5 GB, 24K Ctx, 55-62 tps)
-    echo   2. Qwen2.5-Coder-3B-Instruct-Q5_K_M.gguf (2.2 GB, 32K Ctx, 58-68 tps)
-    echo   3. Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf (4.7 GB, 8K Ctx, 28-34 tps)
+    echo   1. Qwen2.5-Coder-3B-Instruct-Q5_K_M.gguf (2.24 GB, 64K q4_0 KV / 32K q8_0 KV, 58-68 tps)
+    echo   2. Phi-4-mini-instruct-Q4_K_M.gguf (2.50 GB, 32K q4_0 KV, 55-62 tps)
+    echo   3. Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf (4.68 GB, 8K q4_0 KV, 28-34 tps)
     exit /b 1
 )
 

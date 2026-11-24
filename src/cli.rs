@@ -399,17 +399,13 @@ pub async fn run_server(
     match action {
         "status" => {
             if engine::backend::Backend::from_config(config) == engine::backend::Backend::LlamaCpp {
-                // llama.cpp serves a pinned model: the readiness gate is the
-                // canary, and the id is the configured one (llama.cpp has no
-                // adaptive auto-bind).
                 return match lc.readiness().await {
-                    Ok(()) => Ok((
-                        format!(
-                            "healthy: model {} listed",
-                            config.model.as_deref().unwrap_or("auto")
-                        ),
-                        true,
-                    )),
+                    Ok(()) => {
+                        let detected = lc.canary_model().await.unwrap_or_else(|| {
+                            config.model.clone().unwrap_or_else(|| "auto".into())
+                        });
+                        Ok((format!("healthy: model {detected} listed"), true))
+                    }
                     Err(e) => Ok((format!("unhealthy: {e}"), false)),
                 };
             }
