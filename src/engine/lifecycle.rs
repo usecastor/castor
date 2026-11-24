@@ -1224,10 +1224,7 @@ mod tests {
         cfg.ports.engine = port;
 
         // Backdate a foreign boot lock well beyond its TTL.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now = crate::platform::now_epoch_ms();
         let lock_path = state.locks().join("engine_boot.lock");
         std::fs::write(
             lock_path,

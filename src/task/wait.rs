@@ -28,6 +28,7 @@ use axum::routing::get;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::platform::now_epoch_ms as now_ms;
 use crate::state::{AcquireResult, Locks, StateDir};
 use crate::task::registry::{DiskRead, TaskRecord, TaskRegistry, TaskStatus};
 
@@ -390,13 +391,6 @@ fn elapsed_seconds(rec: &TaskRecord, now: u64) -> u64 {
         _ => rec.created_at,
     };
     end.saturating_sub(start) / 1000
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

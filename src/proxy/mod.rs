@@ -649,10 +649,7 @@ mod tests {
         let dead_pid = child.id();
         let _ = child.wait();
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now = crate::platform::now_epoch_ms();
         std::fs::create_dir_all(state.locks()).unwrap();
         std::fs::write(
             state.locks().join("proxy.lock"),

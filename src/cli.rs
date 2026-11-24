@@ -852,10 +852,7 @@ pub async fn run_with(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(raw) = std::fs::read_to_string(&task_file)
                     && let Ok(mut rec) = serde_json::from_str::<serde_json::Value>(&raw)
                 {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
+                    let now = now_epoch_ms();
                     rec["status"] = serde_json::json!("failed");
                     rec["reason"] = serde_json::json!(err_msg);
                     rec["ended_at"] = serde_json::json!(now);

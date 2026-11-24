@@ -73,11 +73,7 @@ impl EventLogger {
 /// (`YYYY-MM-DDTHH:MM:SS.mmmZ`), reusing the crate's single civil-date
 /// formatter (see [`crate::telemetry::iso_from_ms`]).
 fn now_iso() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    crate::telemetry::iso_from_ms(now)
+    crate::telemetry::iso_from_ms(crate::platform::now_epoch_ms())
 }
 
 #[cfg(test)]

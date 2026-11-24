@@ -21,6 +21,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
 
+use crate::platform::now_epoch_ms as now_ms;
 use crate::state::StateDir;
 use crate::task::semaphore::{TaskSemaphore, pid_alive};
 
@@ -132,13 +133,6 @@ pub enum DiskRead {
     Corrupt(String),
     /// A healthy, parsed record.
     Ok(TaskRecord),
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// In-memory task registry with a per-task disk mirror.

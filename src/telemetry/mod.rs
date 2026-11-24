@@ -94,11 +94,7 @@ pub(crate) fn iso_from_ms(ms: u64) -> String {
 
 /// Current time as an ISO-8601 UTC string.
 fn now_iso() -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    iso_from_ms(ms)
+    iso_from_ms(crate::platform::now_epoch_ms())
 }
 
 /// Hall-of-Fame extremes across the scanned events: the single most
