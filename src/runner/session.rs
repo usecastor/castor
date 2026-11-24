@@ -38,7 +38,13 @@ fn check_resume(
 fn is_phase1_read(name: &str) -> bool {
     matches!(
         name,
-        "read_file" | "list_dir" | "search_code" | "ast_search" | "web_search" | "web_fetch" | "paper_lookup"
+        "read_file"
+            | "list_dir"
+            | "search_code"
+            | "ast_search"
+            | "web_search"
+            | "web_fetch"
+            | "paper_lookup"
     )
 }
 
@@ -924,9 +930,7 @@ mod tests {
         let state = tmp_state();
         let logger = EventLogger::new(&state, "sess_b");
         let text = "I have the core evidence. Now let me run a final verification pass.";
-        let engine = RecordingEngine::new(vec![
-            comp(text, Vec::new(), None),
-        ]);
+        let engine = RecordingEngine::new(vec![comp(text, Vec::new(), None)]);
         let executor = MockExecutor {
             results: tokio::sync::Mutex::new(VecDeque::new()),
         };
@@ -1285,11 +1289,7 @@ mod tests {
             comp(
                 "Editing the module and checking.",
                 vec![
-                    tc(
-                        "e1",
-                        "edit_file",
-                        r#"{"path":"src/lib.rs","content":"x"}"#,
-                    ),
+                    tc("e1", "edit_file", r#"{"path":"src/lib.rs","content":"x"}"#),
                     tc("b1", "bash", r#"{"command":"cargo check"}"#),
                 ],
                 None,

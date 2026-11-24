@@ -415,8 +415,15 @@ impl FsExecutor {
             None
         };
 
-        let (updated, count, effective_target, effective_replacement) = if let Some((eff_target, local_style)) = exact_candidate {
-            let matches: Vec<usize> = original.match_indices(&eff_target).map(|(idx, _)| idx).collect();
+        let (updated, count, effective_target, effective_replacement) = if let Some((
+            eff_target,
+            local_style,
+        )) = exact_candidate
+        {
+            let matches: Vec<usize> = original
+                .match_indices(&eff_target)
+                .map(|(idx, _)| idx)
+                .collect();
             let count = matches.len();
             if count == 0 {
                 return Err(FsError::EditError(not_found_msg(path)));
@@ -504,7 +511,9 @@ impl FsExecutor {
                 let min_indent = non_empty_indents.iter().copied().min().unwrap_or(0);
                 let rel_sig = entries
                     .into_iter()
-                    .map(|opt| opt.map(|(indent, content)| (indent.saturating_sub(min_indent), content)))
+                    .map(|opt| {
+                        opt.map(|(indent, content)| (indent.saturating_sub(min_indent), content))
+                    })
                     .collect();
                 (min_indent, rel_sig)
             }
@@ -522,13 +531,18 @@ impl FsExecutor {
 
             for i in 0..=(file_lines.len() - k) {
                 let window = &file_lines[i..i + k];
-                let window_line_strs: Vec<&str> = window.iter().map(|l| l.content.as_str()).collect();
+                let window_line_strs: Vec<&str> =
+                    window.iter().map(|l| l.content.as_str()).collect();
                 let (_, win_sig) = compute_signature(&window_line_strs);
 
                 if win_sig == target_sig {
                     let first_non_empty_ws = window_line_strs
                         .iter()
-                        .find(|l| !l.trim_end_matches(['\r', '\n', ' ', '\t']).trim_start_matches([' ', '\t']).is_empty())
+                        .find(|l| {
+                            !l.trim_end_matches(['\r', '\n', ' ', '\t'])
+                                .trim_start_matches([' ', '\t'])
+                                .is_empty()
+                        })
                         .map(|l| {
                             let trimmed = l.trim_end_matches(['\r', '\n', ' ', '\t']);
                             let content = trimmed.trim_start_matches([' ', '\t']);
@@ -564,7 +578,11 @@ impl FsExecutor {
 
             let target_first_ws = target_lines
                 .iter()
-                .find(|l| !l.trim_end_matches(['\r', '\n', ' ', '\t']).trim_start_matches([' ', '\t']).is_empty())
+                .find(|l| {
+                    !l.trim_end_matches(['\r', '\n', ' ', '\t'])
+                        .trim_start_matches([' ', '\t'])
+                        .is_empty()
+                })
                 .map(|l| {
                     let trimmed = l.trim_end_matches(['\r', '\n', ' ', '\t']);
                     let content = trimmed.trim_start_matches([' ', '\t']);
@@ -592,7 +610,11 @@ impl FsExecutor {
                         out_lines.push(String::new());
                     } else if !target_first_ws.is_empty() && line.starts_with(target_first_ws) {
                         let rel = &line[target_first_ws.len()..];
-                        out_lines.push(format!("{}{}", win_base_ws, rel.trim_end_matches(['\r', '\n'])));
+                        out_lines.push(format!(
+                            "{}{}",
+                            win_base_ws,
+                            rel.trim_end_matches(['\r', '\n'])
+                        ));
                     } else {
                         let ws = &trimmed[..trimmed.len() - content.len()];
                         let ws_spaces = indent_to_spaces(ws);

@@ -318,10 +318,7 @@ pub async fn run_job_with_engine(
         // function of the workspace's stable top-level shape) — a warm KV prefix
         // so 96%+ of the Turn-1 prefix cache hits across concurrent sessions.
         // When AST is active, augments with top relevant symbol definitions via PPR.
-        runner::skeleton::build_workspace_skeleton_with_prompt(
-            &workspace_root,
-            Some(&spec.prompt),
-        )
+        runner::skeleton::build_workspace_skeleton_with_prompt(&workspace_root, Some(&spec.prompt))
     } else {
         String::new()
     };
@@ -514,9 +511,13 @@ pub async fn run_job_with_engine(
                     .join(".scratch")
                     .join(format!("salvage_{}.md", spec.session_id));
                 let has_salvage = (salvage_path.exists()
-                    && std::fs::metadata(&salvage_path).map(|m| m.len() > 0).unwrap_or(false))
+                    && std::fs::metadata(&salvage_path)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false))
                     || (ws_salvage_path.exists()
-                        && std::fs::metadata(&ws_salvage_path).map(|m| m.len() > 0).unwrap_or(false));
+                        && std::fs::metadata(&ws_salvage_path)
+                            .map(|m| m.len() > 0)
+                            .unwrap_or(false));
                 if has_salvage {
                     TaskStatus::CompletedWithSalvage
                 } else {

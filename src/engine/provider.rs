@@ -524,7 +524,10 @@ impl EngineClient {
                 tool_calls.insert(i, slot);
             }
         }
-        let parsed = body.get("usage").map(parse_usage_tokens).unwrap_or_default();
+        let parsed = body
+            .get("usage")
+            .map(parse_usage_tokens)
+            .unwrap_or_default();
         let prompt_tokens = parsed.prompt_tokens;
         let cached_tokens = parsed.cached_tokens;
         let completion_tokens = parsed.completion_tokens;

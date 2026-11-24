@@ -1,8 +1,10 @@
 #![cfg(feature = "ast")]
 
-use std::path::Path;
+use castor::runner::skeleton::{
+    build_prompt_retrieved_context, build_workspace_skeleton_with_prompt,
+};
 use castor::tools::graph::CodePropertyGraph;
-use castor::runner::skeleton::{build_prompt_retrieved_context, build_workspace_skeleton_with_prompt};
+use std::path::Path;
 
 #[test]
 fn test_cpg_multi_language_ingestion_and_call_resolution() {
@@ -65,7 +67,11 @@ pub fn isolated_island() {}
 
     let ppr = graph.personalized_pagerank(&seeds, 0.85, 20);
     let leaf_1_idx = graph.nodes.iter().position(|n| n.name == "leaf_1").unwrap();
-    let island_idx = graph.nodes.iter().position(|n| n.name == "isolated_island").unwrap();
+    let island_idx = graph
+        .nodes
+        .iter()
+        .position(|n| n.name == "isolated_island")
+        .unwrap();
 
     assert!(ppr[leaf_1_idx] > ppr[island_idx]);
 }

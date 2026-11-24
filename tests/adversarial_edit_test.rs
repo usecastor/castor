@@ -86,7 +86,8 @@ async fn test_adversarial_indentation_shift() {
 async fn test_adversarial_tab_space_mismatch() {
     let dir = setup_test_dir("tab_space");
     let file_path = dir.join("calculator.rs");
-    let original = "fn calculate() {\n\t\tlet factor = 42;\n\t\tlet result = factor * 2;\n\t\tresult\n}\n";
+    let original =
+        "fn calculate() {\n\t\tlet factor = 42;\n\t\tlet result = factor * 2;\n\t\tresult\n}\n";
     fs::write(&file_path, original).unwrap();
     let ex = FsExecutor::new(&dir).unwrap();
 
@@ -130,7 +131,8 @@ async fn test_adversarial_trailing_whitespace_drift() {
     let dir = setup_test_dir("trailing_space");
     let file_path = dir.join("handler.rs");
     // Trailing spaces on comment and blank line
-    let original = "fn handle() {\n    // verify status    \n    \n    let status = 200;\n    status\n}\n";
+    let original =
+        "fn handle() {\n    // verify status    \n    \n    let status = 200;\n    status\n}\n";
     fs::write(&file_path, original).unwrap();
     let ex = FsExecutor::new(&dir).unwrap();
 
@@ -270,9 +272,9 @@ async fn test_adversarial_invalid_syntax_rejected_by_ast_gate() {
 /// so the agent can discover sub-sections and issue targeted reads.
 #[tokio::test]
 async fn test_adversarial_web_fetch_large_page_section_outline() {
+    use axum::Router;
     use axum::response::Html;
     use axum::routing::get;
-    use axum::Router;
 
     let app = Router::new().route(
         "/large_doc",
@@ -302,13 +304,17 @@ async fn test_adversarial_web_fetch_large_page_section_outline() {
     assert_eq!(result.status, 200);
     // When truncated, the document must include section outline / anchor hints
     assert!(
-        result.markdown.contains("[Content truncated") || result.markdown.contains("[Section Index]") || result.markdown.contains("Section Outline"),
+        result.markdown.contains("[Content truncated")
+            || result.markdown.contains("[Section Index]")
+            || result.markdown.contains("Section Outline"),
         "Large document must indicate truncation or outline, got: {}",
         &result.markdown[result.markdown.len().saturating_sub(400)..]
     );
     // Truncated large web page must provide a structured section outline / anchor index with hints
     assert!(
-        result.markdown.contains("## Document Outline") || result.markdown.contains("[Section Index]") || result.markdown.contains("### Sections"),
+        result.markdown.contains("## Document Outline")
+            || result.markdown.contains("[Section Index]")
+            || result.markdown.contains("### Sections"),
         "Truncated web fetch output must generate a structural section outline with anchor links for discoverability, got: {}",
         &result.markdown[result.markdown.len().saturating_sub(600)..]
     );

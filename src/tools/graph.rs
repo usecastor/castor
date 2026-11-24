@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ast_grep_core::tree_sitter::LanguageExt;
 use ast_grep_core::Node;
+use ast_grep_core::tree_sitter::LanguageExt;
 use ast_grep_language::SupportLang;
 
 use super::ast::{OUTLINE_DECL_KINDS, infer_lang_by_extension};
@@ -174,7 +174,10 @@ impl CodePropertyGraph {
             let end_line = node.end_pos().line() + 1;
 
             let sym_kind = match kind_str {
-                "function_item" | "fn_item" | "function_definition" | "function_declaration"
+                "function_item"
+                | "fn_item"
+                | "function_definition"
+                | "function_declaration"
                 | "method_definition" => SymbolKind::Function,
                 "struct_item" => SymbolKind::Struct,
                 "class_definition" | "class_declaration" => SymbolKind::Class,
@@ -237,13 +240,13 @@ impl CodePropertyGraph {
         let first_line = raw.lines().next().unwrap_or("").trim();
         let tokens: Vec<&str> = first_line.split_whitespace().collect();
         for (i, tok) in tokens.iter().enumerate() {
-            if ["fn", "def", "struct", "class", "impl", "trait", "mod", "enum", "function"]
-                .contains(tok)
+            if [
+                "fn", "def", "struct", "class", "impl", "trait", "mod", "enum", "function",
+            ]
+            .contains(tok)
                 && i + 1 < tokens.len()
             {
-                let candidate = tokens[i + 1]
-                    .trim_matches(['(', '{', ':', '<', '>'])
-                    .trim();
+                let candidate = tokens[i + 1].trim_matches(['(', '{', ':', '<', '>']).trim();
                 if !candidate.is_empty() {
                     return candidate.to_string();
                 }
@@ -460,8 +463,8 @@ impl CodePropertyGraph {
         const RRF_K: f64 = 60.0;
         let mut rrf_scores: Vec<(usize, f64)> = (0..n)
             .map(|i| {
-                let score =
-                    (1.0 / (RRF_K + ppr_rank_map[i] as f64)) + (1.0 / (RRF_K + lex_rank_map[i] as f64));
+                let score = (1.0 / (RRF_K + ppr_rank_map[i] as f64))
+                    + (1.0 / (RRF_K + lex_rank_map[i] as f64));
                 (i, score)
             })
             .collect();
@@ -482,7 +485,10 @@ impl CodePropertyGraph {
             .map(|(idx, _)| idx)
             .collect();
 
-        top_indices.into_iter().map(|idx| &self.nodes[idx]).collect()
+        top_indices
+            .into_iter()
+            .map(|idx| &self.nodes[idx])
+            .collect()
     }
 }
 
@@ -611,10 +617,20 @@ pub fn create_default_user() -> UserConfig {
         assert!(names.contains(&"create_default_user"));
 
         // Prove reference linking: `create_default_user` references `UserConfig` / `new`.
-        let create_idx = graph.nodes.iter().position(|n| n.name == "create_default_user").unwrap();
-        let user_idx = graph.nodes.iter().position(|n| n.name == "UserConfig").unwrap();
+        let create_idx = graph
+            .nodes
+            .iter()
+            .position(|n| n.name == "create_default_user")
+            .unwrap();
+        let user_idx = graph
+            .nodes
+            .iter()
+            .position(|n| n.name == "UserConfig")
+            .unwrap();
         assert!(
-            graph.adj[create_idx].iter().any(|(dst, _)| *dst == user_idx),
+            graph.adj[create_idx]
+                .iter()
+                .any(|(dst, _)| *dst == user_idx),
             "create_default_user must have an edge to UserConfig"
         );
     }
@@ -638,7 +654,8 @@ pub fn unrelated_math_function(x: i32) -> i32 {
         let mut graph = CodePropertyGraph::new();
         graph.add_file(Path::new("src/net.rs"), source);
 
-        let prompt = "Please investigate a bug in parse_http_header where whitespace trimming fails.";
+        let prompt =
+            "Please investigate a bug in parse_http_header where whitespace trimming fails.";
         let relevant = graph.retrieve_relevant_symbols(prompt, 2);
 
         assert!(!relevant.is_empty());

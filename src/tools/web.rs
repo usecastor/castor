@@ -598,7 +598,9 @@ fn cap_output(text: &str, _full_len: usize) -> String {
         return text.to_string();
     }
     let outline = generate_markdown_outline(text);
-    let head_cap = MAX_OUTPUT_BYTES.saturating_sub(outline.len().min(4000)).max(6000);
+    let head_cap = MAX_OUTPUT_BYTES
+        .saturating_sub(outline.len().min(4000))
+        .max(6000);
     let max_safe = text.floor_char_boundary(head_cap);
     let window = &text[..max_safe];
     let search_start = max_safe.saturating_sub(500);

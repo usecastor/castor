@@ -13,7 +13,7 @@ use encoding_rs::{CoderResult, Decoder, UTF_8};
 // ---------------------------------------------------------------------------
 
 pub use crate::engine::sanitize::{
-    Repetition, RepetitionDetector, MIN_PATTERN_REPEATS, PATTERN_REPEAT_COUNT,
+    MIN_PATTERN_REPEATS, PATTERN_REPEAT_COUNT, Repetition, RepetitionDetector,
 };
 
 /// Extract non-empty streamed text deltas (reasoning, content, tool-call arguments)

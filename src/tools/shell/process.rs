@@ -30,7 +30,11 @@ pub const ERROR_MAX_STDERR_LINES: usize = 100;
 /// On success (exit 0): Retains the first 20 lines of stdout (eliminating verbose floods).
 /// On error (non-zero exit): Retains the last 100 lines of stdout and last 100 lines of stderr,
 /// preserving 100% of compiler error diagnostics, failure context, and stack traces.
-pub fn semantic_truncate_output(stdout: &str, stderr: &str, exit_code: i32) -> (String, String, bool) {
+pub fn semantic_truncate_output(
+    stdout: &str,
+    stderr: &str,
+    exit_code: i32,
+) -> (String, String, bool) {
     let mut truncated = false;
 
     let trunc_stdout = if exit_code == 0 {
@@ -39,7 +43,10 @@ pub fn semantic_truncate_output(stdout: &str, stderr: &str, exit_code: i32) -> (
             truncated = true;
             let kept = &lines[..SUCCESS_MAX_STDOUT_LINES];
             let elided = lines.len() - SUCCESS_MAX_STDOUT_LINES;
-            format!("{}\n[... {elided} lines omitted on success ...]", kept.join("\n"))
+            format!(
+                "{}\n[... {elided} lines omitted on success ...]",
+                kept.join("\n")
+            )
         } else {
             stdout.to_string()
         }
@@ -61,7 +68,10 @@ pub fn semantic_truncate_output(stdout: &str, stderr: &str, exit_code: i32) -> (
             truncated = true;
             let kept = &lines[lines.len() - ERROR_MAX_STDERR_LINES..];
             let elided = lines.len() - ERROR_MAX_STDERR_LINES;
-            format!("[... {elided} stderr lines elided ...]\n{}", kept.join("\n"))
+            format!(
+                "[... {elided} stderr lines elided ...]\n{}",
+                kept.join("\n")
+            )
         } else {
             stderr.to_string()
         }
@@ -374,9 +384,8 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
     let raw_stdout = String::from_utf8_lossy(&out).into_owned();
     let (clean_stdout, clean_stderr, sem_truncated) =
         semantic_truncate_output(&raw_stdout, &err, exit_code);
-    let was_truncated = out_trunc.load(Ordering::SeqCst)
-        || err_trunc.load(Ordering::SeqCst)
-        || sem_truncated;
+    let was_truncated =
+        out_trunc.load(Ordering::SeqCst) || err_trunc.load(Ordering::SeqCst) || sem_truncated;
 
     Ok(ShellOutput {
         exit_code,

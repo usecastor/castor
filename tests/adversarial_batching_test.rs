@@ -6,14 +6,16 @@
 //! 3. Absence of announcement regex stalls (elimination of `is_announced_intent` and English prompt nudges).
 //! 4. Consolidated turn advisories (at most ONCE at turn end when code is modified without bash, ZERO when bash is present).
 
+use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use async_trait::async_trait;
 
 use castor::engine::{Completion, EngineError, Message, Metrics, ToolCall, ToolSchema};
 use castor::runner::events::EventLogger;
-use castor::runner::{ChatEngine, SessionOptions, ToolError, ToolExecutor, ToolOutcome, run_session};
+use castor::runner::{
+    ChatEngine, SessionOptions, ToolError, ToolExecutor, ToolOutcome, run_session,
+};
 use castor::state::StateDir;
 
 // ---------------------------------------------------------------------------
@@ -104,15 +106,25 @@ impl ToolExecutor for TimelineTrackingExecutor {
     async fn execute(&self, name: &str, _args_json: &str) -> Result<ToolOutcome, ToolError> {
         let (idx, expected_name, delay, outcome_text) = {
             let mut queue = self.delays.lock().await;
-            let pos = queue.iter().position(|(_, expected_name, _, _)| expected_name == name);
+            let pos = queue
+                .iter()
+                .position(|(_, expected_name, _, _)| expected_name == name);
             if let Some(p) = pos {
                 queue.remove(p).unwrap()
             } else {
-                (999, name.to_string(), Duration::from_millis(10), "ok".to_string())
+                (
+                    999,
+                    name.to_string(),
+                    Duration::from_millis(10),
+                    "ok".to_string(),
+                )
             }
         };
 
-        assert_eq!(name, expected_name, "Tool name mismatch in scripted executor");
+        assert_eq!(
+            name, expected_name,
+            "Tool name mismatch in scripted executor"
+        );
 
         let start = Instant::now();
         tokio::time::sleep(delay).await;
@@ -223,7 +235,12 @@ async fn adversarial_three_phase_concurrency_and_barrier_ordering() {
     // Call 4 (Phase 1): list_dir (30ms)
     let turn1_tools = vec![
         tc("c0", 0, "read_file", r#"{"path":"src/alpha.rs"}"#),
-        tc("c1", 1, "write_file", r#"{"path":"src/beta.rs","content":"mod beta;"}"#),
+        tc(
+            "c1",
+            1,
+            "write_file",
+            r#"{"path":"src/beta.rs","content":"mod beta;"}"#,
+        ),
         tc("c2", 2, "read_file", r#"{"path":"src/gamma.rs"}"#),
         tc("c3", 3, "bash", r#"{"command":"cargo check"}"#),
         tc("c4", 4, "list_dir", r#"{"path":"src"}"#),
@@ -239,7 +256,12 @@ async fn adversarial_three_phase_concurrency_and_barrier_ordering() {
         (1, "write_file", Duration::from_millis(30), "wrote beta"),
         (2, "read_file", Duration::from_millis(30), "content gamma"),
         (3, "bash", Duration::from_millis(10), "check ok"),
-        (4, "list_dir", Duration::from_millis(30), "alpha.rs\nbeta.rs"),
+        (
+            4,
+            "list_dir",
+            Duration::from_millis(30),
+            "alpha.rs\nbeta.rs",
+        ),
     ]);
 
     let options = SessionOptions::with_state(state);
@@ -262,11 +284,26 @@ async fn adversarial_three_phase_concurrency_and_barrier_ordering() {
     let records = executor.records().await;
     assert_eq!(records.len(), 5, "All 5 tools must execute");
 
-    let r0 = records.iter().find(|r| r.name == "read_file" && r.index == 0).unwrap();
-    let r1 = records.iter().find(|r| r.name == "write_file" && r.index == 1).unwrap();
-    let r2 = records.iter().find(|r| r.name == "read_file" && r.index == 2).unwrap();
-    let r3 = records.iter().find(|r| r.name == "bash" && r.index == 3).unwrap();
-    let r4 = records.iter().find(|r| r.name == "list_dir" && r.index == 4).unwrap();
+    let r0 = records
+        .iter()
+        .find(|r| r.name == "read_file" && r.index == 0)
+        .unwrap();
+    let r1 = records
+        .iter()
+        .find(|r| r.name == "write_file" && r.index == 1)
+        .unwrap();
+    let r2 = records
+        .iter()
+        .find(|r| r.name == "read_file" && r.index == 2)
+        .unwrap();
+    let r3 = records
+        .iter()
+        .find(|r| r.name == "bash" && r.index == 3)
+        .unwrap();
+    let r4 = records
+        .iter()
+        .find(|r| r.name == "list_dir" && r.index == 4)
+        .unwrap();
 
     // 1. Phase 1 Concurrency: Call 0, 2, and 4 must run concurrently.
     // Total duration for all 3 reads (each 30ms) must be < 65ms when concurrent.
@@ -317,7 +354,10 @@ async fn adversarial_prefix_cache_deterministic_index_sorting() {
     ];
 
     let engine = ScriptedEngine::new(vec![
-        comp("Emitting 3 reads with divergent completion times", turn1_tools),
+        comp(
+            "Emitting 3 reads with divergent completion times",
+            turn1_tools,
+        ),
         comp("Final answer after reads", vec![]),
     ]);
 
@@ -349,10 +389,7 @@ async fn adversarial_prefix_cache_deterministic_index_sorting() {
     let turn2_messages = &recorded[1].messages;
 
     // Filter to role: "tool" messages from Turn 1:
-    let tool_messages: Vec<&Message> = turn2_messages
-        .iter()
-        .filter(|m| m.role == "tool")
-        .collect();
+    let tool_messages: Vec<&Message> = turn2_messages.iter().filter(|m| m.role == "tool").collect();
 
     assert_eq!(tool_messages.len(), 3, "Must have 3 tool result messages");
 
@@ -386,9 +423,7 @@ async fn adversarial_no_announcement_regex_stalls() {
     // Announcement phrase that triggers the legacy `is_announced_intent`:
     let announcement_text = "I will now inspect the project files and run verification tests.";
 
-    let engine = ScriptedEngine::new(vec![
-        comp(announcement_text, vec![]),
-    ]);
+    let engine = ScriptedEngine::new(vec![comp(announcement_text, vec![])]);
 
     let executor = TimelineTrackingExecutor::new(vec![]);
     let options = SessionOptions::with_state(state);
@@ -435,8 +470,18 @@ async fn adversarial_consolidated_turn_advisory_once_at_end_when_no_bash() {
 
     // Case A: write_file + edit_file without bash:
     let case_a_tools = vec![
-        tc("w1", 0, "write_file", r#"{"path":"src/foo.rs","content":"fn foo() {}"}"#),
-        tc("e1", 1, "edit_file", r#"{"path":"src/bar.rs","target":"a","replacement":"b"}"#),
+        tc(
+            "w1",
+            0,
+            "write_file",
+            r#"{"path":"src/foo.rs","content":"fn foo() {}"}"#,
+        ),
+        tc(
+            "e1",
+            1,
+            "edit_file",
+            r#"{"path":"src/bar.rs","target":"a","replacement":"b"}"#,
+        ),
     ];
 
     let engine = ScriptedEngine::new(vec![
@@ -471,7 +516,9 @@ async fn adversarial_consolidated_turn_advisory_once_at_end_when_no_bash() {
         for msg in &call.messages {
             if msg.role == "user" {
                 assert!(
-                    !msg.content.contains("Source code was modified without a subsequent verification command"),
+                    !msg.content.contains(
+                        "Source code was modified without a subsequent verification command"
+                    ),
                     "Legacy standalone VERIFICATION_NUDGE user turn injected! Causes turn ping-pong."
                 );
             }

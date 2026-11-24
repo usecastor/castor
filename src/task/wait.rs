@@ -590,7 +590,10 @@ pub fn resolve_cross_env_state_dir(state: &StateDir, task_id: &str) -> StateDir 
     if crate::platform::is_wsl() {
         if let Ok(user) = std::env::var("USER") {
             let candidate = std::path::PathBuf::from(format!("/mnt/c/Users/{user}/.castor"));
-            if candidate.join("tasks").join(format!("task_{task_id}.json")).exists()
+            if candidate
+                .join("tasks")
+                .join(format!("task_{task_id}.json"))
+                .exists()
                 || candidate.join("ports").join("status.port").exists()
             {
                 return StateDir::new(candidate);
@@ -599,7 +602,10 @@ pub fn resolve_cross_env_state_dir(state: &StateDir, task_id: &str) -> StateDir 
         if let Ok(entries) = std::fs::read_dir("/mnt/c/Users") {
             for entry in entries.flatten() {
                 let candidate = entry.path().join(".castor");
-                if candidate.join("tasks").join(format!("task_{task_id}.json")).exists()
+                if candidate
+                    .join("tasks")
+                    .join(format!("task_{task_id}.json"))
+                    .exists()
                     || candidate.join("ports").join("status.port").exists()
                 {
                     return StateDir::new(candidate);
@@ -1052,7 +1058,11 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
             let _ = reg_clone
-                .transition(&id_clone, TaskStatus::Completed, Some("http success".into()))
+                .transition(
+                    &id_clone,
+                    TaskStatus::Completed,
+                    Some("http success".into()),
+                )
                 .await;
         });
 
@@ -1078,7 +1088,11 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let _ = reg_clone
-                .transition(&id_clone, TaskStatus::Completed, Some("disk rescued".into()))
+                .transition(
+                    &id_clone,
+                    TaskStatus::Completed,
+                    Some("disk rescued".into()),
+                )
                 .await;
         });
 
