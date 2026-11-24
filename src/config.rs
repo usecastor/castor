@@ -299,7 +299,7 @@ pub fn load() -> Result<LoadedConfig, ConfigError> {
 /// Load with an injectable env getter (test seam).
 pub fn load_with(get_env: impl Fn(&str) -> Option<String>) -> Result<LoadedConfig, ConfigError> {
     let (state_dir, state_dir_src) = match get_env("CASTOR_STATE_DIR") {
-        Some(v) if !v.is_empty() => (PathBuf::from(v), Source::Env),
+        Some(v) if !v.is_empty() => (crate::platform::to_host_path(PathBuf::from(v)), Source::Env),
         _ => (default_state_dir(), Source::Default),
     };
 
@@ -553,7 +553,7 @@ pub fn load_with(get_env: impl Fn(&str) -> Option<String>) -> Result<LoadedConfi
 
     // DGI tuning knobs: env-only settings (no config.json keys).
     let (dgi_reject_margin, src_dgi_reject_margin) =
-        pick_f64(env_f64("CASTOR_DGI_REJECT_MARGIN")?, 1.5);
+        pick_f64(env_f64("CASTOR_DGI_REJECT_MARGIN")?, 1.2);
     let (dgi_bypass_warm_session, src_dgi_bypass_warm_session) =
         pick_bool(env_bool("CASTOR_DGI_BYPASS_WARM_SESSION")?, true);
 
@@ -1447,7 +1447,7 @@ mod tests {
         let l = load_case(&[], None);
         assert_eq!(
             (l.config.dgi_reject_margin, l.sources.dgi_reject_margin),
-            (1.5, Source::Default)
+            (1.2, Source::Default)
         );
         let dir = tmp_dir();
         let err = load_with_env(&[

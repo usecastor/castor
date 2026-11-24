@@ -557,6 +557,157 @@ fn spawn_detached(state: &StateDir, port: u16) {
     }
 }
 
+/// Helper to extract the Windows host gateway IP inside WSL from `/etc/resolv.conf`.
+pub fn get_wsl_host_ip() -> Option<String> {
+    let content = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("nameserver") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                return Some(parts[1].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Locate the effective state directory for a task across environment boundaries.
+///
+/// Under WSL, tasks dispatched by a Windows-host Castor instance reside in
+/// `/mnt/c/Users/<user>/.castor`. If the local WSL state dir (`~/.castor`)
+/// does not contain the task record or active status port, this probes the
+/// Windows user profile state dir so `castor wait` works seamlessly cross-boundary.
+pub fn resolve_cross_env_state_dir(state: &StateDir, task_id: &str) -> StateDir {
+    // 1. If the task file exists in the current state dir, use it.
+    let local_task_file = state.tasks().join(format!("task_{task_id}.json"));
+    if local_task_file.exists() {
+        return state.clone();
+    }
+
+    // 2. If running inside WSL, probe Windows user profile directories for .castor.
+    #[cfg(unix)]
+    if crate::platform::is_wsl() {
+        if let Ok(user) = std::env::var("USER") {
+            let candidate = std::path::PathBuf::from(format!("/mnt/c/Users/{user}/.castor"));
+            if candidate.join("tasks").join(format!("task_{task_id}.json")).exists()
+                || candidate.join("ports").join("status.port").exists()
+            {
+                return StateDir::new(candidate);
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir("/mnt/c/Users") {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join(".castor");
+                if candidate.join("tasks").join(format!("task_{task_id}.json")).exists()
+                    || candidate.join("ports").join("status.port").exists()
+                {
+                    return StateDir::new(candidate);
+                }
+            }
+        }
+    }
+
+    state.clone()
+}
+
+/// CLI handler for `castor wait <task_id> [--timeout-s N] [--port P] [--state-dir D]`.
+///
+/// Seamlessly waits for a task to reach a terminal state whether invoked from native Windows or inside WSL:
+/// 1. Inspects the state dir (with cross-environment fallback between WSL and Windows if needed).
+/// 2. If the task is already terminal on disk, immediately outputs the JSON response.
+/// 3. Attempts HTTP long-poll to the StatusServer (trying 127.0.0.1, then host IP if in WSL).
+/// 4. If HTTP is unreachable or refused (due to NAT, firewall, or down server), seamlessly
+///    falls back to direct disk-mirror polling until terminal or timeout.
+/// 5. Returns the exact JSON response.
+pub async fn run_wait_cli(
+    state: &StateDir,
+    task_id: &str,
+    timeout_s: u64,
+    override_port: Option<u16>,
+) -> Result<String, String> {
+    let effective_state = resolve_cross_env_state_dir(state, task_id);
+    let reg = TaskRegistry::new(&effective_state);
+
+    // Fast-path: check if task is already terminal on disk.
+    match reg.read_disk(task_id) {
+        DiskRead::Ok(rec) if rec.status.is_terminal() => {
+            let (_, body) = terminal_response(&rec);
+            return Ok(body);
+        }
+        DiskRead::Corrupt(msg) => {
+            return Err(format!("malformed task file: {msg}"));
+        }
+        _ => {}
+    }
+
+    let port = override_port.unwrap_or_else(|| active_status_port(&effective_state, 18021));
+
+    // Try HTTP long-poll to StatusServer.
+    #[allow(unused_mut)]
+    let mut candidate_urls = vec![format!(
+        "http://127.0.0.1:{port}/task/{task_id}/wait?timeout_s={timeout_s}"
+    )];
+
+    #[cfg(unix)]
+    if crate::platform::is_wsl() {
+        if let Some(host_ip) = get_wsl_host_ip() {
+            candidate_urls.push(format!(
+                "http://{host_ip}:{port}/task/{task_id}/wait?timeout_s={timeout_s}"
+            ));
+        }
+    }
+
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_s.saturating_add(5)))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    for url in candidate_urls {
+        match http_client.get(&url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    let text = resp.text().await.map_err(|e| e.to_string())?;
+                    return Ok(text);
+                } else if status == StatusCode::NOT_FOUND {
+                    break;
+                }
+            }
+            Err(_) => {
+                continue;
+            }
+        }
+    }
+
+    // Disk fallback: poll the disk mirror directly until terminal or timeout.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_s);
+    let poll_interval = Duration::from_millis(DISK_POLL_MS);
+
+    loop {
+        match reg.read_disk(task_id) {
+            DiskRead::Ok(rec) if rec.status.is_terminal() => {
+                let (_, body) = terminal_response(&rec);
+                return Ok(body);
+            }
+            DiskRead::Corrupt(msg) => {
+                return Err(format!("malformed task file: {msg}"));
+            }
+            _ => {}
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            let body = json!({
+                "status": "executing",
+                "timed_out": true
+            });
+            return Ok(body.to_string());
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -867,5 +1018,74 @@ mod tests {
         let addr = SocketAddr::from(([127, 0, 0, 1], active_port));
         let (code, _) = http_get(&addr, &format!("/task/{id}/status")).await;
         assert_eq!(code, 200, "status server should respond on active port");
+    }
+
+    #[tokio::test]
+    async fn test_run_wait_cli_instant_terminal_disk() {
+        let state = tmp_state();
+        let reg = TaskRegistry::new(&state);
+        let id = reg.create("quick", "/tmp", "s_quick").await.unwrap();
+        reg.transition(&id, TaskStatus::Completed, Some("all done".into()))
+            .await
+            .unwrap();
+
+        let output = run_wait_cli(&state, &id, 5, None).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["reason"], "all done");
+    }
+
+    #[tokio::test]
+    async fn test_run_wait_cli_http_long_poll() {
+        let state = tmp_state();
+        let server = StatusServer::new(&state);
+        let reg = server.inner.registry.clone();
+        let addr = server.serve_ephemeral().await.unwrap();
+
+        let id = reg.create("http_task", "/tmp", "s_http").await.unwrap();
+        reg.transition(&id, TaskStatus::Executing, None)
+            .await
+            .unwrap();
+
+        let id_clone = id.clone();
+        let reg_clone = reg.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = reg_clone
+                .transition(&id_clone, TaskStatus::Completed, Some("http success".into()))
+                .await;
+        });
+
+        let output = run_wait_cli(&state, &id, 5, Some(addr.port()))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["reason"], "http success");
+    }
+
+    #[tokio::test]
+    async fn test_run_wait_cli_disk_fallback_offline_server() {
+        let state = tmp_state();
+        let reg = TaskRegistry::new(&state);
+        let id = reg.create("offline_task", "/tmp", "s_off").await.unwrap();
+        reg.transition(&id, TaskStatus::Executing, None)
+            .await
+            .unwrap();
+
+        let id_clone = id.clone();
+        let reg_clone = reg.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = reg_clone
+                .transition(&id_clone, TaskStatus::Completed, Some("disk rescued".into()))
+                .await;
+        });
+
+        // Pass a dark port where no server is listening to verify seamless disk fallback.
+        let output = run_wait_cli(&state, &id, 5, Some(59999)).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["reason"], "disk rescued");
     }
 }

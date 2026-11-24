@@ -53,10 +53,7 @@ pub struct JobSpec {
 }
 
 fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::platform::now_epoch_ms()
 }
 
 /// Canonicalize the workspace root by walking up from the provided path
@@ -143,6 +140,7 @@ Peer Engineering Invariants:\n\
     system_prompt.push_str(&routing);
     system_prompt.push_str(
         "- Verification Discipline: Never claim completion or close a task without running the verification gate and confirming clean output.\n\
+- High-Throughput Batching: Always emit ALL independent tool calls in parallel within a single turn. When exploring, diagnosing, or refactoring, batch your searches and reads together (e.g. issue multiple `read_file` or `search_code` calls in one turn). Never ping-pong single reads or searches sequentially when they can be dispatched concurrently.\n\
 - Security & Authority: Tool refusals tagged `Access denied`, `Execution blocked`, or `binary file` are binding policy decisions, not transient failures or permission requests. Never route around one \u{2014} no `bash`/`cat`/`cp`/`mv`/`tee` substitute, alternative path, symlink, or privilege escalation. If the blocked file or operation is essential to the task, stop that line of work and report the constraint in your final report, naming the exact target and the allowed root or permission that would unblock it, so the Lead Architect / user can adjust the workspace policy deliberately. (If the denial was your own typo \u{2014} a malformed or mistyped in-workspace path \u{2014} correct it and retry; that is fixing your error, not bypassing policy.)",
     );
 
@@ -224,6 +222,7 @@ pub async fn run_job_with_engine(
     // 1. DGI gatekeeper: classify the dispatch BEFORE committing to a slot
     //    lease. A rejected or failed probe never holds a lease and fails fast
     //    with the unadulterated error (no heuristic fallback).
+    let mut dgi_review_advisory: Option<String> = None;
     if config.base_url.is_some() && config.model.is_some() {
         let dgi = if crate::mcp::dgi::warm_session_bypass(config, state, &spec.session_id) {
             tracing::debug!(
@@ -254,6 +253,17 @@ pub async fn run_job_with_engine(
             }
         };
 
+        if let crate::mcp::dgi::DgiVerdict::Review(score) = &dgi {
+            tracing::info!(
+                session_id = %spec.session_id,
+                score = score,
+                "[dgi] task admitted under Review tier (0 < delta_z <= 1.2)"
+            );
+            dgi_review_advisory = Some(format!(
+                "\n\n[DGI Advisory]\nNotice: Dispatch scope leans broad (margin in Review tier, score {score}). Maintain strict single-subsystem focus and tight verification gates to avoid reasoning ceiling exhaustion."
+            ));
+        }
+
         if let crate::mcp::dgi::DgiVerdict::Reject(sigs) = &dgi {
             let body = sigs
                 .iter()
@@ -265,7 +275,11 @@ pub async fn run_job_with_engine(
                  Decompose into a single-concern slice (one subsystem, one verification gate) and re-dispatch."
             );
             let _ = registry
-                .transition(&spec.task_id, TaskStatus::Failed, Some(reject_msg.clone()))
+                .transition(
+                    &spec.task_id,
+                    TaskStatus::RejectedDecomposition,
+                    Some(reject_msg.clone()),
+                )
                 .await;
             return Err(reject_msg);
         }
@@ -303,16 +317,23 @@ pub async fn run_job_with_engine(
         // A byte-identical, deterministic `[Workspace Skeleton]` block (a pure
         // function of the workspace's stable top-level shape) — a warm KV prefix
         // so 96%+ of the Turn-1 prefix cache hits across concurrent sessions.
-        runner::skeleton::build_workspace_skeleton(std::path::Path::new(&spec.cwd))
+        // When AST is active, augments with top relevant symbol definitions via PPR.
+        runner::skeleton::build_workspace_skeleton_with_prompt(
+            &workspace_root,
+            Some(&spec.prompt),
+        )
     } else {
         String::new()
     };
-    let system_prompt = build_worker_system_prompt(
+    let mut system_prompt = build_worker_system_prompt(
         &workspace_root,
         config.workspace_skeleton_prefix,
         &skeleton,
         &skills_index,
     );
+    if let Some(ref advisory) = dgi_review_advisory {
+        system_prompt.push_str(advisory);
+    }
 
     // 3. Acquire execution slot (token-budgeted). The pool's total budget is
     //    `max_context`: the unified admission rule caps the *sum* of every
@@ -484,6 +505,23 @@ pub async fn run_job_with_engine(
         Ok(session_res) => {
             let terminal_status = if session_res.status == "completed" {
                 TaskStatus::Completed
+            } else if session_res.status == "reasoning_budget_exhausted" {
+                let salvage_path = state
+                    .root()
+                    .join(".scratch")
+                    .join(format!("salvage_{}.md", spec.session_id));
+                let ws_salvage_path = workspace_root
+                    .join(".scratch")
+                    .join(format!("salvage_{}.md", spec.session_id));
+                let has_salvage = (salvage_path.exists()
+                    && std::fs::metadata(&salvage_path).map(|m| m.len() > 0).unwrap_or(false))
+                    || (ws_salvage_path.exists()
+                        && std::fs::metadata(&ws_salvage_path).map(|m| m.len() > 0).unwrap_or(false));
+                if has_salvage {
+                    TaskStatus::CompletedWithSalvage
+                } else {
+                    TaskStatus::Failed
+                }
             } else {
                 TaskStatus::Failed
             };
@@ -988,7 +1026,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_simplification_exhausted_reasoning_marks_task_failed() {
+    async fn status_simplification_exhausted_reasoning_marks_task_completed_with_salvage() {
         let (state, dir) = tmp_state();
         let registry = TaskRegistry::new(&state);
         let task_id = registry
@@ -1054,7 +1092,7 @@ mod tests {
         assert!(res.contains("Salvage summary: reasoning ceiling hit"));
 
         let rec = registry.get(&task_id).await.unwrap();
-        assert_eq!(rec.status, TaskStatus::Failed);
+        assert_eq!(rec.status, TaskStatus::CompletedWithSalvage);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

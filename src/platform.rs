@@ -1,5 +1,86 @@
 //! Platform detection and OS-specific process management.
 
+/// Current wall-clock time as Unix-epoch milliseconds.
+pub fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Liveness probe for a pid (signal 0 on Unix, PROCESS_QUERY_LIMITED_INFORMATION on Windows).
+/// Conservative: a probe that errors with EPERM means the process exists and is treated as alive.
+///
+/// On Linux a successful `kill(pid, 0)` also reports for **zombie** (`<defunct>`) processes.
+/// A zombie has already exited — it cannot execute code, heartbeat, or release its slot —
+/// so we re-inspect `/proc/{pid}/status` and treat `State: Z` as dead.
+#[cfg(unix)]
+pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() as u32 {
+        return true;
+    }
+    let r = unsafe { libc::kill(pid as i32, 0) };
+    if r == 0 {
+        #[cfg(target_os = "linux")]
+        {
+            return !is_linux_zombie(pid);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return true;
+        }
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "linux")]
+fn is_linux_zombie(pid: u32) -> bool {
+    let path = format!("/proc/{pid}/status");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    content
+        .lines()
+        .find(|l| l.starts_with("State:"))
+        .map(|l| l.trim_start_matches("State:").trim_start().starts_with('Z'))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    unsafe {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE: u32 = 259;
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if !handle.is_null() {
+            let mut exit_code: u32 = 0;
+            let success = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            success != 0 && exit_code == STILL_ACTIVE
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+pub fn pid_alive(_pid: u32) -> bool {
+    false
+}
+
 /// Terminate a process and its whole process group.
 pub fn kill_process_tree(pid: u32) {
     if pid == 0 {
@@ -25,15 +106,72 @@ pub fn kill_process_tree(pid: u32) {
 /// maps it to `/mnt/<drive>/foo/bar`.
 ///
 /// In Windows:
-/// Retains native paths as-is.
+/// If passed a WSL-style path with a `/mnt/<drive>` prefix (e.g. `/mnt/d/foo/bar`),
+/// maps it to `<drive>:\foo\bar`.
 pub fn to_host_path(p: impl AsRef<std::path::Path>) -> std::path::PathBuf {
     let path = p.as_ref();
     #[cfg(unix)]
     {
         return std::path::PathBuf::from(to_wsl_path(path));
     }
+    #[cfg(windows)]
+    {
+        return std::path::PathBuf::from(to_windows_path(path));
+    }
     #[allow(unreachable_code)]
     path.to_path_buf()
+}
+
+/// Translates a WSL /mnt path (e.g. `/mnt/d/foo/bar`) to Windows format (e.g. `D:\foo\bar`).
+///
+/// Handles:
+/// - `/mnt/<drive>/...` -> `<DRIVE>:\...`
+/// - `/mnt/<drive>` -> `<DRIVE>:\`
+/// - `\mnt\<drive>\...` -> `<DRIVE>:\...`
+/// - Preserves Windows drive-letter paths (normalizing to backslashes).
+/// - Preserves non-/mnt paths as-is.
+pub fn to_windows_path(p: impl AsRef<std::path::Path>) -> String {
+    let s = p.as_ref().to_string_lossy();
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let normalized = trimmed.replace('\\', "/");
+    if let Some(after_mnt) = normalized.strip_prefix("/mnt/") {
+        let bytes = after_mnt.as_bytes();
+        if !bytes.is_empty() && bytes[0].is_ascii_alphabetic() {
+            let drive = (bytes[0] as char).to_ascii_uppercase();
+            if bytes.len() == 1 {
+                return format!("{drive}:\\");
+            } else if bytes[1] == b'/' {
+                let rest = after_mnt[2..].replace('/', "\\");
+                let clean_rest = rest.trim_start_matches('\\');
+                if clean_rest.is_empty() {
+                    return format!("{drive}:\\");
+                } else {
+                    return format!("{drive}:\\{clean_rest}");
+                }
+            }
+        }
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        let drive = (bytes[0] as char).to_ascii_uppercase();
+        let rest = if bytes.len() >= 3 && (bytes[2] == b'\\' || bytes[2] == b'/') {
+            &trimmed[3..]
+        } else {
+            &trimmed[2..]
+        };
+        let clean_rest = rest.replace('/', "\\");
+        let trimmed_rest = clean_rest.trim_start_matches('\\');
+        if trimmed_rest.is_empty() {
+            format!("{drive}:\\")
+        } else {
+            format!("{drive}:\\{trimmed_rest}")
+        }
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Translates a Windows path with a drive letter to WSL /mnt format (e.g. `D:\foo\bar` -> `/mnt/d/foo/bar`).
@@ -291,7 +429,40 @@ mod tests {
                 to_host_path("D:\\LLM_Ecosystem"),
                 std::path::PathBuf::from("D:\\LLM_Ecosystem")
             );
+            assert_eq!(
+                to_host_path("/mnt/d/LLM_Ecosystem"),
+                std::path::PathBuf::from("D:\\LLM_Ecosystem")
+            );
+            assert_eq!(
+                to_host_path("/mnt/c/users/apath"),
+                std::path::PathBuf::from("C:\\users\\apath")
+            );
+            assert_eq!(
+                to_host_path("relative/path"),
+                std::path::PathBuf::from("relative/path")
+            );
         }
+    }
+
+    #[test]
+    fn test_to_windows_path() {
+        assert_eq!(to_windows_path("/mnt/d/LLM_Ecosystem"), "D:\\LLM_Ecosystem");
+        assert_eq!(to_windows_path("/mnt/c/Users/Apath"), "C:\\Users\\Apath");
+        assert_eq!(to_windows_path("/mnt/d"), "D:\\");
+        assert_eq!(to_windows_path("/mnt/d/"), "D:\\");
+        assert_eq!(to_windows_path("D:\\LLM_Ecosystem"), "D:\\LLM_Ecosystem");
+        assert_eq!(to_windows_path("d:/LLM_Ecosystem"), "D:\\LLM_Ecosystem");
+        assert_eq!(to_windows_path("relative/path"), "relative/path");
+        assert_eq!(to_windows_path("/tmp/castor-x"), "/tmp/castor-x");
+    }
+
+    #[test]
+    fn test_to_wsl_path() {
+        assert_eq!(to_wsl_path("D:\\LLM_Ecosystem"), "/mnt/d/LLM_Ecosystem");
+        assert_eq!(to_wsl_path("c:/users/apath"), "/mnt/c/users/apath");
+        assert_eq!(to_wsl_path("D:\\"), "/mnt/d");
+        assert_eq!(to_wsl_path("/mnt/d/LLM_Ecosystem"), "/mnt/d/LLM_Ecosystem");
+        assert_eq!(to_wsl_path("relative/path"), "relative/path");
     }
 
     #[cfg(unix)]

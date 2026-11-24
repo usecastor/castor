@@ -82,10 +82,7 @@ pub struct ServerParams {
 }
 
 fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::platform::now_epoch_ms()
 }
 
 /// Valid reasoning-effort tiers for the configured local serving engine
@@ -344,11 +341,20 @@ impl CastorMcpServer {
 
                         if let Some(r) = rec {
                             match r.status {
-                                crate::task::registry::TaskStatus::Completed => {
+                                crate::task::registry::TaskStatus::Completed
+                                | crate::task::registry::TaskStatus::CompletedWithSalvage => {
                                     let out = r.reason.unwrap_or_else(|| {
                                         "Task completed successfully.".to_string()
                                     });
                                     return CallToolResult::success(vec![ContentBlock::text(out)]);
+                                }
+                                crate::task::registry::TaskStatus::RejectedDecomposition => {
+                                    let err = r.reason.unwrap_or_else(|| {
+                                        "Task rejected by decomposition gatekeeper.".to_string()
+                                    });
+                                    return CallToolResult::error(vec![ContentBlock::text(
+                                        format!("Decomposition rejected: {err}"),
+                                    )]);
                                 }
                                 crate::task::registry::TaskStatus::Failed => {
                                     let err =
@@ -487,17 +493,21 @@ impl CastorMcpServer {
                 };
                 let status_port = loaded.config.ports.status;
                 let text = match rec.status {
-                    crate::task::registry::TaskStatus::Completed => {
+                    crate::task::registry::TaskStatus::Completed
+                    | crate::task::registry::TaskStatus::CompletedWithSalvage => {
                         format!(
-                            "[task] id={} status=completed\n{}",
+                            "[task] id={} status={}\n{}",
                             rec.id,
+                            rec.status,
                             rec.reason.as_deref().unwrap_or("Task completed.")
                         )
                     }
-                    crate::task::registry::TaskStatus::Failed => {
+                    crate::task::registry::TaskStatus::Failed
+                    | crate::task::registry::TaskStatus::RejectedDecomposition => {
                         format!(
-                            "[task] id={} status=failed\nReason: {}",
+                            "[task] id={} status={}\nReason: {}",
                             rec.id,
+                            rec.status,
                             rec.reason.as_deref().unwrap_or("Unknown failure.")
                         )
                     }

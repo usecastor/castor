@@ -29,21 +29,27 @@ pub const MAX_ELASTIC_TURNS: u32 = 200;
 
 /// Task lifecycle status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Queued,
     Executing,
     Completed,
+    CompletedWithSalvage,
+    RejectedDecomposition,
     Failed,
     Cancelled,
 }
 
 impl TaskStatus {
-    /// Terminal states: completed / failed / cancelled.
+    /// Terminal states: completed / completed_with_salvage / rejected_decomposition / failed / cancelled.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            TaskStatus::Completed
+                | TaskStatus::CompletedWithSalvage
+                | TaskStatus::RejectedDecomposition
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled
         )
     }
 }
@@ -54,6 +60,8 @@ impl std::fmt::Display for TaskStatus {
             TaskStatus::Queued => "queued",
             TaskStatus::Executing => "executing",
             TaskStatus::Completed => "completed",
+            TaskStatus::CompletedWithSalvage => "completed_with_salvage",
+            TaskStatus::RejectedDecomposition => "rejected_decomposition",
             TaskStatus::Failed => "failed",
             TaskStatus::Cancelled => "cancelled",
         };

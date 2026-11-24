@@ -214,7 +214,7 @@ impl Locks {
 
         let is_held = |info: &LockInfo| {
             now.saturating_sub(info.held_at) < ttl_ms
-                && (!verify_pid_alive || crate::task::semaphore::pid_alive(info.pid))
+                && (!verify_pid_alive || crate::platform::pid_alive(info.pid))
         };
 
         // 2. Exists: reject if still active.
@@ -380,10 +380,7 @@ fn write_lock_file(path: &Path, pid: u32, held_at: u64, ttl_ms: u64) -> io::Resu
 }
 
 fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::platform::now_epoch_ms()
 }
 
 /// Process-local serialization for wedge-counter read-modify-write.
