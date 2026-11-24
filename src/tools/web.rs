@@ -28,8 +28,8 @@ const DEFAULT_BRAVE: &str = "https://api.search.brave.com/res/v1/web/search";
 /// Short timeout applied to every outbound request.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Output cap for [`WebClient::fetch_docs`] (~20KB).
-const MAX_OUTPUT_BYTES: usize = 20_000;
+/// Output cap for [`WebClient::fetch_docs`] (~12KB).
+const MAX_OUTPUT_BYTES: usize = 12 * 1024;
 
 /// Hard cap on the total response body streamed by [`WebClient::fetch_docs`]
 /// (10 MiB). Exceeding it aborts the fetch with a typed
@@ -556,13 +556,50 @@ async fn read_body_capped(resp: &mut reqwest::Response, url: &str) -> Result<Vec
     }
 }
 
-/// Truncate to the output cap, cutting at a clean boundary and appending a
-/// marker reporting the shown and total sizes.
-fn cap_output(text: &str, full_len: usize) -> String {
+/// Generate a structured markdown section outline from a markdown document.
+/// Extracts headings (H1-H6) with section anchor links and range query hints.
+pub fn generate_markdown_outline(text: &str) -> String {
+    let mut sections = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            let level = trimmed.chars().take_while(|&c| c == '#').count();
+            if level > 0 && level <= 6 {
+                let title = trimmed[level..].trim();
+                if !title.is_empty() {
+                    let slug: String = title
+                        .to_lowercase()
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                        .collect();
+                    let slug = slug.trim_matches('-');
+                    let indent = "  ".repeat(level.saturating_sub(1));
+                    sections.push(format!("{indent}* [{title}](#{slug})"));
+                }
+            }
+        }
+    }
+
+    let mut out = String::from("## Document Outline\n");
+    if sections.is_empty() {
+        out.push_str("*(No structural headings detected)*\n");
+    } else {
+        out.push_str(&sections.join("\n"));
+        out.push('\n');
+    }
+    out.push_str("\n[Hint: To inspect specific sections without spilling, use targeted web_search queries or fetch specific sub-pages/sections.]\n");
+    out
+}
+
+/// Truncate to the output cap, cutting at a clean boundary and generating a
+/// structured markdown section outline with anchor links and range query hints.
+fn cap_output(text: &str, _full_len: usize) -> String {
     if text.len() <= MAX_OUTPUT_BYTES {
         return text.to_string();
     }
-    let max_safe = text.floor_char_boundary(MAX_OUTPUT_BYTES);
+    let outline = generate_markdown_outline(text);
+    let head_cap = MAX_OUTPUT_BYTES.saturating_sub(outline.len().min(4000)).max(6000);
+    let max_safe = text.floor_char_boundary(head_cap);
     let window = &text[..max_safe];
     let search_start = max_safe.saturating_sub(500);
     let mut cut = window.rfind("\n\n").unwrap_or(0);
@@ -579,11 +616,8 @@ fn cap_output(text: &str, full_len: usize) -> String {
     if fence_count % 2 == 1 {
         out.push_str("\n```");
     }
-    use std::fmt::Write;
-    let _ = write!(
-        out,
-        "\n\n[Content truncated: showing {cut} of {full_len} chars]"
-    );
+    out.push_str("\n\n[Content truncated. See Document Outline below for remaining sections.]\n\n");
+    out.push_str(&outline);
     out
 }
 
@@ -1330,6 +1364,18 @@ pub(crate) mod tests {
         // Single page in 1-page doc
         assert_eq!(parse_page_range(Some("1"), 1), Some((1, 1)));
     }
+    #[test]
+    fn test_generate_markdown_outline_extracts_headings_and_anchors() {
+        let doc = "# Main API\n\nSome intro text.\n\n## Authentication\n\nAuth details.\n\n### Bearer Token\n\nTokens.\n\n## Endpoints\n\nList.\n";
+        let outline = generate_markdown_outline(doc);
+        assert!(outline.contains("## Document Outline"));
+        assert!(outline.contains("* [Main API](#main-api)"));
+        assert!(outline.contains("  * [Authentication](#authentication)"));
+        assert!(outline.contains("    * [Bearer Token](#bearer-token)"));
+        assert!(outline.contains("  * [Endpoints](#endpoints)"));
+        assert!(outline.contains("[Hint: To inspect specific sections without spilling"));
+    }
+
     #[test]
     fn cap_output_multibyte_boundary_safety() {
         // Byte 20000 falls inside multi-byte character (en-dash '–', 3 bytes: 19998..20001).

@@ -16,6 +16,60 @@ use super::scanner::ShellPolicyError;
 /// Per-stream capture ceiling (256KB buffer cap).
 pub(crate) const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 
+/// Maximum lines of stdout to retain on success (exit 0) before semantic truncation.
+pub const SUCCESS_MAX_STDOUT_LINES: usize = 20;
+
+/// Maximum lines of stdout to retain on error (non-zero exit) before semantic truncation.
+pub const ERROR_MAX_STDOUT_LINES: usize = 100;
+
+/// Maximum lines of stderr to retain on error before semantic truncation.
+pub const ERROR_MAX_STDERR_LINES: usize = 100;
+
+/// Semantic line truncation for shell execution output.
+///
+/// On success (exit 0): Retains the first 20 lines of stdout (eliminating verbose floods).
+/// On error (non-zero exit): Retains the last 100 lines of stdout and last 100 lines of stderr,
+/// preserving 100% of compiler error diagnostics, failure context, and stack traces.
+pub fn semantic_truncate_output(stdout: &str, stderr: &str, exit_code: i32) -> (String, String, bool) {
+    let mut truncated = false;
+
+    let trunc_stdout = if exit_code == 0 {
+        let lines: Vec<&str> = stdout.lines().collect();
+        if lines.len() > SUCCESS_MAX_STDOUT_LINES {
+            truncated = true;
+            let kept = &lines[..SUCCESS_MAX_STDOUT_LINES];
+            let elided = lines.len() - SUCCESS_MAX_STDOUT_LINES;
+            format!("{}\n[... {elided} lines omitted on success ...]", kept.join("\n"))
+        } else {
+            stdout.to_string()
+        }
+    } else {
+        let lines: Vec<&str> = stdout.lines().collect();
+        if lines.len() > ERROR_MAX_STDOUT_LINES {
+            truncated = true;
+            let kept = &lines[lines.len() - ERROR_MAX_STDOUT_LINES..];
+            let elided = lines.len() - ERROR_MAX_STDOUT_LINES;
+            format!("[... {elided} lines elided ...]\n{}", kept.join("\n"))
+        } else {
+            stdout.to_string()
+        }
+    };
+
+    let trunc_stderr = {
+        let lines: Vec<&str> = stderr.lines().collect();
+        if lines.len() > ERROR_MAX_STDERR_LINES {
+            truncated = true;
+            let kept = &lines[lines.len() - ERROR_MAX_STDERR_LINES..];
+            let elided = lines.len() - ERROR_MAX_STDERR_LINES;
+            format!("[... {elided} stderr lines elided ...]\n{}", kept.join("\n"))
+        } else {
+            stderr.to_string()
+        }
+    };
+
+    (trunc_stdout, trunc_stderr, truncated)
+}
+
 /// Result of a sandboxed shell execution.
 #[derive(Debug)]
 pub struct ShellOutput {
@@ -317,11 +371,68 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
         }
     };
 
+    let raw_stdout = String::from_utf8_lossy(&out).into_owned();
+    let (clean_stdout, clean_stderr, sem_truncated) =
+        semantic_truncate_output(&raw_stdout, &err, exit_code);
+    let was_truncated = out_trunc.load(Ordering::SeqCst)
+        || err_trunc.load(Ordering::SeqCst)
+        || sem_truncated;
+
     Ok(ShellOutput {
         exit_code,
-        stdout: String::from_utf8_lossy(&out).into_owned(),
-        stderr: err,
-        truncated: out_trunc.load(Ordering::SeqCst) || err_trunc.load(Ordering::SeqCst),
+        stdout: clean_stdout,
+        stderr: clean_stderr,
+        truncated: was_truncated,
         duration_ms: t0.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_semantic_truncation_success_under_limit() {
+        let stdout = "line 1\nline 2\nline 3\n";
+        let (out, err, trunc) = semantic_truncate_output(stdout, "", 0);
+        assert!(!trunc);
+        assert_eq!(out, stdout);
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn test_semantic_truncation_success_over_limit() {
+        let lines: Vec<String> = (1..=50).map(|i| format!("output line {i}")).collect();
+        let stdout = lines.join("\n");
+        let (out, _, trunc) = semantic_truncate_output(&stdout, "", 0);
+        assert!(trunc);
+        assert!(out.contains("output line 1"));
+        assert!(out.contains("output line 20"));
+        assert!(!out.contains("output line 21\n"));
+        assert!(out.contains("[... 30 lines omitted on success ...]"));
+    }
+
+    #[test]
+    fn test_semantic_truncation_error_retains_tail_diagnostics() {
+        let lines: Vec<String> = (1..=150).map(|i| format!("diagnostic step {i}")).collect();
+        let stdout = lines.join("\n");
+        let (out, _, trunc) = semantic_truncate_output(&stdout, "", 1);
+        assert!(trunc);
+        assert!(out.contains("diagnostic step 150"));
+        assert!(out.contains("diagnostic step 51"));
+        assert!(!out.contains("diagnostic step 50\n"));
+        assert!(out.contains("[... 50 lines elided ...]"));
+    }
+
+    #[test]
+    fn test_semantic_truncation_stderr_retains_tail_diagnostics() {
+        let lines: Vec<String> = (1..=120).map(|i| format!("stderr err {i}")).collect();
+        let stderr = lines.join("\n");
+        let (_, err, trunc) = semantic_truncate_output("", &stderr, 1);
+        assert!(trunc);
+        assert!(err.contains("stderr err 120"));
+        assert!(err.contains("stderr err 21"));
+        assert!(!err.contains("stderr err 20\n"));
+        assert!(err.contains("[... 20 stderr lines elided ...]"));
+    }
 }

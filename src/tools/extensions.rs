@@ -295,17 +295,7 @@ fn cap_result(text: &str) -> String {
 /// Kill a process group (Unix) or the single process (Windows) by pid.
 fn kill_group(pid: Option<u32>) {
     let Some(pid) = pid else { return };
-    #[cfg(unix)]
-    unsafe {
-        // The child was spawned with process_group(0), so its pgid == its pid.
-        libc::killpg(pid as i32, libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .spawn();
-    }
+    crate::platform::kill_process_tree(pid);
 }
 
 /// Tokenize a command string on whitespace. No shell is ever invoked — this is

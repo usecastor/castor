@@ -503,7 +503,7 @@ const OUTLINE_LANGS: &[SupportLang] = &[
 
 /// Declaration node kinds recognized by [`outline_after_line`], spanning the
 /// Rust, Python, JS/TS, C-family, and JVM grammars bundled with ast-grep.
-const OUTLINE_DECL_KINDS: &[&str] = &[
+pub(crate) const OUTLINE_DECL_KINDS: &[&str] = &[
     "function_item",
     "fn_item",
     "struct_item",
