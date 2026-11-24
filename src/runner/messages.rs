@@ -76,6 +76,7 @@ pub(crate) fn sanitize_tool_delimiters(text: &str, open_tag: &str, close_tag: &s
 /// still has non-empty text after the *last* `close_tag` — i.e. a "severed"
 /// stop where deliberation ended but no tool call followed. Returns false
 /// when `close_tag` is absent (no closed reasoning block to sever on).
+#[allow(dead_code)]
 pub(crate) fn is_severed_stop(content: &str, close_tag: &str) -> bool {
     match content.rfind(close_tag) {
         Some(pos) => !content[pos + close_tag.len()..].trim().is_empty(),

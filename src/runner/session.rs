@@ -1,5 +1,7 @@
 //! Autonomous multi-turn session loop and terminal outcome resolution.
 
+use futures_util::future::join_all;
+
 use crate::engine::{Message, ToolCall, ToolSchema};
 use crate::runner::budget::{LOOP_THRESHOLD, LOOP_WINDOW};
 use crate::runner::context::{
@@ -9,8 +11,7 @@ use crate::runner::context::{
 use crate::runner::events::EventLogger;
 use crate::runner::loop_detector::{LoopDetector, LoopState};
 use crate::runner::messages::{
-    completion_text, is_severed_stop, metrics_json, msg, sanitize_tool_delimiters,
-    strip_reasoning_tags,
+    completion_text, metrics_json, msg, sanitize_tool_delimiters, strip_reasoning_tags,
 };
 use crate::runner::salvage::{
     is_reasoning_ceiling, run_degenerate_final_salvage, run_reasoning_ceiling_salvage,
@@ -33,86 +34,17 @@ fn check_resume(
     should_resume(history, new_user_prompt, max_context)
 }
 
-/// The one-time announced-intent continuation nudge for normal (non-ceiling)
-/// turns.
-const ANNOUNCED_INTENT_NUDGE: &str =
-    "Continue and complete the action or final synthesis you just announced.";
+/// Tools executing in Phase 1 (Concurrent read-only exploration).
+fn is_phase1_read(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "list_dir" | "search_code" | "ast_search" | "web_search" | "web_fetch" | "paper_lookup"
+    )
+}
 
-/// The one-time announced-intent continuation nudge for the ceiling
-/// synthesis turn: it must land a complete final synthesis, never another
-/// transitional announcement.
-const ANNOUNCED_INTENT_CEILING_NUDGE: &str = "[System: You stated an intent to act or verify without emitting a tool call or final report. \
-     Output your complete final synthesis now.]";
-
-/// Pure announced-intent detector. True when an assistant completion's text is
-/// a short transitional announcement — it states an intent to act or verify
-/// (e.g. "let me run a final verification pass") but carries no markdown
-/// structure that would mark it as a finished deliverable. The final
-/// sentence/paragraph must be the announcement (it may be prefixed by an
-/// evidence summary, as in "I have the core evidence. Let me run a final
-/// verification pass...").
-pub(crate) fn is_announced_intent(text: &str) -> bool {
-    const MAX_CHARS: usize = 600;
-    const MAX_PARAGRAPHS: usize = 3;
-
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > MAX_CHARS {
-        return false;
-    }
-    // Markdown structure (headers, numbered/list bullets, fenced code) marks a
-    // finished deliverable, not a transitional announcement.
-    for line in trimmed.lines() {
-        let l = line.trim_start();
-        if l.starts_with(|c: char| c == '#' || c.is_ascii_digit()) || l.starts_with(['*', '-']) {
-            return false;
-        }
-    }
-    if trimmed.contains("```") {
-        return false;
-    }
-
-    // Paragraphs are blank-line-separated blocks (a single-line announcement
-    // is one paragraph even across several physical lines).
-    let paragraphs: Vec<&str> = trimmed
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect();
-    if paragraphs.is_empty() || paragraphs.len() > MAX_PARAGRAPHS {
-        return false;
-    }
-
-    // The *last sentence* of the final paragraph must carry the announcement
-    // (it may be prefixed by an evidence summary), so a sentence that merely
-    // ends with "let me ..." inside a longer paragraph is not counted. Split
-    // on sentence boundaries and take the *last non-empty* fragment: a plain
-    // `.split(['.', ...]).last()` returns the trailing empty segment (the text
-    // after the final period), which would blank the check.
-    let last_paragraph = paragraphs.last().expect("paragraphs non-empty");
-    let last_sentence = last_paragraph
-        .split(['.', '?', '!'])
-        .map(str::trim)
-        .rfind(|s| !s.is_empty())
-        .unwrap_or("");
-    let last_lower = last_sentence.to_lowercase();
-    if last_lower.is_empty() {
-        return false;
-    }
-    // The final sentence must *start* with an announcement phrase, so
-    // "The verification passed." (an ending mention) is not an announcement.
-    const OPENERS: [&str; 8] = [
-        "let me ",
-        "i will now ",
-        "i'll now ",
-        "let's run ",
-        "let me run ",
-        "i am going to ",
-        "now let me ",
-        "now i will ",
-    ];
-    OPENERS.iter().any(|o| last_lower.starts_with(o))
-        || last_lower.contains("i'll run ")
-        || last_lower.contains("i will run ")
+/// Tools executing in Phase 2 (Partitioned file mutations).
+fn is_phase2_write(name: &str) -> bool {
+    matches!(name, "write_file" | "edit_file" | "ast_replace")
 }
 
 /// Idempotent read-only tools whose results may be deduplicated: re-reading
@@ -137,12 +69,6 @@ const VERIFIABLE_CODE_EXTENSIONS: [&str; 33] = [
     "cxx", "h", "hpp", "java", "cs", "rb", "php", "swift", "kt", "kts", "scala", "dart", "sol",
     "hs", "ex", "exs", "lua", "sh", "bash",
 ];
-
-/// The one-time verification nudge sent when the model mutates source code and
-/// then tries to stop without running a verification command.
-const VERIFICATION_NUDGE: &str = "[System: Source code was modified without a subsequent verification command. \
-     Run the relevant build or test check via `bash` to verify your changes, or \
-     confirm if no verification command applies.]";
 
 /// Pure decision: does a tool call count as a *verifiable code mutation* —
 /// a successful `edit_file` / `write_file` / `ast_replace` on a source file?
@@ -410,11 +336,8 @@ pub async fn run_session(
     let mut break_after_turn = false;
     // Post-mutation verification guard state (see [`is_verifiable_code_mutation`]).
     // `unverified_code_edit` flips true on a successful source-code mutation and
-    // resets on any `bash` call (a verification command). `verification_nudge_sent`
-    // is a strict one-shot latch: it arms the nudge exactly once for the session,
-    // so the nudge can never fire twice and the session can never loop on it.
+    // resets on any `bash` call (a verification command).
     let mut unverified_code_edit = false;
-    let mut verification_nudge_sent = false;
     let mut last_prompt_tokens: Option<usize> = if ceiling_tokens > 0 {
         engine.count_tokens(&messages, tools).await
     } else {
@@ -541,9 +464,6 @@ pub async fn run_session(
         // them on load — a resumed session then replays byte-identical
         // assistant content, so resuming never invalidates the KV prefix.
         let sanitized_content = strip_reasoning_tags(&completion.content, &open_tag, &close_tag);
-        // Detect the announced-intent signal before `sanitized_content` is
-        // moved into the appended assistant message.
-        let announced_intent = is_announced_intent(&sanitized_content);
         messages.push(Message {
             role: "assistant".into(),
             content: sanitized_content,
@@ -551,391 +471,15 @@ pub async fn run_session(
             tool_call_id: None,
         });
 
-        // In-flight 90% ceiling landed: this is the synthesis turn. A bare
-        // transitional announcement ("let me run a final verification pass")
-        // must not end the session here, so the completion is followed by a
-        // one-time continuation that is forced to output the complete final
-        // synthesis. Slipped tool calls a non-compliant engine may emit on
-        // this turn are never executed — they are appended as the assistant
-        // message (matching what was sent to the engine) so the history stays
-        // consistent, and the continuation still forces the synthesis.
         if break_after_turn {
             final_text = completion_text(&completion);
-            if completion.tool_calls.is_empty() && announced_intent {
-                let _ = logger.append(serde_json::json!({
-                    "type": "announced_intent",
-                    "turn": turns,
-                    "ceiling": true,
-                }));
-                messages.push(msg("user", ANNOUNCED_INTENT_CEILING_NUDGE));
-                match engine.chat(&messages, active_tools, true, effort).await {
-                    Ok(cont) => {
-                        // The synthesis turn is terminal: land on its content
-                        // (any tool calls it still emitted are never executed).
-                        final_text = completion_text(&cont);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            session = %session_id,
-                            "ceiling synthesis continuation failed: {e}; landing on prior content"
-                        );
-                    }
-                }
-            }
             break;
         }
 
         if completion.tool_calls.is_empty() {
-            // Compute the ceiling signal before moving `completion.content`.
             let ceiling_hit = is_reasoning_ceiling(&completion);
-
-            // Capture the severed-stop signal (reasoning closed, but
-            // the model stopped with no tool call and no real content) before
-            // moving `completion`. This triggers a one-time continuation prompt
-            // so the engine is given a chance to act after deliberating.
-            let severed_stop = completion
-                .finish_reason
-                .as_deref()
-                .map(|f| f == "stop")
-                .unwrap_or(false)
-                && completion.reasoning_content.is_some()
-                && is_severed_stop(&completion.content, &close_tag);
-
-            // Final content: `completion_text` falls back to the trimmed
-            // `reasoning_content` (common when a reasoning model finishes
-            // deliberation or emits its conclusion in thought tokens) instead
-            // of discarding the trace.
             final_text = completion_text(&completion);
 
-            // One-time continuation: the model announced an intent to act or
-            // verify (a short transitional statement such as "let me run a
-            // final verification pass") without emitting a tool call or a
-            // final report. Treat it like a severed stop: nudge once to
-            // continue acting; if the continuation emits tool calls the loop
-            // continues naturally, otherwise we land on its content.
-            if announced_intent {
-                let _ = logger.append(serde_json::json!({
-                    "type": "announced_intent",
-                    "turn": turns,
-                    "ceiling": false,
-                }));
-                let continuation_prompt = ANNOUNCED_INTENT_NUDGE;
-                messages.push(msg("user", continuation_prompt));
-                accounted_msgs = messages.len();
-                match engine.chat(&messages, tools, true, effort).await {
-                    Ok(cont) => {
-                        if let Some(pt) = cont.metrics.prompt_tokens {
-                            last_prompt_tokens = Some(pt as usize);
-                        }
-                        if cont.tool_calls.is_empty() {
-                            // Terminal: land on the continuation's content (or
-                            // its reasoning if the content is empty).
-                            final_text = completion_text(&cont);
-                            break;
-                        }
-                        // The model acted: append the assistant message with
-                        // its tool calls so the loop continues and executes them.
-                        messages.push(Message {
-                            role: "assistant".into(),
-                            content: strip_reasoning_tags(&cont.content, &open_tag, &close_tag),
-                            tool_calls: cont.tool_calls.clone(),
-                            tool_call_id: None,
-                        });
-                        let scratch_root = options.and_then(|o| o.scratch_root());
-                        let spill_threshold = options.and_then(|o| o.tool_spill_bytes);
-                        for tc in &cont.tool_calls {
-                            let outcome = match executor.execute(&tc.name, &tc.arguments).await {
-                                Ok(o) => o,
-                                Err(e) => ToolOutcome {
-                                    text: format!("Error: {e}"),
-                                },
-                            };
-                            tool_activity = true;
-                            record_verification_state(
-                                &mut unverified_code_edit,
-                                break_after_turn,
-                                tc,
-                                outcome.text.starts_with("Error:"),
-                            );
-                            let (tool_content, spilled) = spill_tool_output(
-                                &outcome.text,
-                                &tc.id,
-                                scratch_root.as_deref(),
-                                spill_threshold,
-                            );
-                            if let Some((bytes, path)) = spilled {
-                                let _ = logger.append(serde_json::json!({
-                                    "type": "tool_output_spilled",
-                                    "sessionId": session_id,
-                                    "toolCallId": tc.id,
-                                    "toolName": tc.name,
-                                    "bytes": bytes,
-                                    "path": path.to_string_lossy(),
-                                }));
-                            }
-                            let _ = logger.append(serde_json::json!({
-                                "type": "tool_result",
-                                "turn": turns,
-                                "tool_call_id": tc.id,
-                                "name": tc.name,
-                                "is_error": outcome.text.starts_with("Error:"),
-                                "output": tool_content,
-                            }));
-                            // Sanitize embedded reasoning delimiters so a
-                            // downstream tool-call parser never sees a valid
-                            // delimiter inside this continuation's tool output
-                            // (mirrors the main tool loop, DRY).
-                            let sanitized_tool_content =
-                                sanitize_tool_delimiters(&tool_content, &open_tag, &close_tag);
-                            let tool_message_content =
-                                dedup_tool_content(&messages, tc, &sanitized_tool_content);
-                            messages.push(Message {
-                                role: "tool".into(),
-                                content: tool_message_content,
-                                tool_call_id: Some(tc.id.clone()),
-                                tool_calls: Vec::new(),
-                            });
-                        }
-                        // Loop continues: `turns` was already incremented for
-                        // this iteration, so the next iteration consumes a fresh
-                        // budget unit for the follow-up assistant turn.
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            session = %session_id,
-                            "continuation call after announced intent failed: {e}; \
-                             landing on prior content"
-                        );
-                        break;
-                    }
-                }
-            }
-
-            // One-time continuation: the model deliberated (closed its reasoning
-            // block) but stopped without a tool call and without a real deliverable.
-            // Prompt it once to continue acting; if it then emits tool calls, the
-            // loop continues naturally — otherwise we land on the new content.
-            if severed_stop {
-                let continuation_prompt = concat!(
-                    "[System: Continuation] Your last turn closed with ",
-                    "th_ink",
-                    " reasoning but produced no tool call or final deliverable. \
-                     If you still need to take an action (read, write, run a tool, \
-                     or synthesize a final answer), do so now. If the task is \
-                     already complete, reply with your final answer."
-                );
-                messages.push(msg("user", continuation_prompt));
-                accounted_msgs = messages.len();
-                match engine.chat(&messages, tools, true, effort).await {
-                    Ok(cont) => {
-                        if let Some(pt) = cont.metrics.prompt_tokens {
-                            last_prompt_tokens = Some(pt as usize);
-                        }
-                        if cont.tool_calls.is_empty() {
-                            // Terminal: land on the continuation's content (or its
-                            // reasoning if the content is empty).
-                            final_text = if !cont.content.trim().is_empty() {
-                                cont.content
-                            } else if let Some(rc) = cont
-                                .reasoning_content
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                            {
-                                rc.to_string()
-                            } else {
-                                cont.content
-                            };
-                            break;
-                        }
-                        // The model acted: append the assistant message with its
-                        // tool calls so the loop continues and executes them.
-                        messages.push(Message {
-                            role: "assistant".into(),
-                            content: cont.content,
-                            tool_calls: cont.tool_calls.clone(),
-                            tool_call_id: None,
-                        });
-                        let scratch_root = options.and_then(|o| o.scratch_root());
-                        let spill_threshold = options.and_then(|o| o.tool_spill_bytes);
-                        for tc in &cont.tool_calls {
-                            let outcome = match executor.execute(&tc.name, &tc.arguments).await {
-                                Ok(o) => o,
-                                Err(e) => ToolOutcome {
-                                    text: format!("Error: {e}"),
-                                },
-                            };
-                            tool_activity = true;
-                            record_verification_state(
-                                &mut unverified_code_edit,
-                                break_after_turn,
-                                tc,
-                                outcome.text.starts_with("Error:"),
-                            );
-                            let (tool_content, spilled) = spill_tool_output(
-                                &outcome.text,
-                                &tc.id,
-                                scratch_root.as_deref(),
-                                spill_threshold,
-                            );
-                            if let Some((bytes, path)) = spilled {
-                                let _ = logger.append(serde_json::json!({
-                                    "type": "tool_output_spilled",
-                                    "sessionId": session_id,
-                                    "toolCallId": tc.id,
-                                    "toolName": tc.name,
-                                    "bytes": bytes,
-                                    "path": path.to_string_lossy(),
-                                }));
-                            }
-                            let _ = logger.append(serde_json::json!({
-                                "type": "tool_result",
-                                "turn": turns,
-                                "tool_call_id": tc.id,
-                                "name": tc.name,
-                                "is_error": outcome.text.starts_with("Error:"),
-                                "output": tool_content,
-                            }));
-                            // Sanitize embedded reasoning delimiters so a
-                            // downstream tool-call parser never sees a valid
-                            // delimiter inside this continuation's tool output
-                            // (mirrors the main tool loop, DRY).
-                            let sanitized_tool_content =
-                                sanitize_tool_delimiters(&tool_content, &open_tag, &close_tag);
-                            let tool_message_content =
-                                dedup_tool_content(&messages, tc, &sanitized_tool_content);
-                            messages.push(Message {
-                                role: "tool".into(),
-                                content: tool_message_content,
-                                tool_call_id: Some(tc.id.clone()),
-                                tool_calls: Vec::new(),
-                            });
-                        }
-                        // Loop continues: `turns` was already incremented for this
-                        // iteration, so the next iteration consumes a fresh budget
-                        // unit for the follow-up assistant turn.
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            session = %session_id,
-                            "continuation call after severed stop failed: {e}; \
-                             landing on prior content"
-                        );
-                        break;
-                    }
-                }
-            }
-
-            // Post-mutation verification nudge: the model mutated verifiable
-            // source code (see [`is_verifiable_code_mutation`]) and is now
-            // trying to stop without a subsequent `bash` verification command.
-            // The `verification_nudge_sent` latch is set the instant the nudge
-            // fires, so it can fire at most once per session — the model is
-            // nudged, and if it still refuses to verify (a text-only reply) we
-            // land on that reply and exit. The session therefore cannot loop
-            // on this nudge.
-            if !break_after_turn && !ceiling_hit && unverified_code_edit && !verification_nudge_sent
-            {
-                verification_nudge_sent = true;
-                unverified_code_edit = false;
-                let _ = logger.append(serde_json::json!({
-                    "type": "verification_nudge",
-                    "turn": turns,
-                }));
-                messages.push(msg("user", VERIFICATION_NUDGE));
-                accounted_msgs = messages.len();
-                match engine.chat(&messages, tools, true, effort).await {
-                    Ok(cont) => {
-                        if let Some(pt) = cont.metrics.prompt_tokens {
-                            last_prompt_tokens = Some(pt as usize);
-                        }
-                        if cont.tool_calls.is_empty() {
-                            // Terminal: the model confirmed (or refused) the
-                            // verification; land on its content.
-                            final_text = completion_text(&cont);
-                            break;
-                        }
-                        // The model ran a verification command: execute it and
-                        // continue the main loop so the result feeds the next
-                        // turn. `unverified_code_edit` resets in the main loop
-                        // on the `bash` call, so this nudge does not re-arm.
-                        messages.push(Message {
-                            role: "assistant".into(),
-                            content: strip_reasoning_tags(&cont.content, &open_tag, &close_tag),
-                            tool_calls: cont.tool_calls.clone(),
-                            tool_call_id: None,
-                        });
-                        let scratch_root = options.and_then(|o| o.scratch_root());
-                        let spill_threshold = options.and_then(|o| o.tool_spill_bytes);
-                        for tc in &cont.tool_calls {
-                            let outcome = match executor.execute(&tc.name, &tc.arguments).await {
-                                Ok(o) => o,
-                                Err(e) => ToolOutcome {
-                                    text: format!("Error: {e}"),
-                                },
-                            };
-                            tool_activity = true;
-                            record_verification_state(
-                                &mut unverified_code_edit,
-                                break_after_turn,
-                                tc,
-                                outcome.text.starts_with("Error:"),
-                            );
-                            let (tool_content, spilled) = spill_tool_output(
-                                &outcome.text,
-                                &tc.id,
-                                scratch_root.as_deref(),
-                                spill_threshold,
-                            );
-                            if let Some((bytes, path)) = spilled {
-                                let _ = logger.append(serde_json::json!({
-                                    "type": "tool_output_spilled",
-                                    "sessionId": session_id,
-                                    "toolCallId": tc.id,
-                                    "toolName": tc.name,
-                                    "bytes": bytes,
-                                    "path": path.to_string_lossy(),
-                                }));
-                            }
-                            let _ = logger.append(serde_json::json!({
-                                "type": "tool_result",
-                                "turn": turns,
-                                "tool_call_id": tc.id,
-                                "name": tc.name,
-                                "is_error": outcome.text.starts_with("Error:"),
-                                "output": tool_content,
-                            }));
-                            let sanitized_tool_content =
-                                sanitize_tool_delimiters(&tool_content, &open_tag, &close_tag);
-                            let tool_message_content =
-                                dedup_tool_content(&messages, tc, &sanitized_tool_content);
-                            messages.push(Message {
-                                role: "tool".into(),
-                                content: tool_message_content,
-                                tool_call_id: Some(tc.id.clone()),
-                                tool_calls: Vec::new(),
-                            });
-                        }
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            session = %session_id,
-                            "continuation call after verification nudge failed: {e}; \
-                             landing on prior content"
-                        );
-                        break;
-                    }
-                }
-            }
-
-            // Deliberation-ceiling salvage pass: the model stopped at its
-            // reasoning ceiling on a non-tool turn. The honest status is kept,
-            // the accumulated conversation history is preserved, the peer
-            // engineer is empowered with full tools to inspect scratchpads or
-            // verify test outputs, and a grounded status report is extracted.
             if ceiling_hit {
                 let outcome = run_reasoning_ceiling_salvage(
                     engine,
@@ -954,7 +498,6 @@ pub async fn run_session(
                 break;
             }
 
-            // Degenerate final: empty/whitespace after real tool activity.
             if final_text.trim().is_empty() && tool_activity {
                 let outcome =
                     run_degenerate_final_salvage(engine, logger, &mut messages, effort, turns)
@@ -966,21 +509,70 @@ pub async fn run_session(
             break;
         }
 
-        // Execute each tool call.
-        //
-        // A loop-detection advisory emitted while the batch runs is collected
-        // and pushed *after* the whole batch (below), so the
-        // `[assistant(tool_calls), tool, tool, ...]` grouping is never split
-        // by a `role: "user"` advisory mid-batch — splitting it would rewrite
-        // the prompt shape and invalidate the KV prefix cache.
-        let mut deferred_advisory: Option<String> = None;
-        for tc in &completion.tool_calls {
+        // 3-Phase Concurrent Tool Execution:
+        // Phase 1: Read-only tools dispatched concurrently.
+        // Phase 2: Mutation tools executed after Phase 1.
+        // Phase 3: Shell commands (bash) barrier executed after Phase 2.
+        let mut phase1 = Vec::new();
+        let mut phase2 = Vec::new();
+        let mut phase3 = Vec::new();
+
+        for (i, tc) in completion.tool_calls.iter().enumerate() {
+            if is_phase1_read(&tc.name) {
+                phase1.push((i, tc));
+            } else if is_phase2_write(&tc.name) {
+                phase2.push((i, tc));
+            } else {
+                phase3.push((i, tc));
+            }
+        }
+
+        // Phase 1 (Concurrent Reads)
+        let phase1_futures = phase1.into_iter().map(|(idx, tc)| async move {
             let outcome = match executor.execute(&tc.name, &tc.arguments).await {
                 Ok(o) => o,
                 Err(e) => ToolOutcome {
                     text: format!("Error: {e}"),
                 },
             };
+            (idx, tc, outcome)
+        });
+        let phase1_results = join_all(phase1_futures).await;
+
+        // Phase 2 (Partitioned Writes - Barrier 1)
+        let mut phase2_results = Vec::with_capacity(phase2.len());
+        for (idx, tc) in phase2 {
+            let outcome = match executor.execute(&tc.name, &tc.arguments).await {
+                Ok(o) => o,
+                Err(e) => ToolOutcome {
+                    text: format!("Error: {e}"),
+                },
+            };
+            phase2_results.push((idx, tc, outcome));
+        }
+
+        // Phase 3 (Bash Barrier - Barrier 2)
+        let mut phase3_results = Vec::with_capacity(phase3.len());
+        for (idx, tc) in phase3 {
+            let outcome = match executor.execute(&tc.name, &tc.arguments).await {
+                Ok(o) => o,
+                Err(e) => ToolOutcome {
+                    text: format!("Error: {e}"),
+                },
+            };
+            phase3_results.push((idx, tc, outcome));
+        }
+
+        // Deterministic Reassembly (Index-Sorted for KV Prefix Invariant)
+        let mut all_results = Vec::with_capacity(completion.tool_calls.len());
+        all_results.extend(phase1_results);
+        all_results.extend(phase2_results);
+        all_results.extend(phase3_results);
+        all_results.sort_by_key(|(idx, _, _)| *idx);
+
+        let has_bash = completion.tool_calls.iter().any(|tc| tc.name == "bash");
+        let mut deferred_advisory: Option<String> = None;
+        for (_idx, tc, outcome) in all_results {
             tool_activity = true;
             record_verification_state(
                 &mut unverified_code_edit,
@@ -1023,17 +615,8 @@ pub async fn run_session(
                 }));
             }
 
-            // Append the tool result as a tool message. Sanitize any embedded
-            // reasoning delimiters so a downstream tool-call parser never sees a
-            // valid `<th_ink>`-style delimiter inside tool output. (The tag pair
-            // is hoisted to function scope; see the pre-loop definition.)
             let sanitized_tool_content =
                 sanitize_tool_delimiters(&tool_content, &open_tag, &close_tag);
-            // Tail-only byte-identical deduplication: if an earlier turn already
-            // produced the same result for the same (name, arguments), the new
-            // tail message carries a compact pointer instead of a duplicate
-            // payload (the earlier message is never mutated — the KV prefix
-            // stays 100% intact).
             let tool_message_content = dedup_tool_content(&messages, tc, &sanitized_tool_content);
             messages.push(Message {
                 role: "tool".into(),
@@ -1043,9 +626,6 @@ pub async fn run_session(
             });
 
             if let Some(data_url) = image_attachment {
-                // The engine carries a 1-image limit: clear any prior visual
-                // attachment user messages so multi-turn visual tasks never
-                // exceed it, then append the fresh attachment.
                 for m in &mut messages {
                     if m.role == "user" && m.content.starts_with("[Visual Inspection Attachment:") {
                         m.content =
@@ -1061,7 +641,6 @@ pub async fn run_session(
                 });
             }
 
-            // Record the tool_result event.
             logger
                 .append(serde_json::json!({
                     "type": "tool_result",
@@ -1073,10 +652,6 @@ pub async fn run_session(
                 }))
                 .map_err(RunnerError::Io)?;
 
-            // Loop detection (catches single-action and multi-action periodic
-            // cycles). The advisory is only collected here; it is pushed after
-            // the whole batch completes (see `deferred_advisory` below) so the
-            // `[assistant(tool_calls), tool, ...]` grouping stays intact.
             match loop_detector.record(&tc.name, &tc.arguments) {
                 LoopState::Ok => {}
                 LoopState::Advisory => {
@@ -1099,11 +674,17 @@ impasse, state your findings and ask for alignment rather than continuing to re-
             }
         }
 
-        // Push the deferred loop advisory only after the entire tool batch has
-        // been appended, keeping the tool results contiguous with the
-        // assistant turn that produced them.
         if let Some(advisory) = deferred_advisory {
             messages.push(msg("user", advisory));
+        } else if unverified_code_edit && !has_bash {
+            let _ = logger.append(serde_json::json!({
+                "type": "verification_advisory",
+                "turn": turns,
+            }));
+            messages.push(msg(
+                "user",
+                "[System: Code modified without verification command. Verify your changes via `bash` or conclude.]",
+            ));
         }
 
         // End of turn: persist the sanitized history so a later dispatch can
@@ -1318,51 +899,33 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(res.status, "completed");
-        assert_eq!(res.final_text, "Done.");
+        assert_eq!(
+            res.final_text,
+            "I have the core evidence. Let me run a final verification pass."
+        );
 
         let calls = engine.calls.lock().await;
-        assert_eq!(calls.len(), 2, "ceiling turn + one forced synthesis");
-        // Both the ceiling turn and the forced synthesis carry the full tool
-        // list (never an empty slice): the byte-identical tool prefix is
-        // preserved across the ceiling turn.
-        for (idx, call) in calls.iter().enumerate() {
-            assert_eq!(
-                call.tools.len(),
-                1,
-                "call {idx} must pass tools unchanged, got {} tool schemas",
-                call.tools.len()
-            );
-            assert_eq!(call.tools[0].name, "bash");
-        }
+        assert_eq!(calls.len(), 1, "ceiling turn passes full tools");
+        assert_eq!(calls[0].tools.len(), 1);
+        assert_eq!(calls[0].tools[0].name, "bash");
         let events = logger.read_all();
         assert!(
             events.iter().any(|e| e["type"] == "context_ceiling"),
             "a context_ceiling event must be recorded: {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| e["type"] == "announced_intent" && e["ceiling"] == true),
-            "the ceiling announced-intent event must be recorded: {events:?}"
         );
 
         let _ = std::fs::remove_dir_all(state.root());
     }
 
     // (b) An announced-intent completion on a normal (non-ceiling) turn
-    // triggers a one-time continuation (the "Continue and complete..." nudge)
-    // instead of terminating on the bare announcement.
+    // completes cleanly without artificial string regex stalls.
     #[tokio::test]
-    async fn announced_intent_triggers_one_time_continuation() {
+    async fn announcement_does_not_stall_or_inject_nudges() {
         let state = tmp_state();
         let logger = EventLogger::new(&state, "sess_b");
+        let text = "I have the core evidence. Now let me run a final verification pass.";
         let engine = RecordingEngine::new(vec![
-            comp(
-                "I have the core evidence. Now let me run a final verification pass.",
-                Vec::new(),
-                None,
-            ),
-            comp("Done.", Vec::new(), None),
+            comp(text, Vec::new(), None),
         ]);
         let executor = MockExecutor {
             results: tokio::sync::Mutex::new(VecDeque::new()),
@@ -1380,18 +943,8 @@ mod tests {
         .await
         .unwrap();
 
-        // The session did not terminate on the announcement; it landed on the
-        // continuation's final synthesis.
-        assert_eq!(res.final_text, "Done.");
-        assert_eq!(res.turns, 1, "the continuation is one-time (same turn)");
-
-        let events = logger.read_all();
-        assert!(
-            events
-                .iter()
-                .any(|e| e["type"] == "announced_intent" && e["ceiling"] == false),
-            "a normal announced-intent event must be recorded: {events:?}"
-        );
+        assert_eq!(res.final_text, text);
+        assert_eq!(res.turns, 1);
 
         let _ = std::fs::remove_dir_all(state.root());
     }
@@ -1558,10 +1111,8 @@ mod tests {
     }
 
     // (A) Loop-proof refusal: the agent edits source, tries to stop; the
-    // verification nudge fires exactly ONCE; the agent replies with text and no
-    // tool calls, and the session terminates immediately on that reply. `turns`
-    // is 2 (the edit turn + the single nudge continuation turn) — the nudge
-    // cannot re-fire, so the session can never loop on it.
+    // verification advisory fires at the end of the edit turn; the agent replies with text
+    // and the session terminates immediately on that reply. `turns` is 2 (edit turn + final answer).
     #[tokio::test]
     async fn verification_nudge_fires_once_and_session_terminates() {
         let state = tmp_state();
@@ -1577,7 +1128,6 @@ mod tests {
                 None,
             ),
             comp("Applied the change.", Vec::new(), None),
-            comp("Verified visually, no test needed", Vec::new(), None),
         ]);
         let executor = MockExecutor {
             results: tokio::sync::Mutex::new(vec!["ok".to_string()].into()),
@@ -1596,23 +1146,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            res.final_text, "Verified visually, no test needed",
-            "session must terminate on the refusal reply"
+            res.final_text, "Applied the change.",
+            "session must terminate on the reply"
         );
         assert_eq!(
             res.turns, 2,
-            "turn 1 (edit) + turn 2 (nudge continuation) — no third turn (never loops)"
+            "turn 1 (edit) + turn 2 (final answer) — no extra turns (never loops)"
         );
         assert_eq!(res.status, "completed");
 
         let events = logger.read_all();
-        let nudge_count = events
+        let advisory_count = events
             .iter()
-            .filter(|e| e["type"] == "verification_nudge")
+            .filter(|e| e["type"] == "verification_advisory")
             .count();
         assert_eq!(
-            nudge_count, 1,
-            "the verification nudge must fire exactly once: {events:?}"
+            advisory_count, 1,
+            "the verification advisory must fire once at turn end: {events:?}"
         );
 
         let _ = std::fs::remove_dir_all(state.root());
@@ -1660,18 +1210,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(res.final_text, "Done.");
-        // Two engine turns: the edit batch (turn 1) + the final text stop
-        // (turn 2). The nudge never fires here (the point of this test), so
-        // `turns` reflects the edit turn plus the ordinary final turn.
         assert_eq!(res.turns, 2);
         let events = logger.read_all();
-        let nudge_count = events
+        let advisory_count = events
             .iter()
-            .filter(|e| e["type"] == "verification_nudge")
+            .filter(|e| e["type"] == "verification_advisory")
             .count();
         assert_eq!(
-            nudge_count, 0,
-            "non-code edits must never trigger the nudge: {events:?}"
+            advisory_count, 0,
+            "non-code edits must never trigger the advisory: {events:?}"
         );
 
         let _ = std::fs::remove_dir_all(state.root());
@@ -1714,43 +1261,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(res.final_text, "Done.");
-        // Two engine turns: the failed-edit batch (turn 1) + the final text
-        // stop (turn 2). The nudge never fires here (the point of this test),
-        // so `turns` reflects the edit turn plus the ordinary final turn.
         assert_eq!(res.turns, 2);
         let events = logger.read_all();
-        let nudge_count = events
+        let advisory_count = events
             .iter()
-            .filter(|e| e["type"] == "verification_nudge")
+            .filter(|e| e["type"] == "verification_advisory")
             .count();
         assert_eq!(
-            nudge_count, 0,
-            "a failed edit must not trigger the nudge: {events:?}"
+            advisory_count, 0,
+            "a failed edit must not trigger the advisory: {events:?}"
         );
 
         let _ = std::fs::remove_dir_all(state.root());
     }
 
-    // (D) A code edit followed by a `bash` command clears the unverified flag,
-    // so a subsequent stop does not trigger the nudge (the bash call *is* the
-    // verification command).
+    // (D) A code edit followed by a `bash` command in the batch clears the
+    // unverified flag, so no advisory fires.
     #[tokio::test]
     async fn code_edit_then_bash_clears_verification_flag() {
         let state = tmp_state();
         let logger = EventLogger::new(&state, "sess_vd");
         let engine = RecordingEngine::new(vec![
             comp(
-                "Editing the module.",
-                vec![tc(
-                    "e1",
-                    "edit_file",
-                    r#"{"path":"src/lib.rs","content":"x"}"#,
-                )],
-                None,
-            ),
-            comp(
-                "Checking it compiles.",
-                vec![tc("b1", "bash", r#"{"command":"cargo check"}"#)],
+                "Editing the module and checking.",
+                vec![
+                    tc(
+                        "e1",
+                        "edit_file",
+                        r#"{"path":"src/lib.rs","content":"x"}"#,
+                    ),
+                    tc("b1", "bash", r#"{"command":"cargo check"}"#),
+                ],
                 None,
             ),
             comp("Done.", Vec::new(), None),
@@ -1772,14 +1313,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(res.final_text, "Done.");
-        assert_eq!(res.turns, 3);
+        assert_eq!(res.turns, 2);
         let events = logger.read_all();
-        let nudge_count = events
+        let advisory_count = events
             .iter()
-            .filter(|e| e["type"] == "verification_nudge")
+            .filter(|e| e["type"] == "verification_advisory")
             .count();
         assert_eq!(
-            nudge_count, 0,
+            advisory_count, 0,
             "a post-edit bash command clears the flag: {events:?}"
         );
 

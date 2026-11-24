@@ -1239,7 +1239,6 @@ fn spill_tool_output_respects_custom_threshold() {
     assert!(path.exists());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), payload);
     assert!(pointer.contains("Tool output spilled to disk"));
-    assert!(pointer.contains(&format!("> {custom}-byte threshold")));
 
     // Same payload, but a threshold above its length must NOT spill.
     let (output, spilled2) = spill_tool_output(

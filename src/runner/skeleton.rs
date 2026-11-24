@@ -54,13 +54,11 @@ pub fn spill_tool_output(
                 .chars()
                 .rev()
                 .collect();
-            let elided = bytes.saturating_sub(head.len() + tail.len());
             let pointer = format!(
-                "[Tool output spilled to disk: {bytes} bytes > {threshold}-byte threshold. \
-Full payload saved to: {}]\n\n\
---- Head preview (first 1024 bytes) ---\n{head}\n\
-... [{elided} bytes elided] ...\n\
---- Tail preview (last 1024 bytes) ---\n{tail}\n\n\
+                "[Tool output spilled to disk. Full payload saved to: {}]\n\n\
+--- Head preview ---\n{head}\n\
+... [content elided] ...\n\
+--- Tail preview ---\n{tail}\n\n\
 Hint: use read_file with start_line/end_line or search_code to inspect specific regions of {}.",
                 reported.display(),
                 reported.display()
@@ -69,9 +67,8 @@ Hint: use read_file with start_line/end_line or search_code to inspect specific 
         }
         Err(e) => {
             let head: String = output.chars().take(2048).collect();
-            let elided = bytes.saturating_sub(head.len());
             let truncated = format!(
-                "[ToolOutputSpillError: could not write to {}: {e}. Payload truncated from {bytes} bytes]\n\n{head}\n\n... [remaining {elided} bytes truncated] ...",
+                "[ToolOutputSpillError: could not write to {}: {e}]\n\n{head}\n\n... [remaining content truncated] ...",
                 file_path.display()
             );
             (truncated, None)
@@ -128,6 +125,34 @@ pub fn build_workspace_skeleton(workspace: &Path) -> String {
     out
 }
 
+/// Retrieve top relevant code symbols using the Code Property Graph & PageRank
+/// and format them into a bounded prompt context block (<=2,500 tokens).
+#[cfg(feature = "ast")]
+pub fn build_prompt_retrieved_context(workspace: &Path, prompt: &str) -> String {
+    let graph = crate::tools::graph::CodePropertyGraph::build_from_workspace(workspace, 120);
+    let relevant = graph.retrieve_relevant_symbols(prompt, 8);
+    crate::tools::graph::render_graph_context(&relevant, 10_000)
+}
+
+#[cfg(not(feature = "ast"))]
+pub fn build_prompt_retrieved_context(_workspace: &Path, _prompt: &str) -> String {
+    String::new()
+}
+
+/// Build workspace skeleton augmented with PageRank-retrieved code context
+/// when a prompt is provided.
+pub fn build_workspace_skeleton_with_prompt(workspace: &Path, prompt: Option<&str>) -> String {
+    let mut base = build_workspace_skeleton(workspace);
+    if let Some(p) = prompt {
+        let ctx = build_prompt_retrieved_context(workspace, p);
+        if !ctx.is_empty() {
+            base.push('\n');
+            base.push_str(&ctx);
+        }
+    }
+    base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,7 +169,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let payload = "x".repeat(200);
         let (out, spilled) = spill_tool_output(&payload, "call_123", Some(tmp.path()), Some(100));
-        assert!(out.contains("[Tool output spilled to disk: 200 bytes > 100-byte threshold."));
+        assert!(out.contains("[Tool output spilled to disk"));
         assert!(spilled.is_some());
         let (bytes, path) = spilled.unwrap();
         assert_eq!(bytes, 200);
