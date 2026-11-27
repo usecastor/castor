@@ -162,14 +162,16 @@ fn legit_in_tree_paths_pass() {
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn canonical_identity_case_insensitivity() {
-    let root = test_root("ci_identity");
+    // Canonicalize the temp root so `root` and its case-flipped sibling share
+    // an identical parent prefix (e.g., when `std::env::temp_dir()` returns an
+    // 8.3 short path on Windows).
+    let root = canonical_or_self(&test_root("ci_identity"));
     // A differently-cased spelling of the *root itself* matches iff the
     // volume is case-insensitive — the primary byte-wise check fails on
     // the case difference, so a `true` outcome proves the canonical
     // fallback, and a `false` outcome proves a case-sensitive store is
     // never over-permissive.
-    let re_cased = canonical_or_self(&root);
-    let mixed = re_cased
+    let mixed = root
         .file_name()
         .map(|f| {
             let s = f.to_string_lossy().into_owned();
@@ -178,20 +180,20 @@ fn canonical_identity_case_insensitivity() {
             } else {
                 s.to_ascii_uppercase()
             };
-            re_cased.parent().unwrap_or(Path::new("/")).join(flipped)
+            root.parent().unwrap_or(Path::new("/")).join(flipped)
         })
         .expect("test root has a file name");
     let matches = is_within(&mixed, &root);
     assert_eq!(
         matches,
-        volume_is_case_insensitive(&canonical_or_self(&root)),
+        volume_is_case_insensitive(&root),
         "the is_within fallback must agree with the canonical-identity \
          volume probe on the host's real filesystem"
     );
     // A *different* location with the same lowercased form is never
     // treated as inside (no byte-wise or case-insensitive prefix match
     // can relate them), regardless of the store's case policy.
-    let other = test_root("ci_identity_other");
+    let other = canonical_or_self(&test_root("ci_identity_other"));
     assert!(!is_within(&other, &root));
 }
 
