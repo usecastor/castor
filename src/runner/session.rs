@@ -469,8 +469,12 @@ pub async fn run_session(
     let mut break_after_turn = false;
     // Post-mutation verification guard state (see [`is_verifiable_code_mutation`]).
     // `unverified_code_edit` flips true on a successful source-code mutation and
-    // resets on any `bash` call (a verification command).
+    // resets on any `bash` call (a verification command). `verification_nudge_sent`
+    // is a one-shot latch: the verification advisory is injected at most once per
+    // session, so the advisory cannot re-fire on every subsequent unverified edit
+    // turn and the session can never loop on it.
     let mut unverified_code_edit = false;
+    let mut verification_nudge_sent = false;
     let mut last_prompt_tokens: Option<usize> = if ceiling_tokens > 0 {
         engine.count_tokens(&messages, tools).await
     } else {
@@ -801,7 +805,11 @@ impasse, state your findings and ask for alignment rather than continuing to re-
 
         if let Some(advisory) = deferred_advisory {
             messages.push(msg("user", advisory));
-        } else if unverified_code_edit && !has_bash {
+        } else if unverified_code_edit && !has_bash && !verification_nudge_sent {
+            // One-shot latch: set the instant the advisory is injected, so it
+            // fires at most once per session even if the model keeps making
+            // unverified code edits on subsequent turns.
+            verification_nudge_sent = true;
             let _ = logger.append(serde_json::json!({
                 "type": "verification_advisory",
                 "turn": turns,
@@ -1441,6 +1449,108 @@ mod tests {
         assert_eq!(
             advisory_count, 0,
             "a post-edit bash command clears the flag: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    // (E) One-shot latch: two consecutive code-edit turns with no `bash`
+    // between them. The verification advisory is injected on the first edit
+    // turn only (`advisory_count == 1`) — the one-shot latch must prevent it
+    // from re-firing at the end of the second edit turn, which would loop
+    // the session on repeated identical nudges.
+    #[tokio::test]
+    async fn consecutive_unverified_code_edits_advisory_fires_exactly_once() {
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_ve");
+        let engine = RecordingEngine::new(vec![
+            comp(
+                "Editing the module.",
+                vec![tc(
+                    "e1",
+                    "edit_file",
+                    r#"{"path":"src/lib.rs","content":"fn x(){}"}"#,
+                )],
+                None,
+            ),
+            comp(
+                "Editing again.",
+                vec![tc(
+                    "e2",
+                    "edit_file",
+                    r#"{"path":"src/lib.rs","content":"fn y(){}"}"#,
+                )],
+                None,
+            ),
+            comp("Done.", Vec::new(), None),
+        ]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(vec!["ok".to_string(), "ok".to_string()].into()),
+        };
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "work",
+            &[tool_schema("edit_file"), tool_schema("bash")],
+            Some(&SessionOptions::with_state(state.clone())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.final_text, "Done.");
+        assert_eq!(
+            res.turns, 3,
+            "turn 1 (edit) + turn 2 (edit) + turn 3 (final answer) — no extra turns"
+        );
+        assert_eq!(res.status, "completed");
+
+        let events = logger.read_all();
+        let advisory_count = events
+            .iter()
+            .filter(|e| e["type"] == "verification_advisory")
+            .count();
+        assert_eq!(
+            advisory_count, 1,
+            "the verification advisory must fire exactly once across two consecutive \
+             unverified edit turns: {events:?}"
+        );
+
+        // The advisory message must be present in the history seen on the
+        // second edit turn (turn 2) and on the final turn (turn 3).
+        let calls = engine.calls.lock().await;
+        let advisory_marker = "[System: Code modified without verification";
+        assert!(
+            !calls[0]
+                .messages
+                .iter()
+                .any(|m| m.content.contains(advisory_marker)),
+            "first edit turn must not already carry the advisory"
+        );
+        assert!(
+            calls[1]
+                .messages
+                .iter()
+                .any(|m| m.content.contains(advisory_marker)),
+            "the advisory must be injected at the end of the first edit turn"
+        );
+        assert!(
+            calls[2]
+                .messages
+                .iter()
+                .any(|m| m.content.contains(advisory_marker)),
+            "the advisory must remain in context on the final turn"
+        );
+        assert_eq!(
+            calls[2]
+                .messages
+                .iter()
+                .filter(|m| m.content.contains(advisory_marker))
+                .count(),
+            1,
+            "the advisory message must not be duplicated into the history"
         );
 
         let _ = std::fs::remove_dir_all(state.root());

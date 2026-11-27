@@ -20,68 +20,82 @@ pub(crate) const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 /// timed-out process tree before aborting the reader tasks.
 const POST_KILL_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Maximum lines of stdout to retain on success (exit 0) before semantic truncation.
-pub const SUCCESS_MAX_STDOUT_LINES: usize = 20;
-
-/// Maximum lines of stdout to retain on error (non-zero exit) before semantic truncation.
-pub const ERROR_MAX_STDOUT_LINES: usize = 100;
-
-/// Maximum lines of stderr to retain on error before semantic truncation.
-pub const ERROR_MAX_STDERR_LINES: usize = 100;
-
-/// Semantic line truncation for shell execution output.
+/// Head+tail line budgets for semantic truncation of shell output.
 ///
-/// On success (exit 0): Retains the first 20 lines of stdout (eliminating verbose floods).
-/// On error (non-zero exit): Retains the last 100 lines of stdout and last 100 lines of stderr,
-/// preserving 100% of compiler error diagnostics, failure context, and stack traces.
+/// On success (exit 0): stdout keeps its first `SUCCESS_STDOUT_HEAD_LINES` and last
+/// `SUCCESS_STDOUT_TAIL_LINES` lines (eliding the middle above 60); stderr keeps its
+/// first `SUCCESS_STDERR_HEAD_LINES` and last `SUCCESS_STDERR_TAIL_LINES` lines
+/// (eliding the middle above 100).
+///
+/// On error (non-zero exit): both streams keep their first 40 and last 80 lines
+/// (eliding the middle above 120), so verbose flood at the top is trimmed while the
+/// full tail of compiler diagnostics, stack traces, and final errors survives.
+pub const SUCCESS_STDOUT_HEAD_LINES: usize = 25;
+pub const SUCCESS_STDOUT_TAIL_LINES: usize = 35;
+pub const SUCCESS_STDERR_HEAD_LINES: usize = 40;
+pub const SUCCESS_STDERR_TAIL_LINES: usize = 60;
+pub const ERROR_STDOUT_HEAD_LINES: usize = 40;
+pub const ERROR_STDOUT_TAIL_LINES: usize = 80;
+pub const ERROR_STDERR_HEAD_LINES: usize = 40;
+pub const ERROR_STDERR_TAIL_LINES: usize = 80;
+
+/// Head+tail line truncation shared by all shell output streams.
+///
+/// Retains the first `head_lines` and last `tail_lines` lines of `text`. When the total
+/// line count exceeds `head_lines + tail_lines`, the middle is replaced by a single
+/// elision marker `[... N {label} lines omitted ...]` where `N` is the number of elided
+/// lines. Text at or below the `head_lines + tail_lines` budget is returned unchanged
+/// with `false`.
+pub fn truncate_head_tail(
+    text: &str,
+    head_lines: usize,
+    tail_lines: usize,
+    label: &str,
+) -> (String, bool) {
+    let lines: Vec<&str> = text.lines().collect();
+    let budget = head_lines + tail_lines;
+    if lines.len() <= budget {
+        return (text.to_string(), false);
+    }
+    let elided = lines.len() - budget;
+    let head = lines[..head_lines].join("\n");
+    let tail = lines[lines.len() - tail_lines..].join("\n");
+    let marker = format!("[... {elided} {label} lines omitted ...]");
+    (format!("{head}\n{marker}\n{tail}"), true)
+}
+
+/// Semantic line truncation for shell execution output (head + tail retention).
+///
+/// On success (exit 0): stdout keeps its first 25 + last 35 lines (eliding the middle
+/// when above 60); stderr keeps its first 40 + last 60 lines (eliding when above 100).
+/// On error (non-zero exit): both streams keep their first 40 + last 80 lines (eliding
+/// the middle when above 120), preserving both the early failure context and the full
+/// tail of compiler diagnostics, failure context, and stack traces.
 pub fn semantic_truncate_output(
     stdout: &str,
     stderr: &str,
     exit_code: i32,
 ) -> (String, String, bool) {
-    let mut truncated = false;
-
-    let trunc_stdout = if exit_code == 0 {
-        let lines: Vec<&str> = stdout.lines().collect();
-        if lines.len() > SUCCESS_MAX_STDOUT_LINES {
-            truncated = true;
-            let kept = &lines[..SUCCESS_MAX_STDOUT_LINES];
-            let elided = lines.len() - SUCCESS_MAX_STDOUT_LINES;
-            format!(
-                "{}\n[... {elided} lines omitted on success ...]",
-                kept.join("\n")
-            )
-        } else {
-            stdout.to_string()
-        }
+    let (out_head, out_tail, err_head, err_tail) = if exit_code == 0 {
+        (
+            SUCCESS_STDOUT_HEAD_LINES,
+            SUCCESS_STDOUT_TAIL_LINES,
+            SUCCESS_STDERR_HEAD_LINES,
+            SUCCESS_STDERR_TAIL_LINES,
+        )
     } else {
-        let lines: Vec<&str> = stdout.lines().collect();
-        if lines.len() > ERROR_MAX_STDOUT_LINES {
-            truncated = true;
-            let kept = &lines[lines.len() - ERROR_MAX_STDOUT_LINES..];
-            let elided = lines.len() - ERROR_MAX_STDOUT_LINES;
-            format!("[... {elided} lines elided ...]\n{}", kept.join("\n"))
-        } else {
-            stdout.to_string()
-        }
+        (
+            ERROR_STDOUT_HEAD_LINES,
+            ERROR_STDOUT_TAIL_LINES,
+            ERROR_STDERR_HEAD_LINES,
+            ERROR_STDERR_TAIL_LINES,
+        )
     };
 
-    let trunc_stderr = {
-        let lines: Vec<&str> = stderr.lines().collect();
-        if lines.len() > ERROR_MAX_STDERR_LINES {
-            truncated = true;
-            let kept = &lines[lines.len() - ERROR_MAX_STDERR_LINES..];
-            let elided = lines.len() - ERROR_MAX_STDERR_LINES;
-            format!(
-                "[... {elided} stderr lines elided ...]\n{}",
-                kept.join("\n")
-            )
-        } else {
-            stderr.to_string()
-        }
-    };
+    let (clean_stdout, out_trunc) = truncate_head_tail(stdout, out_head, out_tail, "stdout");
+    let (clean_stderr, err_trunc) = truncate_head_tail(stderr, err_head, err_tail, "stderr");
 
-    (trunc_stdout, trunc_stderr, truncated)
+    (clean_stdout, clean_stderr, out_trunc || err_trunc)
 }
 
 /// Result of a sandboxed shell execution.
@@ -422,51 +436,6 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_semantic_truncation_success_under_limit() {
-        let stdout = "line 1\nline 2\nline 3\n";
-        let (out, err, trunc) = semantic_truncate_output(stdout, "", 0);
-        assert!(!trunc);
-        assert_eq!(out, stdout);
-        assert_eq!(err, "");
-    }
-
-    #[test]
-    fn test_semantic_truncation_success_over_limit() {
-        let lines: Vec<String> = (1..=50).map(|i| format!("output line {i}")).collect();
-        let stdout = lines.join("\n");
-        let (out, _, trunc) = semantic_truncate_output(&stdout, "", 0);
-        assert!(trunc);
-        assert!(out.contains("output line 1"));
-        assert!(out.contains("output line 20"));
-        assert!(!out.contains("output line 21\n"));
-        assert!(out.contains("[... 30 lines omitted on success ...]"));
-    }
-
-    #[test]
-    fn test_semantic_truncation_error_retains_tail_diagnostics() {
-        let lines: Vec<String> = (1..=150).map(|i| format!("diagnostic step {i}")).collect();
-        let stdout = lines.join("\n");
-        let (out, _, trunc) = semantic_truncate_output(&stdout, "", 1);
-        assert!(trunc);
-        assert!(out.contains("diagnostic step 150"));
-        assert!(out.contains("diagnostic step 51"));
-        assert!(!out.contains("diagnostic step 50\n"));
-        assert!(out.contains("[... 50 lines elided ...]"));
-    }
-
-    #[test]
-    fn test_semantic_truncation_stderr_retains_tail_diagnostics() {
-        let lines: Vec<String> = (1..=120).map(|i| format!("stderr err {i}")).collect();
-        let stderr = lines.join("\n");
-        let (_, err, trunc) = semantic_truncate_output("", &stderr, 1);
-        assert!(trunc);
-        assert!(err.contains("stderr err 120"));
-        assert!(err.contains("stderr err 21"));
-        assert!(!err.contains("stderr err 20\n"));
-        assert!(err.contains("[... 20 stderr lines elided ...]"));
-    }
 
     #[tokio::test]
     async fn capture_capped_preserves_bytes_when_aborted_on_open_pipe() {

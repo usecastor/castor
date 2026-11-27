@@ -597,6 +597,8 @@ impl CastorMcpServer {
                      - total_sessions: {}\n\
                      - total_turns: {}\n\
                      - total_tasks_completed: {}\n\
+                     - total_tasks_salvaged: {}\n\
+                     - total_tasks_rejected_decomposition: {}\n\
                      - total_tasks_failed: {}\n\
                      - total_tasks_cancelled: {}\n\
                      - total_task_execution_ms: {}\n\
@@ -612,6 +614,8 @@ impl CastorMcpServer {
                     stats.total_sessions,
                     stats.total_turns,
                     stats.total_tasks_completed,
+                    stats.total_tasks_salvaged,
+                    stats.total_tasks_rejected_decomposition,
                     stats.total_tasks_failed,
                     stats.total_tasks_cancelled,
                     stats.total_task_execution_ms,

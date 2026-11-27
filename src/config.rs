@@ -140,8 +140,11 @@ pub struct Config {
     /// Secret: never print the value.
     pub openalex_api_key: Option<String>,
     pub boot_timeout_secs: u64,
-    /// DGI gatekeeper log-odds reject margin: reject only when
-    /// `logP(OVERLOADED) - logP(ADMIT)` exceeds this (env-only).
+    /// DGI gatekeeper log-odds reject margin: the binary gate rejects only
+    /// when `logP(OVERLOADED) - logP(ADMIT)` exceeds this (env-only).
+    /// Calibrated on the live 1,053-prompt benchmark: `1.2` holds the
+    /// false-reject rate on single-concern ADMIT dispatches to ~2.7% while
+    /// catching ~half of the monolithic multi-subsystem REJECT class.
     pub dgi_reject_margin: f64,
     /// DGI warm-session bypass: skip the probe for continuations that already
     /// have a non-empty `messages.json` (env-only).

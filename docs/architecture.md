@@ -40,15 +40,20 @@ In a cloud-only agent, every tool output (reading 20 files, running `cargo test`
 A **pre-execution firewall** that stops compound "mega-prompt" thrashing before it burns
 compute or leases a slot. A **1-forward-pass logit probe** (sub-25 ms on vLLM via `guided_choice`;
 scales with decode speed on llama.cpp) against the serving engine classifies the
-dispatch prompt; the decision rule is:
+dispatch prompt with a strictly binary rule:
 
 ```
 delta_z = logP(OVERLOADED) − logP(ADMIT)
 REJECT  if delta_z > 1.2
-REVIEW  if -0.5 <= delta_z <= 1.2
+ADMIT   otherwise
 ```
 
-Near-tie or mildly broad margins (`-0.5 <= delta_z <= 1.2`) are routed to an advisory review rather than silent admission; strong `ADMIT` predictions (`delta_z < -0.5`) proceed directly.
+The margin (`CASTOR_DGI_REJECT_MARGIN`, default `1.2`) was calibrated on a live
+1,053-prompt benchmark (`evals/dgi/dataset.json`): it holds the false-reject rate
+on single-concern `ADMIT` dispatches to ~2.7% while catching ~half of the
+monolithic multi-subsystem `REJECT` class (the remainder are cohesive-but-long
+dispatches the model scores as single-subsystem). The gate injects **no**
+advisory text into the worker prompt — it only decides admit vs. fail-fast.
 **Warm sessions** (continuations of an already-warm context) bypass the probe entirely with
 zero overhead. The probe is **engine-agnostic**: vLLM uses a `guided_choice` single-token
 completion; llama.cpp uses a schema-constrained JSON chat decode. Same decision rule,

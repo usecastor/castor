@@ -17,6 +17,7 @@
 //! spawn if down → release), best-effort, never blocking the MCP server.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -572,43 +573,96 @@ pub fn get_wsl_host_ip() -> Option<String> {
 /// `/mnt/c/Users/<user>/.castor`. If the local WSL state dir (`~/.castor`)
 /// does not contain the task record or active status port, this probes the
 /// Windows user profile state dir so `castor wait` works seamlessly cross-boundary.
+///
+/// The Windows probe is two-pass so that a foreign profile's `status.port`
+/// file can never hijack our state dir:
+///
+/// - **Pass 1** looks strictly for the task's disk mirror — first under our
+///   own `$USER` profile, then across every `/mnt/c/Users/*` profile.
+/// - **Pass 2** falls back to a `ports/status.port` check ONLY under our own
+///   `$USER` profile (the live Windows server of our account, even when this
+///   specific task's file has not been mirrored yet).
 pub fn resolve_cross_env_state_dir(state: &StateDir, task_id: &str) -> StateDir {
     // 1. If the task file exists in the current state dir, use it.
-    let local_task_file = state.tasks().join(format!("task_{task_id}.json"));
+    // The on-disk mirror is `{task_id}.json` (see `TaskRegistry::task_path`),
+    // where the id itself already carries the `task_` prefix.
+    let local_task_file = state.tasks().join(format!("{task_id}.json"));
     if local_task_file.exists() {
         return state.clone();
     }
 
-    // 2. If running inside WSL, probe Windows user profile directories for .castor.
+    // 2. If running inside WSL, probe Windows user profile directories.
     #[cfg(unix)]
     if crate::platform::is_wsl() {
-        if let Ok(user) = std::env::var("USER") {
-            let candidate = std::path::PathBuf::from(format!("/mnt/c/Users/{user}/.castor"));
-            if candidate
-                .join("tasks")
-                .join(format!("task_{task_id}.json"))
-                .exists()
-                || candidate.join("ports").join("status.port").exists()
-            {
-                return StateDir::new(candidate);
-            }
+        let user = std::env::var("USER").ok();
+        // Pass 1: a task file is definitive proof of ownership. Check our own
+        // profile first, then scan every Windows user profile.
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(user) = &user {
+            candidates.push(PathBuf::from(format!("/mnt/c/Users/{user}/.castor")));
         }
         if let Ok(entries) = std::fs::read_dir("/mnt/c/Users") {
             for entry in entries.flatten() {
                 let candidate = entry.path().join(".castor");
-                if candidate
-                    .join("tasks")
-                    .join(format!("task_{task_id}.json"))
-                    .exists()
-                    || candidate.join("ports").join("status.port").exists()
-                {
-                    return StateDir::new(candidate);
+                if !candidates.iter().any(|c| c == &candidate) {
+                    candidates.push(candidate);
                 }
             }
+        }
+        // `{task_id}.json` — same convention as `TaskRegistry::task_path`.
+        let task_file_name = format!("{task_id}.json");
+        if let Some(candidate) = candidates
+            .into_iter()
+            .find(|c| c.join("tasks").join(&task_file_name).exists())
+        {
+            return StateDir::new(candidate);
+        }
+        // Pass 2: only our own profile's active status port qualifies —
+        // never another user's `.castor` based on a `status.port` alone.
+        if let Some(user) = user
+            && PathBuf::from(format!("/mnt/c/Users/{user}/.castor"))
+                .join("ports")
+                .join("status.port")
+                .exists()
+        {
+            return StateDir::new(PathBuf::from(format!("/mnt/c/Users/{user}/.castor")));
         }
     }
 
     state.clone()
+}
+
+/// Fetch candidate wait URLs in order until one succeeds.
+///
+/// Returns `Some(body)` for the first candidate that answers 2xx. A 404 (or
+/// any other non-2xx) response, a transport error (connection refused,
+/// timeout, DNS), or a failed body read on a candidate does **not** end the
+/// loop — the *next* candidate is tried. This lets a status server that
+/// owns the state dir but not the task (e.g. loopback `:18021` in WSL while
+/// the Windows host owns the task) or an unreachable candidate be skipped
+/// in favor of a healthy instance on another candidate (the host gateway
+/// IP). If every candidate fails, returns `None` and the caller falls back
+/// to disk polling.
+async fn try_wait_candidate_urls(client: &reqwest::Client, urls: &[String]) -> Option<String> {
+    for url in urls {
+        // A transport error (refused/timeout/DNS) must continue to the next
+        // candidate, NOT abort the loop — hence an explicit match, not `?`.
+        let resp = match client.get(url).send().await {
+            Ok(resp) => resp,
+            Err(_) => continue,
+        };
+        if !resp.status().is_success() {
+            // Non-2xx (notably 404): the probed instance does not serve this
+            // task — continue to the next candidate instead of bailing to
+            // disk polling.
+            continue;
+        }
+        match resp.text().await {
+            Ok(text) => return Some(text),
+            Err(_) => continue,
+        }
+    }
+    None
 }
 
 /// CLI handler for `castor wait <task_id> [--timeout-s N] [--port P] [--state-dir D]`.
@@ -643,19 +697,19 @@ pub async fn run_wait_cli(
 
     let port = override_port.unwrap_or_else(|| active_status_port(&effective_state, 18021));
 
-    // Try HTTP long-poll to StatusServer.
-    #[allow(unused_mut)]
+    // Candidate wait URLs: loopback first, then (under WSL) the host
+    // gateway IP from `/etc/resolv.conf`.
     let mut candidate_urls = vec![format!(
         "http://127.0.0.1:{port}/task/{task_id}/wait?timeout_s={timeout_s}"
     )];
 
     #[cfg(unix)]
-    if crate::platform::is_wsl() {
-        if let Some(host_ip) = get_wsl_host_ip() {
-            candidate_urls.push(format!(
-                "http://{host_ip}:{port}/task/{task_id}/wait?timeout_s={timeout_s}"
-            ));
-        }
+    if crate::platform::is_wsl()
+        && let Some(host_ip) = get_wsl_host_ip()
+    {
+        candidate_urls.push(format!(
+            "http://{host_ip}:{port}/task/{task_id}/wait?timeout_s={timeout_s}"
+        ));
     }
 
     let http_client = reqwest::Client::builder()
@@ -663,21 +717,12 @@ pub async fn run_wait_cli(
         .build()
         .map_err(|e| e.to_string())?;
 
-    for url in candidate_urls {
-        match http_client.get(&url).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    let text = resp.text().await.map_err(|e| e.to_string())?;
-                    return Ok(text);
-                } else if status == StatusCode::NOT_FOUND {
-                    break;
-                }
-            }
-            Err(_) => {
-                continue;
-            }
-        }
+    // Try HTTP long-poll to StatusServer. A 404 or transport error on one
+    // candidate does not end the loop — the next candidate is tried before
+    // falling back to disk polling (a server that owns the state dir but not
+    // this task must not mask a healthy instance on another candidate).
+    if let Some(body) = try_wait_candidate_urls(&http_client, &candidate_urls).await {
+        return Ok(body);
     }
 
     // Disk fallback: poll the disk mirror directly until terminal or timeout.
@@ -1095,5 +1140,294 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(v["status"], "completed");
         assert_eq!(v["reason"], "disk rescued");
+    }
+
+    // ---------------------------------------------------------------------
+    // Cross-environment (WSL) resolution fixtures
+    //
+    // The production lookup probes the *real* Windows mount, so these tests
+    // build fixture profiles there under unique names
+    // (`castortest-<pid>-<n>`) that cannot collide with real user profiles,
+    // and a drop guard removes them. Tests skip when the mount is absent
+    // (non-WSL hosts, where the WSL branch is compiled out).
+    // ---------------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn windows_users_root() -> PathBuf {
+        PathBuf::from("/mnt/c/Users")
+    }
+
+    /// True only when the Windows user-profile mount is present **and**
+    /// writable from this WSL instance, so the fixture tests can actually
+    /// create `/mnt/c/Users/<fixture>/.castor`. The mount is absent on
+    /// non-WSL hosts (WSL branch compiled out) and is read-only
+    /// (`dr-xr-xr-x`) under some WSL permission configurations — in both
+    /// cases the fixture tests must *skip*, not fail.
+    #[cfg(unix)]
+    fn wsl_probe_available() -> bool {
+        let root = windows_users_root();
+        if !root.is_dir() {
+            return false;
+        }
+        // Probe writability with a throwaway dir; clean it up on success.
+        let probe = fixture_name("probe");
+        let dir = root.join(&probe);
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Remove a fixture profile on drop so the real Windows mount is never
+    /// left dirty (also covers panics).
+    #[cfg(unix)]
+    struct WslFixtureGuard(PathBuf);
+    #[cfg(unix)]
+    impl Drop for WslFixtureGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Build `/mnt/c/Users/<name>/.castor` with an optional mirrored task
+    /// file and an optional `ports/status.port` file. The task file uses the
+    /// `{task_id}.json` convention (`TaskRegistry::task_path`).
+    #[cfg(unix)]
+    fn make_wsl_fixture(
+        name: &str,
+        task_id: Option<&str>,
+        status_port: Option<u16>,
+    ) -> WslFixtureGuard {
+        let profile = windows_users_root().join(name).join(".castor");
+        if let Some(p) = status_port {
+            std::fs::create_dir_all(profile.join("ports")).unwrap();
+            std::fs::write(profile.join("ports").join("status.port"), p.to_string()).unwrap();
+        }
+        if let Some(tid) = task_id {
+            std::fs::create_dir_all(profile.join("tasks")).unwrap();
+            std::fs::write(profile.join("tasks").join(format!("{tid}.json")), "{}").unwrap();
+        }
+        WslFixtureGuard(profile)
+    }
+
+    /// A unique fixture profile name for this test process.
+    #[cfg(unix)]
+    fn fixture_name(tag: &str) -> String {
+        let n = TMP.fetch_add(1, Ord::SeqCst);
+        format!("castortest-{}-{}-{tag}", std::process::id(), n)
+    }
+
+    /// Local state dir stand-in for the WSL `~/.castor` (no task file).
+    fn wsl_local_state() -> StateDir {
+        let n = TMP.fetch_add(1, Ord::SeqCst);
+        let p =
+            std::env::temp_dir().join(format!("castor-wsl-resolve-{}-{}", std::process::id(), n));
+        let s = StateDir::new(p);
+        let _ = std::fs::create_dir_all(s.tasks());
+        s
+    }
+
+    /// Serialize `USER` env mutations across tests. In edition 2024
+    /// `std::env::set_var`/`remove_var` are `unsafe` (concurrent mutation
+    /// from other test threads is UB), so the helper below wraps its
+    /// mutation in this lock, mirroring `proxy::sanitize`'s `ENV_LOCK`.
+    #[cfg(unix)]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `resolve_cross_env_state_dir` with `USER` forced to `fake_user`,
+    /// restoring the previous value before returning.
+    #[cfg(unix)]
+    fn resolve_with_user(state: &StateDir, task_id: &str, fake_user: &str) -> StateDir {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let old = std::env::var_os("USER");
+        unsafe {
+            std::env::set_var("USER", fake_user);
+        }
+        let out = resolve_cross_env_state_dir(state, task_id);
+        unsafe {
+            if let Some(old) = old {
+                std::env::set_var("USER", old);
+            } else {
+                std::env::remove_var("USER");
+            }
+        }
+        out
+    }
+
+    /// Pass 1: a task file in a foreign profile must be found by scanning
+    /// `/mnt/c/Users/*` — even when a *different* foreign profile holds a
+    /// `status.port` and our own profile is empty.
+    #[test]
+    #[cfg(unix)]
+    fn cross_env_pass1_foreign_task_file_beats_foreign_status_port() {
+        if !wsl_probe_available() {
+            eprintln!("skipped: /mnt/c/Users not present/writable (not WSL or read-only mount)");
+            return;
+        }
+        let local = wsl_local_state();
+        let _port_only = make_wsl_fixture(&fixture_name("port"), None, Some(18021));
+        let owner = make_wsl_fixture(&fixture_name("task"), Some("task_cross_env_a"), None);
+
+        let got = resolve_cross_env_state_dir(&local, "task_cross_env_a");
+        assert_eq!(
+            got.root(),
+            owner.0.as_path(),
+            "a task file in a foreign profile must select that profile"
+        );
+    }
+
+    /// Pass 1: our own `$USER` profile is checked before the directory scan,
+    /// so a task file in the own profile wins even when a foreign profile
+    /// also has the same task file.
+    #[test]
+    #[cfg(unix)]
+    fn cross_env_pass1_own_profile_preferred_before_scan() {
+        if !wsl_probe_available() {
+            eprintln!("skipped: /mnt/c/Users not present/writable (not WSL or read-only mount)");
+            return;
+        }
+        let local = wsl_local_state();
+        let fake_user = fixture_name("own");
+        let _other = make_wsl_fixture(
+            &fixture_name("other"),
+            Some("task_cross_env_b"),
+            Some(18021),
+        );
+        let own = make_wsl_fixture(&fake_user, Some("task_cross_env_b"), None);
+
+        let got = resolve_with_user(&local, "task_cross_env_b", &fake_user);
+        assert_eq!(
+            got.root(),
+            own.0.as_path(),
+            "the $USER profile must be checked before scanning other profiles"
+        );
+    }
+
+    /// Pass 2: a `status.port` in a foreign profile must never be adopted
+    /// (no task file exists anywhere). `USER` is forced to a fixture user
+    /// whose profile has no `.castor` at all, so the only `status.port` in
+    /// play is the foreign one — resolution must stay on the local dir.
+    #[test]
+    #[cfg(unix)]
+    fn cross_env_pass2_foreign_status_port_alone_not_hijacked() {
+        if !wsl_probe_available() {
+            eprintln!("skipped: /mnt/c/Users not present/writable (not WSL or read-only mount)");
+            return;
+        }
+        let local = wsl_local_state();
+        let fake_user = fixture_name("nope"); // this user has no .castor
+        let _other = make_wsl_fixture(&fixture_name("onlyport"), None, Some(18021));
+
+        let got = resolve_with_user(&local, "task_missing_everywhere", &fake_user);
+        assert_eq!(
+            got.root(),
+            local.root(),
+            "a foreign profile's status.port alone must not change the state dir"
+        );
+    }
+
+    /// Pass 2: a `status.port` in our own `$USER` profile (with no task
+    /// file anywhere) is a valid cross-boundary target.
+    #[test]
+    #[cfg(unix)]
+    fn cross_env_pass2_own_status_port_only_qualifies() {
+        if !wsl_probe_available() {
+            eprintln!("skipped: /mnt/c/Users not present/writable (not WSL or read-only mount)");
+            return;
+        }
+        let local = wsl_local_state();
+        let fake_user = fixture_name("portown");
+        let own = make_wsl_fixture(&fake_user, None, Some(18021));
+
+        let got = resolve_with_user(&local, "task_nowhere_yet", &fake_user);
+        assert_eq!(
+            got.root(),
+            own.0.as_path(),
+            "the $USER profile's live status server must be adopted"
+        );
+    }
+
+    /// A task file present in the *local* state dir short-circuits before
+    /// any WSL probe.
+    #[test]
+    #[cfg(unix)]
+    fn cross_env_local_task_file_wins_without_wsl_probe() {
+        let local = wsl_local_state();
+        let _ = std::fs::write(local.tasks().join("task_local_wins.json"), "{}");
+        let got = resolve_cross_env_state_dir(&local, "task_local_wins");
+        assert_eq!(got.root(), local.root());
+    }
+
+    /// Spin up an axum router on an ephemeral `127.0.0.1:0` and return the
+    /// base URL of its single `/wait` route.
+    async fn bind_ephemeral_wait(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/wait")
+    }
+
+    async fn candidate_404() -> Response {
+        (StatusCode::NOT_FOUND, r#"{"error":"task not found"}"#).into_response()
+    }
+
+    async fn candidate_200() -> Response {
+        (
+            StatusCode::OK,
+            r#"{"found":true,"status":"completed","reason":"via second candidate"}"#,
+        )
+            .into_response()
+    }
+
+    /// 404-continue, tested directly against [`try_wait_candidate_urls`] (no
+    /// global state, no WSL prerequisite): candidate 1 answers 404,
+    /// candidate 2 (a second ephemeral `127.0.0.1:0` server) answers 200.
+    /// The helper must *continue* past the 404 and return candidate 2's
+    /// body. If the loop had bailed out on the 404 (the old `break`), the
+    /// result would be `None` and the assertions fail — this is the
+    /// discrimination the old `run_wait_cli`-level test was attempting
+    /// through a global fetch log (which deadlocked on the non-reentrant
+    /// `Mutex` and contaminated other tests).
+    ///
+    /// Two other branches are pinned for completeness: every candidate 404
+    /// ⇒ `None` (the caller then falls back to disk polling), and a
+    /// transport error on one candidate (no listener on the port) must also
+    /// continue to the next candidate rather than aborting the loop.
+    #[tokio::test]
+    async fn try_wait_candidate_urls_404_first_continues_to_second() {
+        let url404 = bind_ephemeral_wait(Router::new().route("/wait", get(candidate_404))).await;
+        let url200 = bind_ephemeral_wait(Router::new().route("/wait", get(candidate_200))).await;
+        let client = reqwest::Client::new();
+
+        // 404 on the first candidate must not end the loop: the second
+        // candidate's 200 body is surfaced verbatim.
+        let body = try_wait_candidate_urls(&client, &[url404.clone(), url200.clone()])
+            .await
+            .expect("a 200 candidate must win over a 404 candidate");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["reason"], "via second candidate");
+
+        // All candidates 404 ⇒ None (caller falls back to disk polling).
+        assert!(
+            try_wait_candidate_urls(&client, &[url404.clone(), url404])
+                .await
+                .is_none(),
+            "all-404 candidates must yield None"
+        );
+
+        // A transport error (no listener on the port) must also continue to
+        // the next candidate rather than aborting the loop.
+        let dead = "http://127.0.0.1:1/wait".to_string();
+        let body = try_wait_candidate_urls(&client, &[dead, url200])
+            .await
+            .expect("a transport error on candidate 1 must continue to candidate 2");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "completed");
     }
 }

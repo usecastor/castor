@@ -13,7 +13,8 @@
 //! `fetch_docs` performs a GET, gates on the `Content-Type` header (plus a
 //! binary sniff for unknown types), converts HTML to Markdown via `html2md`,
 //! passes JSON / plain text through, fails fast on binary content, caps the
-//! output at ~20KB, and returns verbatim HTTP errors.
+//! output at 12KB (with a truncation notice and — when the document has
+//! headings — a bounded section outline), and returns verbatim HTTP errors.
 //!
 //! All HTTP goes through a single `reqwest` client (rustls) with short
 //! timeouts. The provider base URLs are injectable so the test suite can
@@ -30,6 +31,22 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Output cap for [`WebClient::fetch_docs`] (~12KB).
 const MAX_OUTPUT_BYTES: usize = 12 * 1024;
+
+/// Hard upper bound on the markdown outline string that [`cap_output`]
+/// appends (4KB, including the [`OUTLINE_TRUNC_SUFFIX`] marker when the
+/// outline had to be cut).
+const MAX_OUTLINE_BYTES: usize = 4 * 1024;
+
+/// Bytes reserved in [`MAX_OUTPUT_BYTES`] for everything after the head:
+/// the `"\n\n"` separator (2), the truncation notice (the headingful variant
+/// with the largest possible byte counts, ~104), and the code-fence closer
+/// (3). The head budget is `MAX_OUTPUT_BYTES - OVERHEAD - outline_len`, so
+/// the total can never exceed [`MAX_OUTPUT_BYTES`].
+const TRUNCATION_OVERHEAD_BYTES: usize = 128;
+
+/// Suffix appended to an outline that had to be truncated at
+/// [`MAX_OUTLINE_BYTES`] (its length is reserved *inside* that bound).
+const OUTLINE_TRUNC_SUFFIX: &str = "\n... (outline truncated)";
 
 /// Hard cap on the total response body streamed by [`WebClient::fetch_docs`]
 /// (10 MiB). Exceeding it aborts the fetch with a typed
@@ -557,50 +574,139 @@ async fn read_body_capped(resp: &mut reqwest::Response, url: &str) -> Result<Vec
 }
 
 /// Generate a structured markdown section outline from a markdown document.
-/// Extracts headings (H1-H6) with section anchor links and range query hints.
-pub fn generate_markdown_outline(text: &str) -> String {
-    let mut sections = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
+///
+/// Detects two kinds of headings:
+/// - **ATX**: `#` .. `######` at line start (with optional leading spaces).
+/// - **setext**: a text line followed by an underline of `=` (H1) or `-`
+///   (H2) — the form `html2md` emits for HTML `<h1>`/`<h2>`, so fetched
+///   pages get a real outline instead of a spurious "no headings" notice.
+///
+/// Returns `None` when the document has **no** headings: callers must not
+/// append any outline boilerplate in that case (a "no structural headings"
+/// notice would only burn budget on plain documents).
+pub(crate) fn generate_markdown_outline(text: &str) -> Option<String> {
+    /// Returns `Some((level, title))` for a setext heading at `i`, else
+    /// `None`.
+    ///
+    /// The underline must be a run of *at least three* identical `=` (→ H1)
+    /// or `-` (→ H2) characters. Requiring `>= 3` keeps short runs (a lone
+    /// `-` is a list item / thematic-break marker; `==` is noise) from being
+    /// mistaken for headings.
+    fn setext_at(lines: &[&str], i: usize) -> Option<(usize, String)> {
+        let cur = lines[i].trim();
+        if cur.is_empty() || i + 1 >= lines.len() {
+            return None;
+        }
+        let under = lines[i + 1].trim();
+        if under.len() < 3 {
+            return None;
+        }
+        let first = under.chars().next()?;
+        if (first != '=' && first != '-') || !under.bytes().all(|b| b == first as u8) {
+            return None;
+        }
+        let level = if first == '=' { 1 } else { 2 };
+        Some((level, cur.to_string()))
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections: Vec<(usize, String)> = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
         if trimmed.starts_with('#') {
+            // ATX heading: 1..=6 hashes followed by whitespace (per CommonMark;
+            // `#nospace` is *not* a heading).
             let level = trimmed.chars().take_while(|&c| c == '#').count();
-            if level > 0 && level <= 6 {
+            if (1..=6).contains(&level)
+                && trimmed
+                    .chars()
+                    .nth(level)
+                    .is_some_and(|c| c == ' ' || c == '\t')
+            {
                 let title = trimmed[level..].trim();
                 if !title.is_empty() {
-                    let slug: String = title
-                        .to_lowercase()
-                        .chars()
-                        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-                        .collect();
-                    let slug = slug.trim_matches('-');
-                    let indent = "  ".repeat(level.saturating_sub(1));
-                    sections.push(format!("{indent}* [{title}](#{slug})"));
+                    sections.push((level, title.to_string()));
                 }
             }
+            i += 1;
+        } else if let Some((level, title)) = setext_at(&lines, i) {
+            sections.push((level, title));
+            i += 2; // skip the underline line
+        } else {
+            i += 1;
         }
     }
 
-    let mut out = String::from("## Document Outline\n");
+    // No headings ⇒ no outline at all (callers must not append boilerplate).
     if sections.is_empty() {
-        out.push_str("*(No structural headings detected)*\n");
-    } else {
-        out.push_str(&sections.join("\n"));
-        out.push('\n');
+        return None;
     }
-    out.push_str("\n[Hint: To inspect specific sections without spilling, use targeted web_search queries or fetch specific sub-pages/sections.]\n");
-    out
+
+    let mut out = String::from("## Document Outline\n");
+    for (level, title) in &sections {
+        // GitHub-style anchor: lowercase, non-alphanumerics → a single
+        // collapsed dash, leading/trailing dashes trimmed.
+        let mut slug = Vec::with_capacity(title.len());
+        for c in title.to_lowercase().chars() {
+            if c.is_alphanumeric() {
+                slug.push(c);
+            } else if slug.last() != Some(&'-') {
+                slug.push('-');
+            }
+        }
+        while slug.first() == Some(&'-') {
+            slug.remove(0);
+        }
+        while slug.last() == Some(&'-') {
+            slug.pop();
+        }
+        let slug = slug.into_iter().collect::<String>();
+        let indent = "  ".repeat(level.saturating_sub(1));
+        out.push_str(&format!("{indent}* [{title}](#{slug})\n"));
+    }
+    out.push_str(
+        "\n[Hint: To inspect specific sections without spilling, use targeted web_search queries or fetch specific sub-pages/sections.]\n",
+    );
+    Some(out)
 }
 
-/// Truncate to the output cap, cutting at a clean boundary and generating a
-/// structured markdown section outline with anchor links and range query hints.
-fn cap_output(text: &str, _full_len: usize) -> String {
+/// Truncate to the output cap, cutting at a clean paragraph/line boundary.
+///
+/// Budget model — the total output (`head + notice + outline`) is **always**
+/// `<= MAX_OUTPUT_BYTES`:
+/// - the appended outline is first strictly bounded to `<= 4,000` bytes
+///   (UTF-8 char-boundary cut, [`OUTLINE_TRUNC_SUFFIX`] appended inside that
+///   bound when the outline exceeds it);
+/// - the head gets at most `MAX_OUTPUT_BYTES - OVERHEAD - outline_len`, where
+///   `OVERHEAD` reserves room for the separator, the truncation notice, and
+///   the code-fence closer;
+/// - headingless documents get no outline at all (no "no headings"
+///   boilerplate), so their head uses the full budget.
+///
+/// The truncation notice reports `full_len` (the pre-truncation byte length
+/// of the content, as known by the caller).
+fn cap_output(text: &str, full_len: usize) -> String {
     if text.len() <= MAX_OUTPUT_BYTES {
         return text.to_string();
     }
-    let outline = generate_markdown_outline(text);
+
+    // Bound the outline to MAX_OUTLINE_BYTES before budgeting.
+    let outline = match generate_markdown_outline(text) {
+        None => None,
+        Some(mut o) => {
+            if o.len() > MAX_OUTLINE_BYTES {
+                let floor = o.floor_char_boundary(MAX_OUTLINE_BYTES - OUTLINE_TRUNC_SUFFIX.len());
+                o = o[..floor].to_string();
+                o.push_str(OUTLINE_TRUNC_SUFFIX);
+            }
+            Some(o)
+        }
+    };
+
     let head_cap = MAX_OUTPUT_BYTES
-        .saturating_sub(outline.len().min(4000))
-        .max(6000);
+        .saturating_sub(TRUNCATION_OVERHEAD_BYTES)
+        .saturating_sub(outline.as_ref().map_or(0, |o| o.len()));
     let max_safe = text.floor_char_boundary(head_cap);
     let window = &text[..max_safe];
     let search_start = max_safe.saturating_sub(500);
@@ -618,8 +724,20 @@ fn cap_output(text: &str, _full_len: usize) -> String {
     if fence_count % 2 == 1 {
         out.push_str("\n```");
     }
-    out.push_str("\n\n[Content truncated. See Document Outline below for remaining sections.]\n\n");
-    out.push_str(&outline);
+
+    let notice = match &outline {
+        Some(_) => format!(
+            "\n\n[Content truncated: showing {cut} of {full_len} bytes. See Document Outline below for remaining sections.]"
+        ),
+        None => format!("\n\n[Content truncated: showing {cut} of {full_len} bytes.]"),
+    };
+    out.push_str(&notice);
+
+    if let Some(o) = outline {
+        out.push_str("\n\n");
+        out.push_str(&o);
+    }
+
     out
 }
 
@@ -1369,13 +1487,27 @@ pub(crate) mod tests {
     #[test]
     fn test_generate_markdown_outline_extracts_headings_and_anchors() {
         let doc = "# Main API\n\nSome intro text.\n\n## Authentication\n\nAuth details.\n\n### Bearer Token\n\nTokens.\n\n## Endpoints\n\nList.\n";
-        let outline = generate_markdown_outline(doc);
+        let outline = generate_markdown_outline(doc).expect("headings must be detected");
         assert!(outline.contains("## Document Outline"));
         assert!(outline.contains("* [Main API](#main-api)"));
         assert!(outline.contains("  * [Authentication](#authentication)"));
         assert!(outline.contains("    * [Bearer Token](#bearer-token)"));
         assert!(outline.contains("  * [Endpoints](#endpoints)"));
         assert!(outline.contains("[Hint: To inspect specific sections without spilling"));
+        // setext headings (the form html2md emits for HTML <h1>/<h2>).
+        let doc2 = "API Documentation\n==========\n\nbody one\n\nSection 2: Component Analysis\n----------\n\nbody two\n\nnot a heading -\n\nem-dash line –\n";
+        let outline2 = generate_markdown_outline(doc2).expect("setext headings must be detected");
+        assert!(outline2.contains("* [API Documentation](#api-documentation)"));
+        assert!(
+            outline2.contains("  * [Section 2: Component Analysis](#section-2-component-analysis)")
+        );
+        assert!(!outline2.contains("not a heading"));
+        // Only a `=`/`-` underline (>= 3 chars, per CommonMark) qualifies.
+        let doc3 = "text line\n==\n\nmore\n";
+        assert!(generate_markdown_outline(doc3).is_none());
+        // `#nospace` is not an ATX heading (no space after the hashes).
+        let doc4 = "#nospace\n\nbody\n";
+        assert!(generate_markdown_outline(doc4).is_none());
     }
 
     #[test]
@@ -1387,9 +1519,137 @@ pub(crate) mod tests {
 
         let capped = cap_output(&s, s.len());
         assert!(!capped.is_empty());
+        // Headingless document: the notice must report the full length and
+        // no outline boilerplate may be appended.
+        assert!(
+            capped.contains(&format!(" of {} bytes.]", s.len())),
+            "notice must report full_len, tail={:?}",
+            &capped[capped.len().saturating_sub(200)..]
+        );
+        assert!(!capped.contains("Document Outline"));
+        assert!(!capped.contains("No structural headings"));
+        // The cut landed on a char boundary inside/after the multi-byte run:
+        // the total must stay within the hard cap.
+        assert!(capped.len() <= MAX_OUTPUT_BYTES);
 
         let (pdf_capped, truncated) = cap_output_pdf(&s, 1, 1, 1);
         assert!(truncated);
         assert!(!pdf_capped.is_empty());
+    }
+
+    #[test]
+    fn cap_output_heading_heavy_25kb_strictly_bounded() {
+        // Build a ~28KB document whose heading lines alone exceed 6KB.
+        let mut doc = String::new();
+        doc.push_str("# Overview\n\n");
+        doc.push_str(&"Intro line. ".repeat(40));
+        doc.push('\n');
+        let mut heading_bytes = 0usize;
+        for i in 0..200 {
+            let level = 2 + i % 4;
+            let hashes = "#".repeat(level);
+            let title =
+                format!("Section {i}: Component Analysis & Deep Dive of the System Under Test");
+            heading_bytes += hashes.len() + 1 + title.len() + 1;
+            doc.push_str(&format!("{hashes} {title}\n\n"));
+            doc.push_str(&"Detailed specification content lorem ipsum dolor sit amet. ".repeat(12));
+            doc.push('\n');
+        }
+        assert!(doc.len() >= 25 * 1024, "doc too small: {}", doc.len());
+        assert!(
+            heading_bytes >= 6 * 1024,
+            "headings too small: {heading_bytes}"
+        );
+
+        let capped = cap_output(&doc, doc.len());
+        // The total output (head + notice + outline) must never exceed the cap.
+        assert!(
+            capped.len() <= MAX_OUTPUT_BYTES,
+            "capped output must be <= {} bytes, got {}",
+            MAX_OUTPUT_BYTES,
+            capped.len()
+        );
+        // The truncation notice must report the pre-truncation byte length.
+        assert!(
+            capped.contains(&format!(" of {} bytes", doc.len())),
+            "notice must report full_len={}: tail={:?}",
+            doc.len(),
+            &capped[capped.len().saturating_sub(300)..]
+        );
+        // Headings exist, so a (bounded) outline must be appended.
+        assert!(
+            capped.contains("## Document Outline"),
+            "headingful truncation must append the outline"
+        );
+        // The outline string itself is bounded to 4,000 bytes (truncated with a
+        // marker when it exceeds it).
+        let outline = capped
+            .split("## Document Outline")
+            .last()
+            .map(|s| s.trim_end().len());
+        assert!(
+            outline.is_some_and(|l| l <= MAX_OUTLINE_BYTES),
+            "outline itself must be <= {MAX_OUTLINE_BYTES} bytes, got {outline:?}"
+        );
+        let full = generate_markdown_outline(&doc).unwrap();
+        if full.len() > MAX_OUTLINE_BYTES {
+            assert!(
+                capped.contains(OUTLINE_TRUNC_SUFFIX),
+                "an over-budget outline must carry the truncation marker"
+            );
+        }
+    }
+
+    #[test]
+    fn cap_output_headingless_no_outline_boilerplate() {
+        let para = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod. ";
+        let doc = para.repeat(200);
+        assert!(doc.len() > MAX_OUTPUT_BYTES);
+
+        let capped = cap_output(&doc, doc.len());
+        assert!(
+            capped.len() <= MAX_OUTPUT_BYTES,
+            "capped output must be <= {} bytes, got {}",
+            MAX_OUTPUT_BYTES,
+            capped.len()
+        );
+        // No headings → no outline, no "no headings" boilerplate at all.
+        assert!(!capped.contains("Document Outline"));
+        assert!(!capped.contains("No structural headings"));
+        // The notice reports the exact cut position and the full length.
+        // Mirror `cap_output`'s head budget *exactly*: for a headingless doc
+        // the outline is `None`, so its length contributes 0 and
+        // `head_cap = MAX_OUTPUT_BYTES - TRUNCATION_OVERHEAD_BYTES`. (The
+        // earlier version budgeted from `MAX_OUTPUT_BYTES` directly, which
+        // over-estimated the head by the overhead and made the expected
+        // `cut` land past the real one.)
+        let outline_len = 0; // headingless ⇒ no outline is appended
+        let head_cap = MAX_OUTPUT_BYTES
+            .saturating_sub(TRUNCATION_OVERHEAD_BYTES)
+            .saturating_sub(outline_len);
+        let max_safe = doc.floor_char_boundary(head_cap);
+        let window = &doc[..max_safe];
+        let search_start = max_safe.saturating_sub(500);
+        let mut cut = window.rfind("\n\n").unwrap_or(0);
+        if cut < search_start {
+            cut = window.rfind('\n').unwrap_or(0);
+        }
+        if cut < search_start {
+            cut = max_safe;
+        }
+        assert_eq!(
+            cut, max_safe,
+            "this headingless doc has no newlines, so the cut must land at head_cap"
+        );
+        assert!(
+            capped.contains(&format!(
+                "[Content truncated: showing {cut} of {} bytes.]",
+                doc.len()
+            )),
+            "headingless notice must show cut and full_len, tail={:?}",
+            &capped[capped.len().saturating_sub(200)..]
+        );
+        // The head must be a verbatim prefix of the document.
+        assert!(doc.starts_with(&capped[..capped.len().min(2000)]));
     }
 }

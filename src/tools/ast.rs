@@ -806,6 +806,36 @@ pub fn validate_file_syntax(path: &Path, content: &str) -> Result<(), AstError> 
     Err(AstError::SyntaxFailure(msg))
 }
 
+/// Count the number of syntax errors (ERROR/UNDEFINED/MISSING nodes) in
+/// `content` when parsed in memory as the language that
+/// [`infer_lang_by_extension`] resolves for `path`.
+///
+/// Returns `None` when `content` is empty/whitespace or when the extension does
+/// not map to any bundled grammar (there is nothing to parse). Otherwise
+/// returns `Some(count)` — the number of distinct error nodes, collected up to
+/// a high limit (`256`) so a badly broken file does not cost an unbounded scan
+/// while still distinguishing "a few" from "many".
+///
+/// This is the counting companion to [`validate_file_syntax`]: it lets
+/// `edit_file` decide whether an edit *worsens* an already-broken file (more
+/// error nodes than the original) instead of failing outright on the
+/// original's pre-existing errors.
+pub fn count_syntax_errors(path: &Path, content: &str) -> Option<usize> {
+    if content.trim().is_empty() {
+        return None;
+    }
+    let lang = infer_lang_by_extension(path)?;
+    let source = if lang == SupportLang::Html {
+        html_validation_text(content)
+    } else {
+        content.to_string()
+    };
+    let doc = lang.ast_grep(&source);
+    let mut errors = Vec::new();
+    collect_syntax_errors(&doc.root(), &source, &mut errors, 256);
+    Some(errors.len())
+}
+
 fn walk_for_errors(node: &Node<ast_grep_core::tree_sitter::StrDoc<SupportLang>>, out: &mut bool) {
     if *out {
         return;
@@ -1217,6 +1247,47 @@ mod tests {
         let path = std::path::Path::new("notes.txt");
         let content = "let x = ;;;\n";
         assert!(validate_file_syntax(path, content).is_ok());
+    }
+
+    #[test]
+    fn count_syntax_errors_counts_rust_errors() {
+        // Valid Rust -> zero errors.
+        let fixed = "fn a() {\n    let x = 1;\n}\nfn b() {\n    let y = 2;\n}\n";
+        assert_eq!(
+            count_syntax_errors(std::path::Path::new("lib.rs"), fixed),
+            Some(0)
+        );
+        // One missing initializer -> one error.
+        let broken = "fn a() {\n    let x = 1;\n}\nfn b() {\n    let y = ;\n}\n";
+        assert_eq!(
+            count_syntax_errors(std::path::Path::new("lib.rs"), broken),
+            Some(1)
+        );
+        // Two missing initializers -> two errors (the fix/worsen discriminator
+        // used by `edit_file`).
+        let worse = "fn a() {\n    let x = ;\n}\nfn b() {\n    let y = ;\n}\n";
+        assert_eq!(
+            count_syntax_errors(std::path::Path::new("lib.rs"), worse),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn count_syntax_errors_returns_none_for_unsupported_and_empty() {
+        // No bundled grammar for `.txt` -> None, regardless of content.
+        assert_eq!(
+            count_syntax_errors(std::path::Path::new("notes.txt"), "let x = ;;;"),
+            None
+        );
+        // Empty / whitespace content -> None (nothing to parse).
+        assert_eq!(
+            count_syntax_errors(std::path::Path::new("lib.rs"), ""),
+            None
+        );
+        assert_eq!(
+            count_syntax_errors(std::path::Path::new("lib.rs"), "   \n\t"),
+            None
+        );
     }
 
     #[test]

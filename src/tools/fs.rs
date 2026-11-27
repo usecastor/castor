@@ -655,22 +655,55 @@ impl FsExecutor {
             (updated, count, last_effective_target, last_effective_repl)
         };
 
-        // AST gate: when the `ast` feature is enabled, parse the fully-rewritten
-        // content in memory before committing it to disk. If the resolved
-        // grammar flags an ERROR/UNDEFINED node, the write is refused and the
-        // file is left byte-identical. Without the feature, `edit_file` performs
-        // the plain exact-substring replacement only (no compile, no AST call).
+        // AST gate: when the `ast` feature is enabled, parse both the original
+        // and the fully-rewritten content in memory before committing.
+        //
+        // - If the original is already clean, any introduced syntax error is
+        //   rejected (the strict gate): a clean file must not get worse.
+        // - If the original ALREADY has syntax errors, the edit is allowed only
+        //   when it does not *increase* the error count (a fix, or a neutral
+        //   non-worsening change is fine); an edit that adds MORE errors is
+        //   rejected with a SyntaxValidationError. This lets already-broken
+        //   files be incrementally repaired instead of being locked behind a
+        //   full-file fix.
+        //
+        // Without the feature, `edit_file` performs the plain exact-substring
+        // replacement only (no compile, no AST call).
         #[cfg(feature = "ast")]
-        if super::ast::validate_file_syntax(&resolved, &original).is_ok()
-            && let Err(e) = super::ast::validate_file_syntax(&resolved, &updated)
         {
-            let detail = match e {
-                super::ast::AstError::SyntaxFailure(detail) => detail,
-                other => other.to_string(),
-            };
-            return Err(FsError::EditError(format!(
-                "SyntaxValidationError: replacement introduces syntax errors in {path}. No write performed. {detail}"
-            )));
+            let original_clean = super::ast::validate_file_syntax(&resolved, &original).is_ok();
+
+            if original_clean {
+                // Strict gate: a clean file must stay clean.
+                if let Err(e) = super::ast::validate_file_syntax(&resolved, &updated) {
+                    let detail = match e {
+                        super::ast::AstError::SyntaxFailure(detail) => detail,
+                        other => other.to_string(),
+                    };
+                    return Err(FsError::EditError(format!(
+                        "SyntaxValidationError: replacement introduces syntax errors in {path}. No write performed. {detail}"
+                    )));
+                }
+            } else if let Some(orig_errs) = super::ast::count_syntax_errors(&resolved, &original) {
+                // The original is already broken. Count errors before and
+                // after; allow the edit only if it does not make things worse.
+                if let Some(new_errs) = super::ast::count_syntax_errors(&resolved, &updated)
+                    && new_errs > orig_errs
+                {
+                    let detail = match super::ast::validate_file_syntax(&resolved, &updated) {
+                        Err(e) => match e {
+                            super::ast::AstError::SyntaxFailure(detail) => detail,
+                            other => other.to_string(),
+                        },
+                        Ok(()) => {
+                            "updated content has more syntax errors than the original".to_string()
+                        }
+                    };
+                    return Err(FsError::EditError(format!(
+                        "SyntaxValidationError: replacement worsens syntax errors in {path} (original {orig_errs} -> updated {new_errs}). No write performed. {detail}"
+                    )));
+                }
+            }
         }
 
         self.atomic_write(&resolved, &updated)?;
@@ -1842,6 +1875,70 @@ mod tests {
         assert!(err.to_string().contains("SyntaxValidationError"));
         assert_eq!(fs::read_to_string(&go_file).unwrap(), go_orig);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "ast")]
+    #[test]
+    fn edit_file_allows_non_worsening_edit_on_broken_rust() {
+        // An already-broken file (1 syntax error) may be edited as long as the
+        // edit does not increase the error count. Fixing the one broken line
+        // (1 -> 0) must be allowed and committed.
+        let root = test_root("edit_broken_fix");
+        let file = root.join("lib.rs");
+        let broken = "fn a() {\n    let x = 1;\n}\nfn b() {\n    let y = ;\n}\n";
+        fs::write(&file, broken).unwrap();
+        let ex = executor(&root);
+
+        let out = ex
+            .edit_file("lib.rs", "let y = ;", "let y = 2;", false)
+            .unwrap();
+        assert!(out.contains("Replaced 1 occurrence(s)"), "{out}");
+        let after = fs::read_to_string(&file).unwrap();
+        assert!(
+            after.contains("let y = 2;"),
+            "fix must be committed: {after}"
+        );
+        assert!(
+            !after.contains("let y = ;"),
+            "broken line must be gone: {after}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "ast")]
+    #[test]
+    fn edit_file_rejects_more_errors_on_broken_rust() {
+        // An already-broken file (1 syntax error) must be refused when the edit
+        // adds MORE errors (1 -> 2): the file is left byte-identical and the
+        // error is labelled SyntaxValidationError, reporting both counts.
+        let root = test_root("edit_broken_worsen");
+        let file = root.join("lib.rs");
+        let broken = "fn a() {\n    let x = 1;\n}\nfn b() {\n    let y = ;\n}\n";
+        fs::write(&file, broken).unwrap();
+        let ex = executor(&root);
+
+        let err = ex
+            .edit_file("lib.rs", "let x = 1;", "let x = ;", false)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, FsError::EditError(_)),
+            "expected an EditError, got {err:?}"
+        );
+        assert!(
+            msg.contains("SyntaxValidationError"),
+            "error must be labelled SyntaxValidationError, got: {msg}"
+        );
+        assert!(
+            msg.contains("No write performed"),
+            "error must state that no write was performed, got: {msg}"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            broken,
+            "file must be byte-identical after a refused edit"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

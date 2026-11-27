@@ -122,7 +122,7 @@ The exact list below is the present-state inventory from
 | `CASTOR_MAX_CONCURRENT_TASKS` | `4` | Cross-process execution slots (disk-lease semaphore). Defaults to the Swarm baseline `MAX_SEQS=4`; user-defined profiles (e.g. `turbo`=2, `bonsai`=1) or an explicit env/file value override this. Each worker additionally token-budgets the pool at `max_context` so concurrent streams never overcommit the aggregate KV footprint. |
 | `CASTOR_WORKSPACE_SKELETON` | `true` | Prepend a compact workspace-skeleton block to the system prompt (warm Turn-1 prefix for KV prefix caching). |
 | `CASTOR_TOOL_SPILL_BYTES` | `16384` | Max bytes of a single tool output before it is spilled to disk (head/tail preview kept in conversation). |
-| `CASTOR_DGI_REJECT_MARGIN` | `1.2` | DGI gatekeeper log-odds reject margin: reject only when `logP(OVERLOADED) − logP(ADMIT)` exceeds this. |
+| `CASTOR_DGI_REJECT_MARGIN` | `1.2` | DGI gatekeeper log-odds reject margin for the binary ADMIT/REJECT gate: reject only when `logP(OVERLOADED) − logP(ADMIT)` exceeds this. Calibrated on the live 1,053-prompt benchmark (`evals/dgi/dataset.json`): `1.2` keeps false rejects on single-concern ADMIT dispatches at ~2.7%. |
 | `CASTOR_DGI_BYPASS_WARM_SESSION` | `true` | Skip the DGI probe for continuations that already have a non-empty session. |
 | `CASTOR_DGI_TIMEOUT_SECS` | `30` | Timeout for the DGI 1-forward-pass logit probe. |
 | `CASTOR_TURN_TIMEOUT_SECS` | `600` | Per-turn wall-clock watchdog timeout; `0` disables. |
@@ -157,11 +157,22 @@ Use structural AST tools, not string matching, for syntactic discovery and refac
   normalized, whitespace-trimmed, and relative-indentation alignment with
   candidate line hints on ambiguity), uniqueness-guarded, per-region
   line-ending preservation. Under the `ast` feature the rewritten content
-  additionally passes an in-memory AST syntax gate before commit; without the
+  passes a two-tier in-memory AST syntax gate before commit; without the
   feature there is no syntax validation and the edit performs matching without
-  AST checks.
-- `write_file` — full file write, atomic via temporary file swap, guarded by
-  the in-memory AST syntax gate when `ast` is active.
+  AST checks. The gate is two-tier and behaves as:
+  * **clean file** — the original parses with no error nodes, so any edit
+    that introduces an `ERROR`/`UNDEFINED`/`MISSING` node is rejected
+    (a clean file must stay clean);
+  * **already-broken file** — the edit is allowed only when it does not
+    *increase* the original file's syntax-error count (a fix or a neutral
+    change is fine; an edit that adds more errors is rejected).
+- `write_file` — full file write, atomic via temporary file swap. Unlike
+  `edit_file`, it uses a **single strict gate**: when `ast` is active, only the
+  *new* content is parsed in memory — any `ERROR`/`UNDEFINED`/`MISSING` node
+  rejects the write regardless of the original file's state (the original is
+  never compared, so a pre-broken file cannot be saved through `write_file`;
+  non-code extensions parse-free, empty content allowed). Without the feature
+  there is no syntax validation.
 
 ### 3.4 Module layout
 
@@ -232,7 +243,21 @@ evals/                   # Tier A offline replay, golden test tasks, and DGI 1,0
 skills/                  # Reusable SKILL.md workflow recipes
 ```
 
-### 3.5 Concurrent Dispatch & Dynamic Admission (Token-Budgeted Slot Semaphore)
+### 3.5 Concurrent Dispatch, Warm KV Prefix & Token-Budgeted Slot Semaphore
+
+The worker system prompt is a **byte-identical, workspace-deterministic warm KV
+prefix** (`src/mcp/worker.rs` `build_worker_system_prompt`). It is a pure
+function of the workspace's stable shape and the build — the static persona /
+invariants / tool-routing block, then `[Workspace]` root, then the deterministic
+`[Workspace Skeleton]`, then the active-skills index — and is **identical across
+every prompt and every resumed session** in the same workspace. Prompt-specific
+CPG/PPR retrieved-code context is **never** in the
+system prompt; it is built separately (`build_user_turn_augmentation`) and
+attached to the **user message** passed into `runner::run_session` and into the
+initial token estimate. This is what makes per-workspace concurrent slices share
+one warm KV prefix, and what lets resumed (`session_id`) continuations reuse the
+exact same system-prompt bytes so the prior conversation's KV prefix cache is
+preserved from token 0, with the CPG/PPR context riding on the new user prompt.
 
 Concurrency is governed **entirely dynamically** by the microkernel's
 token-budgeted slot semaphore (`src/task/semaphore.rs`, file-backed cross-process

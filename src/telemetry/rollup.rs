@@ -396,13 +396,25 @@ pub(super) fn load_task_metrics_cached(
         }
 
         match status.as_str() {
-            "completed" | "completed_with_salvage" => {
+            "completed" => {
                 metrics.completed += 1;
                 if let Some(ms) = exec {
                     metrics.total_execution_ms += ms;
                 }
             }
-            "failed" | "rejected_decomposition" => {
+            "completed_with_salvage" => {
+                metrics.salvaged += 1;
+                if let Some(ms) = exec {
+                    metrics.total_execution_ms += ms;
+                }
+            }
+            "rejected_decomposition" => {
+                metrics.rejected_decomposition += 1;
+                if let Some(ms) = exec {
+                    metrics.total_execution_ms += ms;
+                }
+            }
+            "failed" => {
                 metrics.failed += 1;
                 if let Some(ms) = exec {
                     metrics.total_execution_ms += ms;
@@ -418,7 +430,15 @@ pub(super) fn load_task_metrics_cached(
 
 #[derive(Default)]
 pub(super) struct TaskMetrics {
+    /// Pure completions only: `completed_with_salvage` (reasoning-budget-exhausted
+    /// salvage) and `rejected_decomposition` are tracked in their own counters so
+    /// this figure is never inflated by them.
     pub(super) completed: u64,
+    /// Tasks that finished via the reasoning-ceiling salvage pass.
+    pub(super) salvaged: u64,
+    /// Tasks whose decomposition was rejected (never executed).
+    pub(super) rejected_decomposition: u64,
+    /// `failed` only — salvage and rejected-decomposition tasks do not inflate it.
     pub(super) failed: u64,
     pub(super) cancelled: u64,
     /// Sum of task execution durations in ms (`ended_at - started_at`) over
@@ -494,6 +514,8 @@ pub fn derive_stats(state_dir: &Path, opts: &StatsOptions) -> Stats {
         total_turns: session_rollup.total_turns,
         total_sessions: session_rollup.total_sessions,
         total_tasks_completed: task_metrics.completed,
+        total_tasks_salvaged: task_metrics.salvaged,
+        total_tasks_rejected_decomposition: task_metrics.rejected_decomposition,
         total_tasks_failed: task_metrics.failed,
         total_tasks_cancelled: task_metrics.cancelled,
         total_task_execution_ms: task_metrics.total_execution_ms,
@@ -878,12 +900,31 @@ pub fn format_stats_card_styled(stats: &Stats, color: bool) -> String {
         fmt_grouped(stats.total_sessions)
     ));
 
-    let total_tasks =
-        stats.total_tasks_completed + stats.total_tasks_failed + stats.total_tasks_cancelled;
+    let total_tasks = stats.total_tasks_completed
+        + stats.total_tasks_salvaged
+        + stats.total_tasks_rejected_decomposition
+        + stats.total_tasks_failed
+        + stats.total_tasks_cancelled;
     if total_tasks > 0 {
         let ok_rate = (stats.total_tasks_completed as f64 / total_tasks as f64) * 100.0;
         let mut details = Vec::new();
         details.push(format!("{} ok", fmt_grouped(stats.total_tasks_completed)));
+        if stats.total_tasks_salvaged > 0 {
+            details.push(format!(
+                "{}{} salvaged{}",
+                p.bright_green,
+                fmt_grouped(stats.total_tasks_salvaged),
+                p.reset
+            ));
+        }
+        if stats.total_tasks_rejected_decomposition > 0 {
+            details.push(format!(
+                "{}{} rejected{}",
+                p.yellow,
+                fmt_grouped(stats.total_tasks_rejected_decomposition),
+                p.reset
+            ));
+        }
         if stats.total_tasks_failed > 0 {
             details.push(format!(
                 "{}{} fail{}",
@@ -1950,21 +1991,101 @@ mod tests {
     #[test]
     fn derive_stats_counts_salvage_and_rejected_decomposition() {
         let state = tmp_state();
+        // Pure completion: the only task that counts toward `completed`.
+        write(
+            &state.join("tasks/task_ok.json"),
+            "{\"id\":\"task_ok\",\"status\":\"completed\",\"started_at\":1760000001000,\"ended_at\":1760000002000}",
+        );
+        // Salvage: must NOT inflate `completed` — its own bucket only.
         write(
             &state.join("tasks/task_salvage.json"),
             "{\"id\":\"task_salvage\",\"status\":\"completed_with_salvage\",\"started_at\":1760000000000,\"ended_at\":1760000002500}",
         );
+        // Rejected decomposition: must NOT inflate `failed` — its own bucket.
         write(
             &state.join("tasks/task_rejected.json"),
             "{\"id\":\"task_rejected\",\"status\":\"rejected_decomposition\",\"created_at\":1760000003000,\"ended_at\":1760000003100}",
         );
+        // Hard failure: the only task counted toward `failed`.
+        write(
+            &state.join("tasks/task_fail.json"),
+            "{\"id\":\"task_fail\",\"status\":\"failed\",\"started_at\":1760000004000,\"ended_at\":1760000005000}",
+        );
 
         let s = derive_stats(&state, &Default::default());
-        assert_eq!(s.total_tasks_completed, 1);
-        assert_eq!(s.total_tasks_failed, 1);
-        assert_eq!(s.total_task_execution_ms, 2_500);
+        assert_eq!(
+            s.total_tasks_completed, 1,
+            "pure completed only — salvage must not inflate it"
+        );
+        assert_eq!(
+            s.total_tasks_salvaged, 1,
+            "reasoning-budget-exhausted salvage in its own bucket"
+        );
+        assert_eq!(
+            s.total_tasks_rejected_decomposition, 1,
+            "rejected decomposition in its own bucket"
+        );
+        assert_eq!(
+            s.total_tasks_failed, 1,
+            "failed only — rejected decomposition must not inflate it"
+        );
+        assert_eq!(s.total_tasks_cancelled, 0);
+        // 1000 (ok) + 2500 (salvage) + 1000 (fail); the rejected task has no
+        // `started_at`, so it contributes nothing to the execution-time sum.
+        assert_eq!(s.total_task_execution_ms, 4_500);
 
         let _ = fs::remove_dir_all(&state);
+    }
+
+    /// Backward compatibility: `stats.json` files written by an older build
+    /// (pre-`total_tasks_salvaged` / `total_tasks_rejected_decomposition`)
+    /// still deserialize, with the new fields defaulting to zero.
+    #[test]
+    fn stats_json_without_new_task_fields_deserializes() {
+        let legacy = serde_json::json!({
+            "total_completion_tokens": 12000,
+            "total_reasoning_tokens": 3000,
+            "total_prompt_tokens": 80000,
+            "total_cached_tokens": 10000,
+            "total_turns": 42,
+            "total_sessions": 3,
+            "total_tasks_completed": 7,
+            "total_tasks_failed": 2,
+            "total_tasks_cancelled": 1,
+            "total_task_execution_ms": 60000,
+            "avg_duration_ms": 12345.0,
+            "total_duration_ms": 37035,
+            "total_tool_calls": 99,
+            "total_tool_errors": 4,
+            "tool_calls": { "bash": 50, "read_file": 49 },
+            "tool_errors": { "bash": 4 },
+            "benchmark_model": "Claude Sonnet 5",
+            "estimated_cost_saved_usd": 10.1,
+            "estimated_electricity_cost_usd": 0.5,
+            "estimated_energy_kwh": 1.0,
+            "inference_compute_ms": 20000,
+            "electricity_rate_usd": 0.18,
+            "system_power_watts": 250,
+            "net_savings_usd": 9.6,
+            "reasoning_ratio": 0.25,
+            "edit_write_ratio": 1.5,
+            "first_recorded_session": "2026-09-05T03:58:07.228Z",
+            "last_recorded_session": "2026-09-05T04:00:01.000Z",
+            "last_updated": "2026-09-05T04:01:00.000Z",
+        });
+
+        let stats: Stats = serde_json::from_value(legacy).expect("legacy stats.json must parse");
+        assert_eq!(stats.total_tasks_completed, 7);
+        assert_eq!(stats.total_tasks_failed, 2);
+        assert_eq!(stats.total_tasks_cancelled, 1);
+        assert_eq!(stats.total_tasks_salvaged, 0);
+        assert_eq!(stats.total_tasks_rejected_decomposition, 0);
+
+        // And the round trip stays stable: the new fields serialize (default
+        // values included) and re-parse to the same values.
+        let reparsed: Stats =
+            serde_json::from_value(serde_json::to_value(&stats).unwrap()).unwrap();
+        assert_eq!(reparsed, stats);
     }
 
     #[test]
@@ -2007,6 +2128,45 @@ mod tests {
         };
         let card = format_stats_card(&stats);
         assert!(!card.contains("Task Execution Time"));
+    }
+
+    /// The Tasks line renders the salvage and rejected-decomposition buckets
+    /// cleanly (only when non-zero) and computes the success rate against the
+    /// full task population — `ok / (ok + salvaged + rejected + fail + canc)`.
+    #[test]
+    fn format_stats_card_shows_salvaged_and_rejected_task_buckets() {
+        let stats = Stats {
+            total_tasks_completed: 3,
+            total_tasks_salvaged: 2,
+            total_tasks_rejected_decomposition: 1,
+            total_tasks_failed: 1,
+            total_tasks_cancelled: 1,
+            ..Default::default()
+        };
+        let card = format_stats_card(&stats);
+        // 8 tasks total; 3 pure completions → 37.5% success.
+        assert!(card.contains("37.5% success"), "card: {card}");
+        assert!(card.contains("3 ok"), "card: {card}");
+        assert!(card.contains("2 salvaged"), "card: {card}");
+        assert!(card.contains("1 rejected"), "card: {card}");
+        assert!(card.contains("1 fail"), "card: {card}");
+        assert!(card.contains("1 canc"), "card: {card}");
+    }
+
+    /// Zero salvage / rejected buckets render nothing extra (no empty
+    /// "0 salvaged" noise) — only `ok` / `fail` / `canc` appear.
+    #[test]
+    fn format_stats_card_omits_zero_salvage_and_rejected_buckets() {
+        let stats = Stats {
+            total_tasks_completed: 4,
+            total_tasks_failed: 1,
+            total_tasks_cancelled: 2,
+            ..Default::default()
+        };
+        let card = format_stats_card(&stats);
+        assert!(card.contains("4 ok"), "card: {card}");
+        assert!(!card.contains("salvaged"), "card: {card}");
+        assert!(!card.contains("rejected"), "card: {card}");
     }
 
     #[test]

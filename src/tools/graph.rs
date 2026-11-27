@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use ast_grep_core::Node;
@@ -80,63 +81,128 @@ impl CodePropertyGraph {
     }
 
     /// Add a single source file to the graph, extracting symbol definitions
-    /// and cross-references.
+    /// and cross-references. Equivalent to indexing the file and immediately
+    /// linking its references against the currently-known symbol table; for
+    /// single-file callers and unit tests the file is already complete, so
+    /// same-file references resolve correctly.
     pub fn add_file(&mut self, path: &Path, content: &str) {
+        let range = self.index_file(path, content);
+        self.link_range(range, content);
+    }
+
+    /// Pass 1 of the two-pass build: parse one source file, append its
+    /// declaration nodes to `nodes`, and record them in the
+    /// `name_to_nodes` symbol table. Returns the node-index range
+    /// `[start_idx..end_idx)` occupied by this file's symbols. Unsupported
+    /// (non-code) files yield an empty range and index nothing.
+    ///
+    /// Keeping indexing and reference-linking separate lets
+    /// [`build_from_workspace`] index every file first — so the complete
+    /// `name_to_nodes` table is available — and only then link references.
+    pub fn index_file(&mut self, path: &Path, content: &str) -> Range<usize> {
         let lang = match infer_lang_by_extension(path) {
             Some(l) => l,
-            None => return,
+            None => return 0..0,
         };
 
         let doc = lang.ast_grep(content);
         let root = doc.root();
 
-        // 1. First pass: extract all declaration nodes.
         let mut file_symbols = Vec::new();
         Self::collect_declarations(&root, path, &mut file_symbols);
 
         let start_idx = self.nodes.len();
-        for sym in &file_symbols {
-            let lower_name = sym.name.to_ascii_lowercase();
-            let idx = start_idx + file_symbols.iter().position(|s| s.id == sym.id).unwrap();
-            self.name_to_nodes.entry(lower_name).or_default().push(idx);
-        }
-
-        // Extend adjacency storage.
         let new_total = start_idx + file_symbols.len();
         self.adj.resize_with(new_total, Vec::new);
         self.rev_adj.resize_with(new_total, Vec::new);
         self.nodes.extend(file_symbols);
 
-        // 2. Second pass: link references and calls from definitions in this file.
-        // For each node in the file, scan its body for identifiers matching known symbols.
-        for node_idx in start_idx..self.nodes.len() {
-            let sym = &self.nodes[node_idx];
-            // Simple reference scanning: tokenize symbol signature/body lines
-            // or match identifiers against known names.
-            let lines: Vec<&str> = content.lines().collect();
-            if sym.start_line > 0 && sym.end_line <= lines.len() && sym.start_line <= sym.end_line {
-                let body_slice = &lines[(sym.start_line - 1)..sym.end_line];
-                let mut mentioned = HashSet::new();
-                for line in body_slice {
-                    for word in extract_identifiers(line) {
-                        let lower = word.to_ascii_lowercase();
-                        if lower != sym.name.to_ascii_lowercase() {
-                            mentioned.insert(lower);
-                        }
+        // Record each symbol in the name table at its absolute index. A
+        // positional enumerate (not an `iter().position()` scan) keeps this
+        // O(n) per file instead of O(n^2).
+        for (offset, sym) in self.nodes[start_idx..].iter().enumerate() {
+            let idx = start_idx + offset;
+            self.name_to_nodes
+                .entry(sym.name.to_ascii_lowercase())
+                .or_default()
+                .push(idx);
+        }
+
+        start_idx..self.nodes.len()
+    }
+
+    /// Pass 2 of the two-pass build: link references for the symbols in
+    /// `range` against the **complete** `name_to_nodes` symbol table. For each
+    /// symbol, its body lines are scanned for identifiers that name other known
+    /// symbols, producing directed edges to them (a self-reference — the
+    /// symbol's own name — is never an edge).
+    ///
+    /// `content.lines()` is split exactly once per file (the caller supplies it)
+    /// rather than once per symbol, and each symbol's body is located by a
+    /// positional offset (`start_idx + offset`) rather than an `iter().position()`
+    /// scan.
+    ///
+    /// In [`build_from_workspace`] this runs *after* every file has been
+    /// indexed, so a symbol in file A correctly links to a symbol defined in a
+    /// file Z that is enumerated later — the complete symbol table is present.
+    /// For a single file (`add_file`) the table holds exactly this file's
+    /// symbols, so it links same-file references.
+    pub fn link_range(&mut self, range: Range<usize>, content: &str) {
+        if range.is_empty() {
+            return;
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        let lines_len = lines.len();
+
+        // Copy the per-symbol fields needed for scanning so the loop can
+        // mutably borrow `self` for `add_edge` without holding an immutable
+        // borrow on `self.nodes`.
+        let entries: Vec<(usize, String, usize, usize)> = self.nodes[range.clone()]
+            .iter()
+            .enumerate()
+            .map(|(offset, n)| {
+                (
+                    range.start + offset,
+                    n.name.to_ascii_lowercase(),
+                    n.start_line,
+                    n.end_line,
+                )
+            })
+            .collect();
+
+        for (node_idx, sym_lower, start_line, end_line) in entries {
+            if start_line == 0
+                || start_line > end_line
+                || start_line > lines_len
+                || end_line > lines_len
+            {
+                continue;
+            }
+            // Body slice: lines from `start_line` (1-based) up to `end_line`,
+            // inclusive of both.
+            let body_slice = &lines[start_line - 1..end_line];
+            let mut mentioned = HashSet::new();
+            for line in body_slice {
+                for word in extract_identifiers(line) {
+                    let lower = word.to_ascii_lowercase();
+                    if lower != sym_lower {
+                        mentioned.insert(lower);
                     }
                 }
-                let mut edges_to_add = Vec::new();
-                for word in mentioned {
-                    if let Some(target_indices) = self.name_to_nodes.get(&word) {
-                        for &target_idx in target_indices {
-                            if target_idx != node_idx {
-                                edges_to_add.push((node_idx, target_idx, 1.0));
-                            }
-                        }
+            }
+            for word in mentioned {
+                // Copy the target indices out of the map (dropping the
+                // immutable borrow) before adding edges, so the loop can
+                // mutably borrow `self`.
+                let targets: Vec<usize> = self
+                    .name_to_nodes
+                    .get(&word)
+                    .map(|v| v.to_vec())
+                    .unwrap_or_default();
+                for target_idx in targets {
+                    if target_idx != node_idx {
+                        self.add_edge(node_idx, target_idx, 1.0);
                     }
-                }
-                for (from, to, weight) in edges_to_add {
-                    self.add_edge(from, to, weight);
                 }
             }
         }
@@ -273,19 +339,48 @@ impl CodePropertyGraph {
     }
 
     /// Build a CodePropertyGraph by scanning a workspace root directory.
+    ///
+    /// Two passes over the collected files:
+    ///   - **Pass 1** ([`index_file`]) parses every file, appending its symbol
+    ///     nodes to `nodes` and populating the `name_to_nodes` symbol table, so
+    ///     after the pass the table is *complete*.
+    ///   - **Pass 2** ([`link_range`]) links references for every file against
+    ///     that complete table — so a symbol in file A correctly links to a
+    ///     symbol defined in a file Z that was enumerated later.
+    ///
+    /// `workspace_root` is canonicalized once (falling back to the raw path if
+    /// canonicalization fails); [`collect_source_files`] then skips symlinks and
+    /// any entry whose canonical path escapes the canonical root, so traversal
+    /// can never read files outside the workspace.
     pub fn build_from_workspace(workspace_root: &Path, max_files: usize) -> Self {
         let mut graph = Self::new();
-        let mut files = Vec::new();
-        collect_source_files(workspace_root, &mut files, max_files);
 
+        // Canonicalize the root once so symlink containment is checked against a
+        // fully resolved base; fall back to the raw path if it cannot be resolved.
+        let canon_root =
+            dunce::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+
+        let mut files = Vec::new();
+        collect_source_files(&canon_root, &mut files, max_files, &canon_root);
+
+        // Pass 1: index every file first so the symbol table is complete.
+        let mut pending: Vec<(PathBuf, Range<usize>, String)> = Vec::new();
         for path in files {
             if let Ok(content) = fs::read_to_string(&path) {
                 let rel = path
-                    .strip_prefix(workspace_root)
+                    .strip_prefix(&canon_root)
                     .unwrap_or(&path)
                     .to_path_buf();
-                graph.add_file(&rel, &content);
+                let range = graph.index_file(&rel, &content);
+                if !range.is_empty() {
+                    pending.push((rel, range, content));
+                }
             }
+        }
+
+        // Pass 2: link references across all files using the complete table.
+        for (_rel, range, content) in pending {
+            graph.link_range(range, &content);
         }
         graph
     }
@@ -542,8 +637,18 @@ fn extract_identifiers(text: &str) -> Vec<String> {
     words
 }
 
-/// Recursively collect source files for graph indexing, excluding build/cache dirs.
-fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>, max_files: usize) {
+/// Recursively collect source files for graph indexing, excluding build/cache
+/// dirs, symlinks, and any path whose canonical form escapes the canonical
+/// workspace root.
+///
+/// `canon_root` is the canonicalized workspace root (resolved once by
+/// [`build_from_workspace`]). Each directory entry is classified by its raw
+/// `file_type()` (lstat semantics): symlinked directories are never descended
+/// into, and symlinked files are never indexed. Every remaining file is
+/// canonicalized and admitted only when its canonical path stays under
+/// `canon_root`, so CPG traversal can never read a file outside the workspace
+/// even through a non-symlink path that resolves externally.
+fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>, max_files: usize, canon_root: &Path) {
     if out.len() >= max_files {
         return;
     }
@@ -570,9 +675,29 @@ fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>, max_files: usize) {
         if EXCLUDED.contains(&name.as_str()) || name.starts_with('.') {
             continue;
         }
-        if path.is_dir() {
-            collect_source_files(&path, out, max_files);
-        } else if infer_lang_by_extension(&path).is_some() {
+        // lstat file type (does not follow symlinks).
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            // Never descend into or read through a symlink — it could point
+            // outside the workspace root.
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_source_files(&path, out, max_files, canon_root);
+        } else if file_type.is_file() {
+            if infer_lang_by_extension(&path).is_none() {
+                continue;
+            }
+            // Canonicalize and enforce containment under the workspace root.
+            let Ok(canon) = dunce::canonicalize(&path) else {
+                continue;
+            };
+            if !canon.starts_with(canon_root) {
+                continue;
+            }
             out.push(path);
             if out.len() >= max_files {
                 return;
@@ -693,5 +818,154 @@ pub fn unrelated_math_function(x: i32) -> i32 {
         assert!(rendered.contains("[Retrieved Code Context]"));
         assert!(rendered.contains("parse_http_header"));
         assert!(rendered.len() <= 500);
+    }
+
+    /// Pass 1 (`index_file`) must complete for every file before Pass 2
+    /// (`link_range`) runs, so a symbol in file A links to a symbol defined in a
+    /// file Z that was *added after* A. Here A is indexed first and Z second —
+    /// the case single-pass linking (index-and-link per file) would miss — yet
+    /// the A -> Z edge is still created when A's range is linked in Pass 2
+    /// against the complete symbol table.
+    #[test]
+    fn forward_cross_file_edge_created_in_two_pass() {
+        let a_src = "pub fn run() {\n    zfn();\n}\n";
+        let z_src = "pub fn zfn() {\n    0\n}\n";
+
+        // Pass 1: index A first, then Z (Z added after A).
+        let mut graph = CodePropertyGraph::new();
+        let a_range = graph.index_file(Path::new("src/a.rs"), a_src);
+        let z_range = graph.index_file(Path::new("src/z.rs"), z_src);
+
+        // Pass 2: link both ranges against the now-complete symbol table.
+        graph.link_range(a_range, a_src);
+        graph.link_range(z_range, z_src);
+
+        let run_idx = graph
+            .nodes
+            .iter()
+            .position(|n| n.name == "run")
+            .expect("run() indexed");
+        let zfn_idx = graph
+            .nodes
+            .iter()
+            .position(|n| n.name == "zfn")
+            .expect("zfn() indexed");
+        assert!(
+            graph.adj[run_idx].iter().any(|(dst, _)| *dst == zfn_idx),
+            "run() in file A must link to zfn() defined in the later-added file Z"
+        );
+    }
+
+    /// Platform symlink creation for the containment tests (unix: a single
+    /// `symlink` covers both file and directory links; windows splits them).
+    #[cfg(unix)]
+    fn symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    fn symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        // File targets need symlink_file; the dir-symlink test passes a
+        // directory target and is gated separately below.
+        if target.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+    }
+
+    /// A symlink inside the workspace pointing to a file outside the workspace
+    /// root must be ignored by `build_from_workspace` — the external symbol is
+    /// never indexed, even though a real in-workspace file references it.
+    #[test]
+    fn symlink_file_outside_workspace_ignored() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ws");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        fs::write(
+            root.join("src.rs"),
+            "pub fn real() {\n    external_fn();\n}\n",
+        )
+        .unwrap();
+        fs::write(outside.join("ext.rs"), "pub fn external_fn() {}\n").unwrap();
+
+        // A symlinked file inside `root` pointing at the external file.
+        symlink(&outside.join("ext.rs"), &root.join("link_file.rs")).unwrap();
+
+        let graph = CodePropertyGraph::build_from_workspace(&root, 1000);
+
+        assert!(
+            graph.nodes.iter().any(|n| n.name == "real"),
+            "real in-workspace symbol must be indexed"
+        );
+        assert!(
+            !graph.nodes.iter().any(|n| n.name == "external_fn"),
+            "external symbol behind a file symlink must NOT be indexed: {:?}",
+            graph.nodes
+        );
+        let _ = base;
+    }
+
+    /// A symlinked *directory* inside the workspace pointing outside must not be
+    /// descended into, so source files it contains are never indexed.
+    #[test]
+    fn symlink_dir_outside_workspace_not_descended() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ws");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        fs::write(
+            root.join("src.rs"),
+            "pub fn real() {\n    external_fn();\n}\n",
+        )
+        .unwrap();
+        fs::write(outside.join("ext.rs"), "pub fn external_fn() {}\n").unwrap();
+
+        // A symlinked directory inside `root` pointing at the external dir.
+        symlink(&outside, &root.join("link_dir")).unwrap();
+
+        let graph = CodePropertyGraph::build_from_workspace(&root, 1000);
+
+        assert!(
+            graph.nodes.iter().any(|n| n.name == "real"),
+            "real in-workspace symbol must be indexed"
+        );
+        assert!(
+            !graph.nodes.iter().any(|n| n.name == "external_fn"),
+            "external symbol behind a directory symlink must NOT be indexed: {:?}",
+            graph.nodes
+        );
+        let _ = base;
+    }
+
+    /// Measure `build_from_workspace` latency on this repository (files indexed,
+    /// nodes, edges). Emitted on stderr only (hidden by the default harness,
+    /// shown under `--nocapture`) so the normal gate stays quiet.
+    #[test]
+    fn build_from_workspace_repo_timing() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let start = std::time::Instant::now();
+        let graph = CodePropertyGraph::build_from_workspace(repo, 100_000);
+        let elapsed_ms = start.elapsed().as_millis();
+
+        let files: std::collections::HashSet<&std::path::Path> =
+            graph.nodes.iter().map(|n| n.file.as_path()).collect();
+        let edges: usize = graph.adj.iter().map(|v| v.len()).sum();
+
+        eprintln!(
+            "build_from_workspace timing: {elapsed_ms} ms, {} files (with symbols), {} nodes, {} edges",
+            files.len(),
+            graph.nodes.len(),
+            edges
+        );
+
+        assert!(
+            !graph.nodes.is_empty(),
+            "the repository must yield at least one indexed symbol"
+        );
     }
 }
