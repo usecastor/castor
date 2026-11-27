@@ -248,6 +248,40 @@ fn build_landlock_ruleset(cwd: &Path) -> Result<landlock::RulesetCreated, String
     Ok(ruleset)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn is_cargo_injected_lib_dir(entry: &str) -> bool {
+    if entry.is_empty() {
+        return false;
+    }
+    if entry.contains("/.rustup/toolchains/") {
+        return true;
+    }
+    if let Some((_, after_target)) = entry.rsplit_once("/target/") {
+        return after_target.ends_with("/deps")
+            || after_target.ends_with("/debug")
+            || after_target.ends_with("/release")
+            || after_target == "debug"
+            || after_target == "release"
+            || (after_target.contains("/build/") && after_target.ends_with("/out"));
+    }
+    false
+}
+
+/// Filters Cargo-injected build-output and toolchain directories out of
+/// `LD_LIBRARY_PATH` while preserving any user-supplied library paths.
+#[cfg(any(target_os = "linux", test))]
+fn sanitize_cargo_ld_library_path(raw: &str) -> Option<String> {
+    let kept: Vec<&str> = raw
+        .split(':')
+        .filter(|entry| !entry.is_empty() && !is_cargo_injected_lib_dir(entry))
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(":"))
+    }
+}
+
 pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOutput, ShellError> {
     let t0 = Instant::now();
     let bash = crate::platform::bash_path();
@@ -290,6 +324,24 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
         let scratch_tmp = cwd.join(".scratch").join("tmp");
         if std::fs::create_dir_all(&scratch_tmp).is_ok() {
             cmd_builder.env("TMPDIR", &scratch_tmp);
+        }
+
+        // When invoked from `cargo test` or `cargo run`, Cargo injects dozens of
+        // `target/*/build/*/out` and toolchain directories into `LD_LIBRARY_PATH`.
+        // Inheriting them into child `bash` processes on 9p/drvfs mounts forces `ld.so`
+        // to spend hundreds of milliseconds probing non-existent directories before
+        // executing the first command.
+        if std::env::var_os("CARGO").is_some()
+            && let Ok(ld_path) = std::env::var("LD_LIBRARY_PATH")
+        {
+            match sanitize_cargo_ld_library_path(&ld_path) {
+                Some(cleaned) => {
+                    cmd_builder.env("LD_LIBRARY_PATH", cleaned);
+                }
+                None => {
+                    cmd_builder.env_remove("LD_LIBRARY_PATH");
+                }
+            }
         }
 
         if let Ok(ruleset) = build_landlock_ruleset(cwd) {
@@ -336,6 +388,10 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
             capture_capped(stderr, MAX_CAPTURE_BYTES, buf, flag).await;
         })
     };
+
+    // Poll spawned pipe readers once immediately so their reactor registrations
+    // are active even on a fresh current-thread runtime before any sleep tick.
+    tokio::task::yield_now().await;
 
     let deadline = tokio::time::Instant::now() + timeout;
     let mut status = None;
@@ -408,6 +464,8 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
             {
                 out_task.abort();
                 err_task.abort();
+                let _ = out_task.await;
+                let _ = err_task.await;
             }
             let out = std::mem::take(&mut *out_buf.lock().unwrap());
             let mut err = String::from_utf8_lossy(&std::mem::take(&mut *err_buf.lock().unwrap()))
@@ -465,5 +523,17 @@ mod tests {
         let captured = String::from_utf8_lossy(&out_buf.lock().unwrap()).into_owned();
         assert_eq!(captured, "CAPTURED_BEFORE_HANG\n");
         drop(writer);
+    }
+
+    #[test]
+    fn sanitize_cargo_ld_library_path_strips_cargo_dirs_preserves_user_dirs() {
+        let raw = "/opt/cuda/lib64:/mnt/c/repo/target/debug/build/aws-lc-sys-123/out:/mnt/c/repo/target/debug:/mnt/c/repo/target/debug/deps:/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib:/usr/local/lib";
+        assert_eq!(
+            sanitize_cargo_ld_library_path(raw).as_deref(),
+            Some("/opt/cuda/lib64:/usr/local/lib")
+        );
+
+        let cargo_only = "/mnt/c/repo/target/debug/deps:/home/user/.rustup/toolchains/stable/lib";
+        assert_eq!(sanitize_cargo_ld_library_path(cargo_only), None);
     }
 }
