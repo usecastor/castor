@@ -24,6 +24,13 @@ use crate::task::semaphore::pid_alive;
 /// Embedded single-file workbench frontend (compiled directly into the binary).
 pub const TRACE_HTML: &str = include_str!("trace.html");
 
+fn mtime_ms(meta: &fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+}
+
 // ---------------------------------------------------------------------------
 // Wire Models
 // ---------------------------------------------------------------------------
@@ -212,16 +219,7 @@ pub fn read_recent_tasks(state: &StateDir, limit: usize) -> (Vec<TaskSummary>, u
         }
 
         let meta = entry.metadata().ok();
-        let mtime = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .map_err(std::io::Error::other)
-                    .ok()
-            })
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let mtime = meta.as_ref().and_then(mtime_ms).unwrap_or(0);
         let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
 
         if let Some(cached) = dir_cache.records.get(&path)
@@ -589,12 +587,7 @@ async fn poll_handler(
             .or_else(|| {
                 find_task_file(&state, req_id).and_then(|p| {
                     let m = p.metadata().ok()?;
-                    let mtime = m
-                        .modified()
-                        .ok()?
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()?
-                        .as_millis() as u64;
+                    let mtime = mtime_ms(&m)?;
                     let raw = fs::read_to_string(&p).ok()?;
                     let val: Value = serde_json::from_str(&raw).ok()?;
                     let pid = val.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
@@ -651,11 +644,7 @@ async fn poll_handler(
         let ev_path = state.sessions().join(sess_id).join("events.jsonl");
         if let Ok(meta) = ev_path.metadata() {
             size = meta.len();
-            if let Ok(dur) = meta.modified().and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .map_err(std::io::Error::other)
-            }) {
-                let ev_mtime = dur.as_millis() as u64;
+            if let Some(ev_mtime) = mtime_ms(&meta) {
                 mtime = mtime.max(ev_mtime);
             }
         }
@@ -902,10 +891,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let state = StateDir::new(&root);
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now_ms = crate::platform::now_epoch_ms();
 
         // "old" was dispatched first but is the most recently *touched* on disk
         // (simulating a reaper/update that just rewrote it). "new" was dispatched

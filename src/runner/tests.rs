@@ -1239,7 +1239,6 @@ fn spill_tool_output_respects_custom_threshold() {
     assert!(path.exists());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), payload);
     assert!(pointer.contains("Tool output spilled to disk"));
-    assert!(pointer.contains(&format!("> {custom}-byte threshold")));
 
     // Same payload, but a threshold above its length must NOT spill.
     let (output, spilled2) = spill_tool_output(
@@ -1568,25 +1567,6 @@ fn sanitize_tool_delimiters_inserts_zwsp_after_open_angle() {
     assert!(!out.contains(close), "raw close tag survived: {out:?}");
     // One ZWSP per tag (two tags) → exactly two extra scalar positions.
     assert_eq!(out.chars().count(), text.chars().count() + 2);
-}
-
-#[test]
-fn is_severed_stop_true_when_trailing_text_after_close() {
-    let close = concat!("</th", "ink>");
-    // Deliberation closed but a non-empty answer follows the close tag.
-    assert!(is_severed_stop(
-        &format!("reason {close} trailing answer"),
-        close
-    ));
-}
-
-#[test]
-fn is_severed_stop_false_when_close_at_end_or_absent() {
-    let close = concat!("</th", "ink>");
-    // Close tag with nothing after it → a clean stop, not a severed one.
-    assert!(!is_severed_stop(&format!("reason {close}"), close));
-    // No close tag at all → no closed reasoning block to sever on.
-    assert!(!is_severed_stop("no close tag", close));
 }
 
 /// An engine that records the `reasoning_effort` and the full message

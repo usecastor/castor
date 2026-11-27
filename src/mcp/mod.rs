@@ -82,10 +82,7 @@ pub struct ServerParams {
 }
 
 fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::platform::now_epoch_ms()
 }
 
 /// Valid reasoning-effort tiers for the configured local serving engine
@@ -344,11 +341,20 @@ impl CastorMcpServer {
 
                         if let Some(r) = rec {
                             match r.status {
-                                crate::task::registry::TaskStatus::Completed => {
+                                crate::task::registry::TaskStatus::Completed
+                                | crate::task::registry::TaskStatus::CompletedWithSalvage => {
                                     let out = r.reason.unwrap_or_else(|| {
                                         "Task completed successfully.".to_string()
                                     });
                                     return CallToolResult::success(vec![ContentBlock::text(out)]);
+                                }
+                                crate::task::registry::TaskStatus::RejectedDecomposition => {
+                                    let err = r.reason.unwrap_or_else(|| {
+                                        "Task rejected by decomposition gatekeeper.".to_string()
+                                    });
+                                    return CallToolResult::error(vec![ContentBlock::text(
+                                        format!("Decomposition rejected: {err}"),
+                                    )]);
                                 }
                                 crate::task::registry::TaskStatus::Failed => {
                                     let err =
@@ -391,6 +397,7 @@ impl CastorMcpServer {
              > [!TIP]\n\
              > **Castor Engine Status: ACTIVELY EXECUTING**\n\
              > Task `{task_id}` dispatched to background worker.\n\
+             - **CLI Wait**: `castor wait {task_id}`\n\
              - **Wait Command**: `{wait_cmd_win}` (WSL: `{wait_cmd_wsl}`)\n\
              - **Status Command**: `{status_cmd}`"
         );
@@ -487,17 +494,21 @@ impl CastorMcpServer {
                 };
                 let status_port = loaded.config.ports.status;
                 let text = match rec.status {
-                    crate::task::registry::TaskStatus::Completed => {
+                    crate::task::registry::TaskStatus::Completed
+                    | crate::task::registry::TaskStatus::CompletedWithSalvage => {
                         format!(
-                            "[task] id={} status=completed\n{}",
+                            "[task] id={} status={}\n{}",
                             rec.id,
+                            rec.status,
                             rec.reason.as_deref().unwrap_or("Task completed.")
                         )
                     }
-                    crate::task::registry::TaskStatus::Failed => {
+                    crate::task::registry::TaskStatus::Failed
+                    | crate::task::registry::TaskStatus::RejectedDecomposition => {
                         format!(
-                            "[task] id={} status=failed\nReason: {}",
+                            "[task] id={} status={}\nReason: {}",
                             rec.id,
+                            rec.status,
                             rec.reason.as_deref().unwrap_or("Unknown failure.")
                         )
                     }
@@ -513,7 +524,8 @@ impl CastorMcpServer {
                             text.push_str(&live);
                         }
                         text.push_str(&format!(
-                            "\nWait (Windows): {wait_win}\nWait (WSL): {wait_wsl}"
+                            "\nWait (CLI): castor wait {}\nWait (Windows): {wait_win}\nWait (WSL): {wait_wsl}",
+                            rec.id
                         ));
                         text
                     }
@@ -585,6 +597,8 @@ impl CastorMcpServer {
                      - total_sessions: {}\n\
                      - total_turns: {}\n\
                      - total_tasks_completed: {}\n\
+                     - total_tasks_salvaged: {}\n\
+                     - total_tasks_rejected_decomposition: {}\n\
                      - total_tasks_failed: {}\n\
                      - total_tasks_cancelled: {}\n\
                      - total_task_execution_ms: {}\n\
@@ -600,6 +614,8 @@ impl CastorMcpServer {
                     stats.total_sessions,
                     stats.total_turns,
                     stats.total_tasks_completed,
+                    stats.total_tasks_salvaged,
+                    stats.total_tasks_rejected_decomposition,
                     stats.total_tasks_failed,
                     stats.total_tasks_cancelled,
                     stats.total_task_execution_ms,
@@ -755,10 +771,7 @@ pub fn format_live_turn_status(
     state: &StateDir,
     rec: &crate::task::registry::TaskRecord,
 ) -> Option<String> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let now_ms = crate::platform::now_epoch_ms();
     let start_ms = rec.started_at.unwrap_or(rec.created_at);
     let elapsed_s = now_ms.saturating_sub(start_ms) / 1000;
 

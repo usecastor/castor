@@ -224,10 +224,9 @@ impl FsExecutor {
             };
             let b64 = base64_encode(&bytes);
             return Ok(format!(
-                "[IMAGE_ATTACHMENT:data:{mime};base64,{b64}:path:{}]\nSuccessfully loaded image file '{}' ({} bytes) for visual inspection.",
+                "[IMAGE_ATTACHMENT:data:{mime};base64,{b64}:path:{}]\nSuccessfully loaded image file '{}' for visual inspection.",
                 resolved.display(),
-                resolved.display(),
-                bytes.len()
+                resolved.display()
             ));
         } else {
             sandbox::check_binary(&resolved)?;
@@ -346,10 +345,11 @@ impl FsExecutor {
         }
 
         self.atomic_write(&resolved, content)?;
+        let lines = content.lines().count();
         Ok(format!(
-            "Wrote {} bytes to {}",
-            content.len(),
-            resolved.display()
+            "Successfully wrote {} ({} lines)",
+            resolved.display(),
+            lines
         ))
     }
 
@@ -400,52 +400,310 @@ impl FsExecutor {
         let not_found_msg = |path: &str| {
             format!(
                 "Target content not found in file: {path}. \
-                 Re-read the file with read_file around the target lines to refresh content before retrying."
+                 Verify the exact lines and relative indentation with read_file before retrying."
             )
         };
 
-        let (effective_target, local_style) = if original.contains(target) {
-            (target.to_string(), line_ending_style(target))
+        // Tier 1: Exact substring match (including CRLF/LF variations)
+        let exact_candidate = if original.contains(target) {
+            Some((target.to_string(), line_ending_style(target)))
         } else if crlf_target != target && original.contains(&crlf_target) {
-            (crlf_target, Some("crlf"))
+            Some((crlf_target, Some("crlf")))
         } else if lf_target != target && original.contains(&lf_target) {
-            (lf_target, Some("lf"))
+            Some((lf_target, Some("lf")))
         } else {
-            return Err(FsError::EditError(not_found_msg(path)));
+            None
         };
 
-        let count = original.matches(&effective_target).count();
-        if count == 0 {
-            return Err(FsError::EditError(not_found_msg(path)));
-        }
-        if count > 1 && !replace_all {
-            return Err(FsError::EditError(format!(
-                "AmbiguousTargetError: target_content found {count} times in file: {path}. \
-                 Provide a longer unique target or pass replace_all: true. No write performed."
-            )));
-        }
-
-        let effective_replacement = normalize_line_endings(replacement, local_style);
-        let updated = if replace_all {
-            original.replace(&effective_target, &effective_replacement)
-        } else {
-            original.replacen(&effective_target, &effective_replacement, 1)
-        };
-
-        // AST gate: when the `ast` feature is enabled, parse the fully-rewritten
-        // content in memory before committing it to disk. If the resolved
-        // grammar flags an ERROR/UNDEFINED node, the write is refused and the
-        // file is left byte-identical. Without the feature, `edit_file` performs
-        // the plain exact-substring replacement only (no compile, no AST call).
-        #[cfg(feature = "ast")]
-        if let Err(e) = super::ast::validate_file_syntax(&resolved, &updated) {
-            let detail = match e {
-                super::ast::AstError::SyntaxFailure(detail) => detail,
-                other => other.to_string(),
+        let (updated, count, effective_target, effective_replacement) = if let Some((
+            eff_target,
+            local_style,
+        )) = exact_candidate
+        {
+            let matches: Vec<usize> = original
+                .match_indices(&eff_target)
+                .map(|(idx, _)| idx)
+                .collect();
+            let count = matches.len();
+            if count == 0 {
+                return Err(FsError::EditError(not_found_msg(path)));
+            }
+            if count > 1 && !replace_all {
+                let candidate_lines: Vec<String> = matches
+                    .iter()
+                    .map(|idx| (original[..*idx].matches('\n').count() + 1).to_string())
+                    .collect();
+                return Err(FsError::EditError(format!(
+                    "AmbiguousTargetError: target_content found {count} times in file: {path} (candidate lines: {}). \
+                     Provide a longer unique target or pass replace_all: true. No write performed.",
+                    candidate_lines.join(", ")
+                )));
+            }
+            let effective_replacement = normalize_line_endings(replacement, local_style);
+            let updated = if replace_all {
+                original.replace(&eff_target, &effective_replacement)
+            } else {
+                original.replacen(&eff_target, &effective_replacement, 1)
             };
-            return Err(FsError::EditError(format!(
-                "SyntaxValidationError: replacement introduces syntax errors in {path}. No write performed. {detail}"
-            )));
+            (updated, count, eff_target, effective_replacement)
+        } else {
+            // Tier 2 & Tier 3: Resilient line-based matching (trailing whitespace & relative indentation alignment)
+            let target_lines: Vec<&str> = target.lines().collect();
+            if target_lines.is_empty() {
+                return Err(FsError::EditError("target_content cannot be empty".into()));
+            }
+
+            struct FileLine {
+                line_no: usize,
+                byte_start: usize,
+                byte_end: usize,
+                content: String,
+            }
+            let mut file_lines = Vec::new();
+            let mut offset = 0;
+            for (i, line) in original.split_inclusive('\n').enumerate() {
+                let start = offset;
+                let end = start + line.len();
+                file_lines.push(FileLine {
+                    line_no: i + 1,
+                    byte_start: start,
+                    byte_end: end,
+                    content: line.to_string(),
+                });
+                offset = end;
+            }
+            if offset < original.len() {
+                file_lines.push(FileLine {
+                    line_no: file_lines.len() + 1,
+                    byte_start: offset,
+                    byte_end: original.len(),
+                    content: original[offset..].to_string(),
+                });
+            }
+
+            let k = target_lines.len();
+            if file_lines.len() < k {
+                return Err(FsError::EditError(not_found_msg(path)));
+            }
+
+            fn indent_to_spaces(s: &str) -> String {
+                s.replace('\t', "    ")
+            }
+
+            fn compute_signature(lines: &[&str]) -> (usize, Vec<Option<(usize, String)>>) {
+                let mut entries: Vec<Option<(usize, String)>> = Vec::with_capacity(lines.len());
+                let mut non_empty_indents = Vec::new();
+
+                for line in lines {
+                    let trimmed = line.trim_end_matches(['\r', '\n', ' ', '\t']);
+                    let content = trimmed.trim_start_matches([' ', '\t']);
+                    if content.is_empty() {
+                        entries.push(None);
+                    } else {
+                        let ws = &trimmed[..trimmed.len() - content.len()];
+                        let ws_spaces = indent_to_spaces(ws);
+                        let indent_len = ws_spaces.len();
+                        non_empty_indents.push(indent_len);
+                        entries.push(Some((indent_len, content.to_string())));
+                    }
+                }
+
+                let min_indent = non_empty_indents.iter().copied().min().unwrap_or(0);
+                let rel_sig = entries
+                    .into_iter()
+                    .map(|opt| {
+                        opt.map(|(indent, content)| (indent.saturating_sub(min_indent), content))
+                    })
+                    .collect();
+                (min_indent, rel_sig)
+            }
+
+            let (target_min_indent, target_sig) = compute_signature(&target_lines);
+
+            struct MatchCandidate {
+                start_line: usize,
+                byte_start: usize,
+                byte_end: usize,
+                win_base_ws: String,
+            }
+
+            let mut candidates = Vec::new();
+
+            for i in 0..=(file_lines.len() - k) {
+                let window = &file_lines[i..i + k];
+                let window_line_strs: Vec<&str> =
+                    window.iter().map(|l| l.content.as_str()).collect();
+                let (_, win_sig) = compute_signature(&window_line_strs);
+
+                if win_sig == target_sig {
+                    let first_non_empty_ws = window_line_strs
+                        .iter()
+                        .find(|l| {
+                            !l.trim_end_matches(['\r', '\n', ' ', '\t'])
+                                .trim_start_matches([' ', '\t'])
+                                .is_empty()
+                        })
+                        .map(|l| {
+                            let trimmed = l.trim_end_matches(['\r', '\n', ' ', '\t']);
+                            let content = trimmed.trim_start_matches([' ', '\t']);
+                            trimmed[..trimmed.len() - content.len()].to_string()
+                        })
+                        .unwrap_or_default();
+
+                    candidates.push(MatchCandidate {
+                        start_line: window[0].line_no,
+                        byte_start: window[0].byte_start,
+                        byte_end: window[k - 1].byte_end,
+                        win_base_ws: first_non_empty_ws,
+                    });
+                }
+            }
+
+            if candidates.is_empty() {
+                return Err(FsError::EditError(not_found_msg(path)));
+            }
+
+            if candidates.len() > 1 && !replace_all {
+                let candidate_lines: Vec<String> = candidates
+                    .iter()
+                    .map(|c| c.start_line.to_string())
+                    .collect();
+                return Err(FsError::EditError(format!(
+                    "AmbiguousTargetError: target_content found {} times in file: {path} (candidate lines: {}). \
+                     Provide a longer unique target or pass replace_all: true. No write performed.",
+                    candidates.len(),
+                    candidate_lines.join(", ")
+                )));
+            }
+
+            let target_first_ws = target_lines
+                .iter()
+                .find(|l| {
+                    !l.trim_end_matches(['\r', '\n', ' ', '\t'])
+                        .trim_start_matches([' ', '\t'])
+                        .is_empty()
+                })
+                .map(|l| {
+                    let trimmed = l.trim_end_matches(['\r', '\n', ' ', '\t']);
+                    let content = trimmed.trim_start_matches([' ', '\t']);
+                    trimmed[..trimmed.len() - content.len()].to_string()
+                })
+                .unwrap_or_default();
+
+            let repl_lines: Vec<&str> = replacement.lines().collect();
+            let target_has_crlf = original.contains("\r\n");
+            let newline_sep = if target_has_crlf { "\r\n" } else { "\n" };
+
+            fn reindent_replacement(
+                repl_lines: &[&str],
+                target_first_ws: &str,
+                target_min_indent: usize,
+                win_base_ws: &str,
+                newline_sep: &str,
+                trailing_newline: bool,
+            ) -> String {
+                let mut out_lines = Vec::new();
+                for line in repl_lines {
+                    let trimmed = line.trim_end_matches(['\r', '\n', ' ', '\t']);
+                    let content = trimmed.trim_start_matches([' ', '\t']);
+                    if content.is_empty() {
+                        out_lines.push(String::new());
+                    } else if !target_first_ws.is_empty() && line.starts_with(target_first_ws) {
+                        let rel = &line[target_first_ws.len()..];
+                        out_lines.push(format!(
+                            "{}{}",
+                            win_base_ws,
+                            rel.trim_end_matches(['\r', '\n'])
+                        ));
+                    } else {
+                        let ws = &trimmed[..trimmed.len() - content.len()];
+                        let ws_spaces = indent_to_spaces(ws);
+                        let rel_indent = ws_spaces.len().saturating_sub(target_min_indent);
+                        let extra_spaces = " ".repeat(rel_indent);
+                        out_lines.push(format!("{}{}{}", win_base_ws, extra_spaces, content));
+                    }
+                }
+                let mut res = out_lines.join(newline_sep);
+                if trailing_newline {
+                    res.push_str(newline_sep);
+                }
+                res
+            }
+
+            let count = candidates.len();
+            let mut updated = original.to_string();
+            let mut last_effective_target = String::new();
+            let mut last_effective_repl = String::new();
+
+            for cand in candidates.iter().rev() {
+                let cand_raw = &original[cand.byte_start..cand.byte_end];
+                let trailing_newline = cand_raw.ends_with('\n');
+                let reindented = reindent_replacement(
+                    &repl_lines,
+                    &target_first_ws,
+                    target_min_indent,
+                    &cand.win_base_ws,
+                    newline_sep,
+                    trailing_newline,
+                );
+
+                updated.replace_range(cand.byte_start..cand.byte_end, &reindented);
+                last_effective_target = cand_raw.to_string();
+                last_effective_repl = reindented;
+            }
+
+            (updated, count, last_effective_target, last_effective_repl)
+        };
+
+        // AST gate: when the `ast` feature is enabled, parse both the original
+        // and the fully-rewritten content in memory before committing.
+        //
+        // - If the original is already clean, any introduced syntax error is
+        //   rejected (the strict gate): a clean file must not get worse.
+        // - If the original ALREADY has syntax errors, the edit is allowed only
+        //   when it does not *increase* the error count (a fix, or a neutral
+        //   non-worsening change is fine); an edit that adds MORE errors is
+        //   rejected with a SyntaxValidationError. This lets already-broken
+        //   files be incrementally repaired instead of being locked behind a
+        //   full-file fix.
+        //
+        // Without the feature, `edit_file` performs the plain exact-substring
+        // replacement only (no compile, no AST call).
+        #[cfg(feature = "ast")]
+        {
+            let original_clean = super::ast::validate_file_syntax(&resolved, &original).is_ok();
+
+            if original_clean {
+                // Strict gate: a clean file must stay clean.
+                if let Err(e) = super::ast::validate_file_syntax(&resolved, &updated) {
+                    let detail = match e {
+                        super::ast::AstError::SyntaxFailure(detail) => detail,
+                        other => other.to_string(),
+                    };
+                    return Err(FsError::EditError(format!(
+                        "SyntaxValidationError: replacement introduces syntax errors in {path}. No write performed. {detail}"
+                    )));
+                }
+            } else if let Some(orig_errs) = super::ast::count_syntax_errors(&resolved, &original) {
+                // The original is already broken. Count errors before and
+                // after; allow the edit only if it does not make things worse.
+                if let Some(new_errs) = super::ast::count_syntax_errors(&resolved, &updated)
+                    && new_errs > orig_errs
+                {
+                    let detail = match super::ast::validate_file_syntax(&resolved, &updated) {
+                        Err(e) => match e {
+                            super::ast::AstError::SyntaxFailure(detail) => detail,
+                            other => other.to_string(),
+                        },
+                        Ok(()) => {
+                            "updated content has more syntax errors than the original".to_string()
+                        }
+                    };
+                    return Err(FsError::EditError(format!(
+                        "SyntaxValidationError: replacement worsens syntax errors in {path} (original {orig_errs} -> updated {new_errs}). No write performed. {detail}"
+                    )));
+                }
+            }
         }
 
         self.atomic_write(&resolved, &updated)?;
@@ -1617,6 +1875,70 @@ mod tests {
         assert!(err.to_string().contains("SyntaxValidationError"));
         assert_eq!(fs::read_to_string(&go_file).unwrap(), go_orig);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "ast")]
+    #[test]
+    fn edit_file_allows_non_worsening_edit_on_broken_rust() {
+        // An already-broken file (1 syntax error) may be edited as long as the
+        // edit does not increase the error count. Fixing the one broken line
+        // (1 -> 0) must be allowed and committed.
+        let root = test_root("edit_broken_fix");
+        let file = root.join("lib.rs");
+        let broken = "fn a() {\n    let x = 1;\n}\nfn b() {\n    let y = ;\n}\n";
+        fs::write(&file, broken).unwrap();
+        let ex = executor(&root);
+
+        let out = ex
+            .edit_file("lib.rs", "let y = ;", "let y = 2;", false)
+            .unwrap();
+        assert!(out.contains("Replaced 1 occurrence(s)"), "{out}");
+        let after = fs::read_to_string(&file).unwrap();
+        assert!(
+            after.contains("let y = 2;"),
+            "fix must be committed: {after}"
+        );
+        assert!(
+            !after.contains("let y = ;"),
+            "broken line must be gone: {after}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "ast")]
+    #[test]
+    fn edit_file_rejects_more_errors_on_broken_rust() {
+        // An already-broken file (1 syntax error) must be refused when the edit
+        // adds MORE errors (1 -> 2): the file is left byte-identical and the
+        // error is labelled SyntaxValidationError, reporting both counts.
+        let root = test_root("edit_broken_worsen");
+        let file = root.join("lib.rs");
+        let broken = "fn a() {\n    let x = 1;\n}\nfn b() {\n    let y = ;\n}\n";
+        fs::write(&file, broken).unwrap();
+        let ex = executor(&root);
+
+        let err = ex
+            .edit_file("lib.rs", "let x = 1;", "let x = ;", false)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, FsError::EditError(_)),
+            "expected an EditError, got {err:?}"
+        );
+        assert!(
+            msg.contains("SyntaxValidationError"),
+            "error must be labelled SyntaxValidationError, got: {msg}"
+        );
+        assert!(
+            msg.contains("No write performed"),
+            "error must state that no write was performed, got: {msg}"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            broken,
+            "file must be byte-identical after a refused edit"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

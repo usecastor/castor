@@ -70,6 +70,20 @@ pub enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Wait for a background task to complete (long-poll HTTP with disk fallback)
+    Wait {
+        /// Task ID to wait for
+        task_id: String,
+        /// Maximum wait time in seconds (default: 3600)
+        #[arg(long, default_value = "3600")]
+        timeout_s: u64,
+        /// Override the state dir root
+        #[arg(long)]
+        state_dir: Option<String>,
+        /// Override the status server port
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Run the interactive Castor Trace visualizer web server
     Trace {
         /// Override the state dir root
@@ -361,10 +375,7 @@ fn fmt_verdict(v: &WatchdogVerdict) -> String {
 
 /// Current wall-clock time as epoch milliseconds.
 fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::platform::now_epoch_ms()
 }
 
 /// Run the `server` subcommand against the engine lifecycle.
@@ -388,17 +399,13 @@ pub async fn run_server(
     match action {
         "status" => {
             if engine::backend::Backend::from_config(config) == engine::backend::Backend::LlamaCpp {
-                // llama.cpp serves a pinned model: the readiness gate is the
-                // canary, and the id is the configured one (llama.cpp has no
-                // adaptive auto-bind).
                 return match lc.readiness().await {
-                    Ok(()) => Ok((
-                        format!(
-                            "healthy: model {} listed",
-                            config.model.as_deref().unwrap_or("auto")
-                        ),
-                        true,
-                    )),
+                    Ok(()) => {
+                        let detected = lc.canary_model().await.unwrap_or_else(|| {
+                            config.model.clone().unwrap_or_else(|| "auto".into())
+                        });
+                        Ok((format!("healthy: model {detected} listed"), true))
+                    }
                     Err(e) => Ok((format!("unhealthy: {e}"), false)),
                 };
             }
@@ -626,7 +633,7 @@ pub async fn run_with(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Status { state_dir, port } => {
             let loaded = config::load().map_err(|e| format!("config: {e}"))?;
             let state = match state_dir {
-                Some(dir) => state::StateDir::new(dir),
+                Some(dir) => state::StateDir::new(crate::platform::to_host_path(dir)),
                 None => state::StateDir::from_config(&loaded.config),
             };
             let _ = state.ensure();
@@ -641,6 +648,22 @@ pub async fn run_with(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let res = server.clone().serve(port).await;
             server.release_lock();
             res?;
+        }
+        Command::Wait {
+            task_id,
+            timeout_s,
+            state_dir,
+            port,
+        } => {
+            let loaded = config::load().map_err(|e| format!("config: {e}"))?;
+            let state = match state_dir {
+                Some(dir) => state::StateDir::new(crate::platform::to_host_path(dir)),
+                None => state::StateDir::from_config(&loaded.config),
+            };
+            let body = task::wait::run_wait_cli(&state, &task_id, timeout_s, port)
+                .await
+                .map_err(|e| format!("wait: {e}"))?;
+            println!("{body}");
         }
         Command::Trace { state_dir, port } => {
             let loaded = config::load().map_err(|e| format!("config: {e}"))?;
@@ -829,10 +852,7 @@ pub async fn run_with(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(raw) = std::fs::read_to_string(&task_file)
                     && let Ok(mut rec) = serde_json::from_str::<serde_json::Value>(&raw)
                 {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
+                    let now = now_epoch_ms();
                     rec["status"] = serde_json::json!("failed");
                     rec["reason"] = serde_json::json!(err_msg);
                     rec["ended_at"] = serde_json::json!(now);

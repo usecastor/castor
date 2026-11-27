@@ -12,6 +12,8 @@
 pub mod ast;
 pub mod extensions;
 pub mod fs;
+#[cfg(feature = "ast")]
+pub mod graph;
 #[cfg(feature = "paper")]
 pub mod paper;
 pub mod sandbox;

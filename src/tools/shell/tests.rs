@@ -511,6 +511,175 @@ mod system_dir_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Head+tail semantic truncation tests (Stage 1)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod head_tail_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Build a numbered one-line-per-iteration text block of exactly `n` lines.
+    fn numbered(n: usize, tag: &str) -> String {
+        (1..=n)
+            .map(|i| format!("{tag} {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Collect all lines of a truncated block as a set, so we can prove which
+    /// original lines survive and which were elided without substring ambiguity.
+    fn line_set(block: &str) -> HashSet<String> {
+        block.lines().map(str::to_string).collect()
+    }
+
+    /// Shared assertions that a head+tail truncation kept the head and tail while
+    /// eliding the middle: `kept_lines` (total lines incl. the marker) == head+1+tail,
+    /// the first/last head and first/last tail lines are present verbatim, and a
+    /// representative set of middle lines are absent.
+    fn assert_head_tail(
+        block: &str,
+        tag: &str,
+        label: &str,
+        head: usize,
+        tail: usize,
+        total_original: usize,
+    ) {
+        let lines: Vec<&str> = block.lines().collect();
+        let elided = total_original - head - tail;
+        assert_eq!(
+            lines.len(),
+            head + 1 + tail,
+            "expected head+marker+tail lines for {label}"
+        );
+        // Head block intact: first and last kept head lines.
+        assert_eq!(lines[0], format!("{tag} 1"), "head first line must survive");
+        assert_eq!(
+            lines[head - 1],
+            format!("{tag} {head}"),
+            "last head line must survive"
+        );
+        // Elision marker is exactly where head and tail meet.
+        assert_eq!(
+            lines[head],
+            format!("[... {elided} {label} lines omitted ...]"),
+            "elision marker must be correct"
+        );
+        // Tail block intact: first and last kept tail lines.
+        // First kept tail line is original (total_original - tail + 1).
+        let first_tail = total_original - tail + 1;
+        assert_eq!(
+            lines[head + 1],
+            format!("{tag} {first_tail}"),
+            "first tail line must survive"
+        );
+        assert_eq!(
+            lines[lines.len() - 1],
+            format!("{tag} {total_original}"),
+            "last tail line must survive"
+        );
+
+        // The elided middle (original lines mid_start..=mid_end) is gone.
+        let mid_start = head + 1;
+        let mid_end = total_original - tail;
+        let set = line_set(block);
+        for probe in [mid_start, mid_start + 1, (mid_start + mid_end) / 2, mid_end] {
+            assert!(
+                !set.contains(&format!("{tag} {probe}")),
+                "middle line {tag} {probe} must have been elided"
+            );
+        }
+    }
+
+    // -- success (exit 0) ---------------------------------------------------
+
+    #[test]
+    fn success_stdout_head_and_tail_survive_middle_omitted() {
+        // 100 lines > budget 60 (head 25 + tail 35) → 40 elided.
+        let stdout = numbered(100, "out");
+        let (out, _, trunc) = semantic_truncate_output(&stdout, "", 0);
+        assert!(trunc, "stdout over budget must be truncated");
+        assert_head_tail(&out, "out", "stdout", 25, 35, 100);
+    }
+
+    #[test]
+    fn success_stderr_head_and_tail_survive_middle_omitted() {
+        // 200 lines > budget 100 (head 40 + tail 60) → 100 elided.
+        let stderr = numbered(200, "err");
+        let (_, err, trunc) = semantic_truncate_output("", &stderr, 0);
+        assert!(trunc, "stderr over budget must be truncated");
+        assert_head_tail(&err, "err", "stderr", 40, 60, 200);
+    }
+
+    // -- error (non-zero exit) ----------------------------------------------
+
+    #[test]
+    fn error_stdout_head_and_tail_survive_middle_omitted() {
+        // 150 lines > budget 120 (head 40 + tail 80) → 30 elided.
+        let stdout = numbered(150, "out");
+        let (out, _, trunc) = semantic_truncate_output(&stdout, "", 1);
+        assert!(trunc, "error stdout over budget must be truncated");
+        assert_head_tail(&out, "out", "stdout", 40, 80, 150);
+    }
+
+    #[test]
+    fn error_stderr_head_and_tail_survive_middle_omitted() {
+        // 150 lines > budget 120 (head 40 + tail 80) → 30 elided.
+        let stderr = numbered(150, "err");
+        let (_, err, trunc) = semantic_truncate_output("", &stderr, 1);
+        assert!(trunc, "error stderr over budget must be truncated");
+        assert_head_tail(&err, "err", "stderr", 40, 80, 150);
+    }
+
+    // -- short / at-budget outputs are untouched ----------------------------
+
+    #[test]
+    fn short_outputs_below_threshold_untouched() {
+        // Well under every budget → both streams byte-identical, not truncated.
+        let (o, e, t) = semantic_truncate_output("a\nb\nc", "x\ny", 0);
+        assert!(!t);
+        assert_eq!(o, "a\nb\nc");
+        assert_eq!(e, "x\ny");
+
+        // Exactly at the success budgets (stdout 25+35=60, stderr 40+60=100):
+        // no elision and `truncated == false`.
+        let stdout = numbered(60, "o");
+        let stderr = numbered(100, "e");
+        let (o, e, t) = semantic_truncate_output(&stdout, &stderr, 0);
+        assert!(!t, "at-budget success output must not be truncated");
+        assert_eq!(o, stdout);
+        assert_eq!(e, stderr);
+
+        // Exactly at the error budgets (both 40+80=120) → untouched.
+        let stdout = numbered(120, "o");
+        let stderr = numbered(120, "e");
+        let (o, e, t) = semantic_truncate_output(&stdout, &stderr, 3);
+        assert!(!t, "at-budget error output must not be truncated");
+        assert_eq!(o, stdout);
+        assert_eq!(e, stderr);
+    }
+
+    // -- shared helper direct behavior --------------------------------------
+
+    #[test]
+    fn truncate_head_tail_helper_omits_middle_only() {
+        // Over budget: head + marker + tail, middle elided.
+        let text = numbered(100, "l");
+        let (out, truncated) = truncate_head_tail(&text, 25, 35, "stdout");
+        assert!(truncated);
+        assert_head_tail(&out, "l", "stdout", 25, 35, 100);
+        assert!(out.starts_with("l 1\n"));
+        assert!(out.ends_with("l 100"));
+
+        // At or below the 25 + 35 budget: returned unchanged, not truncated.
+        let small = numbered(10, "l");
+        let (out, truncated) = truncate_head_tail(&small, 25, 35, "stdout");
+        assert!(!truncated);
+        assert_eq!(out, small);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Executor tests
 // ---------------------------------------------------------------------------
 
@@ -573,6 +742,35 @@ mod run_tests {
         assert_eq!(out.exit_code, 124);
         assert!(out.stderr.contains("timed out"));
         assert!(out.duration_ms < 5000.0, "duration was {}", out.duration_ms);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timeout_returns_promptly_and_preserves_output_with_grandchild_pipe_holders() {
+        let dir = tmp_dir("timeout_pipe_drain");
+        let cmd = "echo PRE_TIMEOUT_STDOUT; echo PRE_TIMEOUT_STDERR >&2; sleep 30 | cat";
+        let out = run(cmd, &dir, Duration::from_millis(300)).unwrap();
+        assert_eq!(out.exit_code, 124);
+        assert!(
+            out.stdout.contains("PRE_TIMEOUT_STDOUT"),
+            "pre-timeout stdout must be preserved: {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("PRE_TIMEOUT_STDERR"),
+            "pre-timeout stderr must be preserved: {:?}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("[Command timed out after 300ms]"),
+            "missing timeout marker: {:?}",
+            out.stderr
+        );
+        assert!(
+            out.duration_ms < 3000.0,
+            "timed-out pipeline must return promptly (<3000ms), took {}ms",
+            out.duration_ms
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

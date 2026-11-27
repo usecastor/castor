@@ -22,6 +22,7 @@ api_key.txt
 .git-credentials
 
 # Large binaries, models & pre-compiled distributions
+.engines/
 llama-cpp/
 models/
 *.gguf

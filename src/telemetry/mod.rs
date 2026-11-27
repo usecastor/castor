@@ -94,11 +94,7 @@ pub(crate) fn iso_from_ms(ms: u64) -> String {
 
 /// Current time as an ISO-8601 UTC string.
 fn now_iso() -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    iso_from_ms(ms)
+    iso_from_ms(crate::platform::now_epoch_ms())
 }
 
 /// Hall-of-Fame extremes across the scanned events: the single most
@@ -140,7 +136,21 @@ pub struct Stats {
     pub total_cache_eligible_prompt_tokens: u64,
     pub total_turns: u64,
     pub total_sessions: u64,
+    /// Pure completions: tasks that finished cleanly with no salvage. Tasks
+    /// that ended via the reasoning-budget-exhausted salvage pass are counted
+    /// in `total_tasks_salvaged` (not here), so this figure is never inflated
+    /// by salvaged completions.
     pub total_tasks_completed: u64,
+    /// Tasks finished via the reasoning-ceiling salvage pass
+    /// (`completed_with_salvage`): the deliverable was salvaged, but the task
+    /// did not complete cleanly. Tracked separately from pure completions.
+    #[serde(default)]
+    pub total_tasks_salvaged: u64,
+    /// Tasks whose decomposition was rejected (`rejected_decomposition`):
+    /// never executed. Kept out of `total_tasks_failed` so failures remain a
+    /// clean measure of executions that went wrong.
+    #[serde(default)]
+    pub total_tasks_rejected_decomposition: u64,
     pub total_tasks_failed: u64,
     pub total_tasks_cancelled: u64,
     /// Total task execution time in ms (sum of `ended_at - started_at` over
@@ -237,6 +247,8 @@ impl Default for Stats {
             total_turns: 0,
             total_sessions: 0,
             total_tasks_completed: 0,
+            total_tasks_salvaged: 0,
+            total_tasks_rejected_decomposition: 0,
             total_tasks_failed: 0,
             total_tasks_cancelled: 0,
             total_task_execution_ms: 0,

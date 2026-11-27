@@ -325,7 +325,7 @@ impl EngineClient {
         let mut completion_tokens: Option<u64> = None;
         let mut reasoning_tokens: Option<u64> = None;
         let mut tool_calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
-        let mut detector = crate::proxy::sanitize::RepetitionDetector::new();
+        let mut detector = crate::engine::sanitize::RepetitionDetector::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| EngineError::Sse(e.to_string()))?;
@@ -333,62 +333,47 @@ impl EngineClient {
             while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
                 let line = String::from_utf8_lossy(&line);
-                let Some(payload) = line.trim().strip_prefix("data:") else {
-                    continue;
+                let frame = match crate::engine::sanitize::parse_sse_line(&line) {
+                    crate::engine::sanitize::SseLine::Ignore => continue,
+                    crate::engine::sanitize::SseLine::Done => {
+                        let rc = if reasoning_content.trim().is_empty() {
+                            None
+                        } else {
+                            Some(reasoning_content)
+                        };
+                        return Ok(assemble(
+                            &content,
+                            rc,
+                            tool_calls,
+                            finish_reason,
+                            ttft,
+                            prompt_tokens,
+                            cached_tokens,
+                            completion_tokens,
+                            reasoning_tokens,
+                            t0,
+                        ));
+                    }
+                    crate::engine::sanitize::SseLine::Malformed(e) => {
+                        return Err(EngineError::Sse(e));
+                    }
+                    crate::engine::sanitize::SseLine::Json(frame) => frame,
                 };
-                let payload = payload.trim();
-                if payload == "[DONE]" {
-                    let rc = if reasoning_content.trim().is_empty() {
-                        None
-                    } else {
-                        Some(reasoning_content)
-                    };
-                    return Ok(assemble(
-                        &content,
-                        rc,
-                        tool_calls,
-                        finish_reason,
-                        ttft,
-                        prompt_tokens,
-                        cached_tokens,
-                        completion_tokens,
-                        reasoning_tokens,
-                        t0,
-                    ));
-                }
-                if payload.is_empty() {
-                    continue;
-                }
-                let frame: Value =
-                    serde_json::from_str(payload).map_err(|e| EngineError::Sse(e.to_string()))?;
                 if let Some(error) = frame.get("error") {
                     return Err(EngineError::Sse(format!("upstream error: {error}")));
                 }
                 if let Some(usage) = frame.get("usage") {
-                    // Engine-reported usage chunk: completion tokens take
-                    // precedence over the local char estimate; prompt tokens
-                    // are carried through for the session ledger.
-                    if let Some(c) = usage.get("completion_tokens").and_then(Value::as_u64) {
+                    let parsed = parse_usage_tokens(usage);
+                    if let Some(c) = parsed.completion_tokens {
                         completion_tokens = Some(c);
                     }
-                    if let Some(p) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+                    if let Some(p) = parsed.prompt_tokens {
                         prompt_tokens = Some(p);
                     }
-                    if let Some(r) = usage
-                        .get("completion_tokens_details")
-                        .and_then(|d| d.get("reasoning_tokens"))
-                        .and_then(Value::as_u64)
-                    {
+                    if let Some(r) = parsed.reasoning_tokens {
                         reasoning_tokens = Some(r);
                     }
-                    if let Some(k) = usage
-                        .get("prompt_tokens_details")
-                        .and_then(|d| d.get("cached_tokens"))
-                        .and_then(Value::as_u64)
-                        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
-                        .or_else(|| usage.get("cached_prompt_tokens").and_then(Value::as_u64))
-                        .or_else(|| usage.get("cache_read_tokens").and_then(Value::as_u64))
-                    {
+                    if let Some(k) = parsed.cached_tokens {
                         cached_tokens = Some(k);
                     }
                 }
@@ -537,25 +522,14 @@ impl EngineClient {
                 tool_calls.insert(i, slot);
             }
         }
-        let usage = body.get("usage");
-        let prompt_tokens = usage
-            .and_then(|u| u.get("prompt_tokens"))
-            .and_then(Value::as_u64);
-        let cached_tokens = usage.and_then(|u| {
-            u.get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(Value::as_u64)
-                .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_u64))
-                .or_else(|| u.get("cached_prompt_tokens").and_then(Value::as_u64))
-                .or_else(|| u.get("cache_read_tokens").and_then(Value::as_u64))
-        });
-        let completion_tokens = usage
-            .and_then(|u| u.get("completion_tokens"))
-            .and_then(Value::as_u64);
-        let reasoning_tokens = usage
-            .and_then(|u| u.get("completion_tokens_details"))
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(Value::as_u64);
+        let parsed = body
+            .get("usage")
+            .map(parse_usage_tokens)
+            .unwrap_or_default();
+        let prompt_tokens = parsed.prompt_tokens;
+        let cached_tokens = parsed.cached_tokens;
+        let completion_tokens = parsed.completion_tokens;
+        let reasoning_tokens = parsed.reasoning_tokens;
         let ttft = if content.is_empty() && tool_calls.is_empty() {
             None
         } else {
@@ -586,7 +560,41 @@ impl EngineClient {
     }
 }
 
-fn repetition_loop_err(rep: crate::proxy::sanitize::Repetition) -> EngineError {
+/// Extracted token usage metrics: (prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedUsageTokens {
+    pub prompt_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+}
+
+/// Parse engine token usage metrics supporting 4-level fallback for cached prompt tokens.
+pub fn parse_usage_tokens(usage: &Value) -> ParsedUsageTokens {
+    let prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64);
+    let cached_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
+        .or_else(|| usage.get("cached_prompt_tokens").and_then(Value::as_u64))
+        .or_else(|| usage.get("cache_read_tokens").and_then(Value::as_u64));
+    let completion_tokens = usage.get("completion_tokens").and_then(Value::as_u64);
+    let reasoning_tokens = usage
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("reasoning_tokens").and_then(Value::as_u64));
+
+    ParsedUsageTokens {
+        prompt_tokens,
+        cached_tokens,
+        completion_tokens,
+        reasoning_tokens,
+    }
+}
+
+fn repetition_loop_err(rep: crate::engine::sanitize::Repetition) -> EngineError {
     let preview: String = rep.pattern.chars().take(120).collect();
     EngineError::RepetitionLoop {
         kind: rep.r#type,
@@ -800,6 +808,23 @@ fn assemble(
             Some((final_content.len() / 4).max(1) as u64)
         }
     });
+    let reasoning_tokens = match reasoning_tokens {
+        Some(n) if n > 0 => Some(n),
+        other => {
+            if let Some(rc) = reasoning_content
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+            {
+                let est = (rc.len() / 4).max(1) as u64;
+                let capped = completion_tokens
+                    .filter(|&c| c > 0)
+                    .map_or(est, |c| est.min(c));
+                Some(capped)
+            } else {
+                other
+            }
+        }
+    };
     let tokens_per_sec = tokens.map(|t| t as f64 / total.as_secs_f64());
     Completion {
         content: final_content,
@@ -1542,5 +1567,63 @@ I will list the directory:
             matches!(err, EngineError::RepetitionLoop { .. }),
             "expected RepetitionLoop, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_estimates_reasoning_tokens_when_usage_omits_details() {
+        async fn reasoning_stream_handler() -> axum::response::Response {
+            let reasoning =
+                "Step 1: inspect the telemetry rollup and provider usage parser carefully.";
+            let chunks = vec![
+                axum::body::Bytes::from(format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"delta": {"reasoning_content": reasoning}}]})
+                )),
+                axum::body::Bytes::from(format!(
+                    "data: {}\n\n",
+                    json!({
+                        "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 50, "completion_tokens": 20}
+                    })
+                )),
+                axum::body::Bytes::from("data: [DONE]\n\n"),
+            ];
+            Body::from_stream(stream::iter(chunks).map(Ok::<_, std::io::Error>)).into_response()
+        }
+
+        let app = Router::new().route("/chat/completions", post(reasoning_stream_handler));
+        let base = start(app).await;
+        let client = EngineClient::from_config(&test_config(&base)).unwrap();
+        let comp = client.chat(&[msg()], &[], true, None).await.unwrap();
+        assert_eq!(comp.content, "ok");
+        assert!(comp.reasoning_content.is_some());
+        let rt = comp
+            .metrics
+            .reasoning_tokens
+            .expect("reasoning_tokens must be populated when reasoning_content streamed");
+        assert!(rt > 0 && rt <= 20, "unexpected reasoning_tokens: {rt}");
+    }
+
+    #[test]
+    fn parse_usage_tokens_prefers_details_and_falls_back_to_top_level() {
+        let with_details = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 40,
+            "completion_tokens_details": {"reasoning_tokens": 28}
+        });
+        assert_eq!(parse_usage_tokens(&with_details).reasoning_tokens, Some(28));
+
+        let top_level = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 40,
+            "reasoning_tokens": 15
+        });
+        assert_eq!(parse_usage_tokens(&top_level).reasoning_tokens, Some(15));
+
+        let omitted = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 40
+        });
+        assert_eq!(parse_usage_tokens(&omitted).reasoning_tokens, None);
     }
 }

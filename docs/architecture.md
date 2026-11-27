@@ -40,14 +40,20 @@ In a cloud-only agent, every tool output (reading 20 files, running `cargo test`
 A **pre-execution firewall** that stops compound "mega-prompt" thrashing before it burns
 compute or leases a slot. A **1-forward-pass logit probe** (sub-25 ms on vLLM via `guided_choice`;
 scales with decode speed on llama.cpp) against the serving engine classifies the
-dispatch prompt; the decision rule is:
+dispatch prompt with a strictly binary rule:
 
 ```
 delta_z = logP(OVERLOADED) − logP(ADMIT)
-REJECT  if delta_z > 1.5
+REJECT  if delta_z > 1.2
+ADMIT   otherwise
 ```
 
-Near-tie margins are routed to an advisory review rather than silent admission.
+The margin (`CASTOR_DGI_REJECT_MARGIN`, default `1.2`) was calibrated on a live
+1,053-prompt benchmark (`evals/dgi/dataset.json`): it holds the false-reject rate
+on single-concern `ADMIT` dispatches to ~2.7% while catching ~half of the
+monolithic multi-subsystem `REJECT` class (the remainder are cohesive-but-long
+dispatches the model scores as single-subsystem). The gate injects **no**
+advisory text into the worker prompt — it only decides admit vs. fail-fast.
 **Warm sessions** (continuations of an already-warm context) bypass the probe entirely with
 zero overhead. The probe is **engine-agnostic**: vLLM uses a `guided_choice` single-token
 completion; llama.cpp uses a schema-constrained JSON chat decode. Same decision rule,
@@ -56,10 +62,12 @@ DRY request-builder and verdict-decoder core in [`src/mcp/dgi.rs`](../src/mcp/dg
 ### 2. Zero-Turn Reactive Lifecycle
 
 Tasks exceeding the sync window (default **15 s**, tunable via `CASTOR_SYNC_TIMEOUT_SECS`)
-yield a durable task ID and a long-poll HTTP wait hook:
+yield a durable task ID and a CLI/HTTP long-poll wait hook:
 
 ```bash
-curl -N "http://127.0.0.1:18021/task/<task-id>/wait"
+castor wait <task-id>
+# or HTTP long-poll directly:
+curl -N "http://127.0.0.1:18021/task/<task-id>/wait?timeout_s=3600"
 ```
 
 The cloud supervisor blocks on that URL at **$0 token cost** and wakes reactively the
@@ -87,7 +95,7 @@ A real-time SSE proxy that monitors live model output on `:18022` for degenerate
 - **Repetition circuit breaker**: Halts mid-stream degenerate loops (identical content repeating within a rolling window) before context exhaustion.
 - **Payload guards**: Filters malformed tool and image payloads before they reach the parser.
 
-See [`src/proxy/`](../src/proxy/).
+See [`src/proxy/`](../src/proxy/) and [`src/engine/sanitize.rs`](../src/engine/sanitize.rs).
 
 ### 5. Evolutionary Optimizer (Evo)
 
@@ -139,7 +147,7 @@ Castor registers three stdio MCP tools:
 |---|---|---|
 | `read_file` | core | Read files, PDFs (in-memory text extraction), and images (PNG/JPG/WebP/GIF/BMP) |
 | `write_file` | core | Create or overwrite files within the workspace root |
-| `edit_file` | core | Exact-substring edit with uniqueness checks and atomic tempfile replacement |
+| `edit_file` | core | 4-tier resilient edit matcher (exact, CRLF/LF, whitespace-trimmed, relative-indent alignment) with uniqueness checks and atomic tempfile replacement |
 | `list_dir` | core | Directory listing with optional depth control |
 | `search_code` | core | Deterministic path-filtered literal text search (fixed strings) |
 | `bash` | core | Sandboxed shell with lexical command filter; native `git` and `python3` |

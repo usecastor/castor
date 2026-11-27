@@ -6,6 +6,16 @@
 //! castor __worker <path-to-job-spec.json>
 //! ```
 //!
+//! **Prompt composition (KV prefix stability).** The system prompt is a pure
+//! function of the *workspace* (static persona + `[Workspace]` root + the
+//! deterministic `[Workspace Skeleton]` + the active-skills index) and is
+//! **byte-identical across every prompt and every resumed session** in the same
+//! workspace — that is the warm KV prefix that makes resumed continuations
+//! cache-hit from token 0. The only variable context (the CPG/PPR
+//! retrieved-code block) is built separately and attached to the **user
+//! message**, never the system prompt, so a new prompt never perturbs the
+//! cached prefix.
+//!
 //! The worker:
 //! 1. Loads the [`JobSpec`].
 //! 2. Runs the DGI gatekeeper classification; a rejected dispatch fails
@@ -53,10 +63,7 @@ pub struct JobSpec {
 }
 
 fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::platform::now_epoch_ms()
 }
 
 /// Canonicalize the workspace root by walking up from the provided path
@@ -93,6 +100,13 @@ pub fn find_workspace_root(p: &std::path::Path) -> std::path::PathBuf {
 ///   (a) Static persona, invariants, and tool-routing hierarchy (most stable)
 ///   (b) `[Workspace]` root, then the deterministic `[Workspace Skeleton]`
 ///   (c) The active-skills index (highest churn — skills can vary per dispatch)
+///
+/// **Byte-identical, workspace-deterministic.** This is a pure function of the
+/// workspace's stable shape and the build — *not* of the dispatch prompt or any
+/// per-run context. The CPG/PPR retrieved-code block is **deliberately excluded
+/// here**; it attaches to the user message (see
+/// [`build_user_turn_augmentation`]) so the system prompt stays a 100%
+/// deterministic warm KV prefix that resumed sessions reuse byte-for-byte.
 ///
 /// Extracted from [`run_job_with_engine`] as a pure function of its inputs so
 /// the prefix ordering can be regression-tested without spawning a job.
@@ -143,6 +157,7 @@ Peer Engineering Invariants:\n\
     system_prompt.push_str(&routing);
     system_prompt.push_str(
         "- Verification Discipline: Never claim completion or close a task without running the verification gate and confirming clean output.\n\
+- High-Throughput Batching: Always emit ALL independent tool calls in parallel within a single turn. When exploring, diagnosing, or refactoring, batch your searches and reads together (e.g. issue multiple `read_file` or `search_code` calls in one turn). Never ping-pong single reads or searches sequentially when they can be dispatched concurrently.\n\
 - Security & Authority: Tool refusals tagged `Access denied`, `Execution blocked`, or `binary file` are binding policy decisions, not transient failures or permission requests. Never route around one \u{2014} no `bash`/`cat`/`cp`/`mv`/`tee` substitute, alternative path, symlink, or privilege escalation. If the blocked file or operation is essential to the task, stop that line of work and report the constraint in your final report, naming the exact target and the allowed root or permission that would unblock it, so the Lead Architect / user can adjust the workspace policy deliberately. (If the denial was your own typo \u{2014} a malformed or mistyped in-workspace path \u{2014} correct it and retry; that is fixing your error, not bypassing policy.)",
     );
 
@@ -159,6 +174,41 @@ Peer Engineering Invariants:\n\
         system_prompt.push_str(skills_index);
     }
     system_prompt
+}
+
+/// Build the **variable** Turn-1 augmentation block that is attached to the
+/// **user message** (never the system prompt), so the system prompt stays a
+/// byte-identical warm KV prefix.
+///
+/// The block contains the CPG/PPR retrieved-code context — prompt-specific, so
+/// it must never land in the system prompt. It is computed only when the
+/// workspace-skeleton prefix is enabled; `build_prompt_retrieved_context`
+/// yields an empty string when the `ast` feature is disabled, so this is a
+/// single call path regardless of feature configuration.
+///
+/// Returns an empty string when the CPG context is absent, in which case the
+/// caller uses the raw dispatch prompt untouched (preserving the fresh
+/// `[system, user]` byte shape for zero-invalidation retries).
+///
+/// The DGI gatekeeper is strictly binary ADMIT/REJECT and never injects any
+/// text into the worker prompt: a rejected dispatch fails fast before the
+/// session starts, and an admitted dispatch proceeds with the raw prompt.
+pub fn build_user_turn_augmentation(
+    workspace_root: &std::path::Path,
+    skeleton_enabled: bool,
+    prompt: &str,
+) -> String {
+    let mut aug = String::new();
+
+    // CPG/PPR retrieved-code context (prompt-specific).
+    if skeleton_enabled {
+        let ctx = runner::skeleton::build_prompt_retrieved_context(workspace_root, prompt);
+        if !ctx.is_empty() {
+            aug.push_str(&ctx);
+        }
+    }
+
+    aug
 }
 
 /// Execute a job specification against the real local engine.
@@ -222,8 +272,11 @@ pub async fn run_job_with_engine(
     let max_ctx = config.max_context.unwrap_or(0);
 
     // 1. DGI gatekeeper: classify the dispatch BEFORE committing to a slot
-    //    lease. A rejected or failed probe never holds a lease and fails fast
-    //    with the unadulterated error (no heuristic fallback).
+    //    lease. The gate is strictly binary (ADMIT / REJECT): a rejected or
+    //    failed probe never holds a lease and fails fast with the
+    //    unadulterated error (no heuristic fallback), and an admitted dispatch
+    //    proceeds with the raw prompt — the DGI injects no advisory text into
+    //    the worker prompt.
     if config.base_url.is_some() && config.model.is_some() {
         let dgi = if crate::mcp::dgi::warm_session_bypass(config, state, &spec.session_id) {
             tracing::debug!(
@@ -265,7 +318,11 @@ pub async fn run_job_with_engine(
                  Decompose into a single-concern slice (one subsystem, one verification gate) and re-dispatch."
             );
             let _ = registry
-                .transition(&spec.task_id, TaskStatus::Failed, Some(reject_msg.clone()))
+                .transition(
+                    &spec.task_id,
+                    TaskStatus::RejectedDecomposition,
+                    Some(reject_msg.clone()),
+                )
                 .await;
             return Err(reject_msg);
         }
@@ -298,12 +355,14 @@ pub async fn run_job_with_engine(
 
     // Build the system prompt in strict low-churn -> high-churn KV prefix
     // order (delegated to the pure [`build_worker_system_prompt`] helper so the
-    // ordering is unit-testable).
+    // ordering is unit-testable). The skeleton is the bare, prompt-agnostic
+    // `[Workspace Skeleton]` — a byte-identical, deterministic warm KV prefix
+    // that is a pure function of the workspace's stable top-level shape and the
+    // build, so it is identical across every prompt and every resumed session.
+    // Prompt-specific context (CPG/PPR retrieval) is NOT part of the system
+    // prompt; it attaches to the user message below.
     let skeleton = if config.workspace_skeleton_prefix {
-        // A byte-identical, deterministic `[Workspace Skeleton]` block (a pure
-        // function of the workspace's stable top-level shape) — a warm KV prefix
-        // so 96%+ of the Turn-1 prefix cache hits across concurrent sessions.
-        runner::skeleton::build_workspace_skeleton(std::path::Path::new(&spec.cwd))
+        runner::skeleton::build_workspace_skeleton(&workspace_root)
     } else {
         String::new()
     };
@@ -313,6 +372,32 @@ pub async fn run_job_with_engine(
         &skeleton,
         &skills_index,
     );
+
+    // Build the variable Turn-1 augmentation (CPG/PPR retrieved-code context).
+    // It attaches to the user message — never the system prompt — so the prompt
+    // above stays a 100% deterministic warm KV prefix (byte-identical across
+    // prompts and resumed sessions).
+    let user_aug = build_user_turn_augmentation(
+        &workspace_root,
+        config.workspace_skeleton_prefix,
+        &spec.prompt,
+    );
+    // The user message: the raw prompt when there is no augmentation (preserves
+    // the fresh `[system, user]` byte shape for zero-invalidation retries), or
+    // the raw prompt preceded by the variable context block (with exactly one
+    // blank line separating them) otherwise.
+    let user_prompt = if user_aug.is_empty() {
+        spec.prompt.clone()
+    } else {
+        let mut s = String::with_capacity(user_aug.len() + spec.prompt.len() + 2);
+        s.push_str(&user_aug);
+        if !user_aug.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push('\n');
+        s.push_str(&spec.prompt);
+        s
+    };
 
     // 3. Acquire execution slot (token-budgeted). The pool's total budget is
     //    `max_context`: the unified admission rule caps the *sum* of every
@@ -331,12 +416,12 @@ pub async fn run_job_with_engine(
             let mut candidate = Vec::with_capacity(1 + history.len() + 1);
             candidate.push(runner::messages::msg("system", &system_prompt));
             candidate.extend(history.iter().cloned());
-            candidate.push(runner::messages::msg("user", &spec.prompt));
+            candidate.push(runner::messages::msg("user", &user_prompt));
             let fits_watermark = if max_ctx > 0 {
                 if let Some(exact) = engine.count_tokens(&candidate, &builtin_tools).await {
                     exact <= runner::context::watermark_tokens(max_ctx as usize)
                 } else {
-                    runner::context::should_resume(&history, &spec.prompt, max_ctx as usize)
+                    runner::context::should_resume(&history, &user_prompt, max_ctx as usize)
                 }
             } else {
                 true
@@ -345,7 +430,7 @@ pub async fn run_job_with_engine(
                 init_msgs.extend(history);
             }
         }
-        init_msgs.push(runner::messages::msg("user", &spec.prompt));
+        init_msgs.push(runner::messages::msg("user", &user_prompt));
         if let Some(exact) = engine.count_tokens(&init_msgs, &builtin_tools).await {
             exact.min(u32::MAX as usize) as u32
         } else {
@@ -357,7 +442,7 @@ pub async fn run_job_with_engine(
             };
             let prompt_tokens = runner::context::uncounted_tail_tokens(&[runner::messages::msg(
                 "user",
-                &spec.prompt,
+                &user_prompt,
             )]) as u32;
             prompt_tokens.saturating_add(resumed_tokens)
         }
@@ -467,13 +552,16 @@ pub async fn run_job_with_engine(
         task_id: spec.task_id.clone(),
     });
 
-    // 8. Run session loop.
+    // 8. Run session loop. The system prompt is the byte-identical warm KV
+    //    prefix; the (variable) user message carries the CPG/PPR + DGI
+    //    augmentation, so a resumed continuation reuses the exact same system
+    //    prompt bytes and its prior conversation KV prefix stays intact.
     let outcome = runner::run_session(
         engine,
         &executor,
         &logger,
         &system_prompt,
-        &spec.prompt,
+        &user_prompt,
         &tools,
         Some(&options),
     )
@@ -484,6 +572,27 @@ pub async fn run_job_with_engine(
         Ok(session_res) => {
             let terminal_status = if session_res.status == "completed" {
                 TaskStatus::Completed
+            } else if session_res.status == "reasoning_budget_exhausted" {
+                let salvage_path = state
+                    .root()
+                    .join(".scratch")
+                    .join(format!("salvage_{}.md", spec.session_id));
+                let ws_salvage_path = workspace_root
+                    .join(".scratch")
+                    .join(format!("salvage_{}.md", spec.session_id));
+                let has_salvage = (salvage_path.exists()
+                    && std::fs::metadata(&salvage_path)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false))
+                    || (ws_salvage_path.exists()
+                        && std::fs::metadata(&ws_salvage_path)
+                            .map(|m| m.len() > 0)
+                            .unwrap_or(false));
+                if has_salvage {
+                    TaskStatus::CompletedWithSalvage
+                } else {
+                    TaskStatus::Failed
+                }
             } else {
                 TaskStatus::Failed
             };
@@ -988,7 +1097,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_simplification_exhausted_reasoning_marks_task_failed() {
+    async fn status_simplification_exhausted_reasoning_marks_task_completed_with_salvage() {
         let (state, dir) = tmp_state();
         let registry = TaskRegistry::new(&state);
         let task_id = registry
@@ -1054,7 +1163,7 @@ mod tests {
         assert!(res.contains("Salvage summary: reasoning ceiling hit"));
 
         let rec = registry.get(&task_id).await.unwrap();
-        assert_eq!(rec.status, TaskStatus::Failed);
+        assert_eq!(rec.status, TaskStatus::CompletedWithSalvage);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1110,5 +1219,94 @@ mod tests {
         assert!(rec.reason.unwrap().starts_with("DgiProbeError:"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The system prompt is a pure function of the workspace's stable shape and
+    /// the build — **not** of the dispatch prompt. Two different prompts in the
+    /// same workspace must therefore produce **byte-identical** system prompts
+    /// (the warm KV prefix that resumed sessions reuse). The prompt-specific
+    /// CPG/PPR context must NOT appear in the system prompt; it attaches to the
+    /// user message instead.
+    #[test]
+    fn system_prompt_is_byte_identical_across_prompts_and_cpg_goes_to_user_message() {
+        let root = std::path::PathBuf::from("/work/repo");
+        let skeleton = "[Workspace Skeleton]\n- src/\n- Cargo.toml\n";
+        let skills_index = skills::render_index(&[crate::skills::Skill {
+            name: "canary-test-staging".into(),
+            description: "Stage changes behind a targeted test file".into(),
+            path: std::path::PathBuf::from("/work/repo/skills/canary-test-staging/SKILL.md"),
+        }]);
+
+        // Two different prompts in the same workspace.
+        let prompt_a = "fix the parser in src/ast.rs";
+        let prompt_b = "write tests for the graph pagerank module";
+
+        let sys_a = build_worker_system_prompt(&root, true, skeleton, &skills_index);
+        let sys_b = build_worker_system_prompt(&root, true, skeleton, &skills_index);
+        assert_eq!(
+            sys_a, sys_b,
+            "byte-identical system prompt is the warm KV prefix invariant"
+        );
+
+        // The system prompt is prompt-agnostic: no prompt-specific CPG/PPR
+        // context (those land in the user message).
+        assert!(
+            !sys_a.contains("Retrieved Code Context"),
+            "system prompt must NOT carry CPG/PPR retrieved context"
+        );
+        assert!(
+            !sys_a.contains(prompt_a) && !sys_a.contains(prompt_b),
+            "system prompt must not embed the dispatch prompt"
+        );
+
+        // With no CPG context (skeleton disabled) and no DGI advisory (the gate
+        // is strictly binary and injects none), the augmentation is empty, so
+        // the caller uses the raw prompt (preserving the fresh `[system, user]`
+        // byte shape).
+        let empty_aug = build_user_turn_augmentation(&root, false, prompt_a);
+        assert!(
+            empty_aug.is_empty(),
+            "no CPG context and no DGI advisory -> empty augmentation"
+        );
+    }
+
+    /// With a real workspace and the workspace-skeleton prefix enabled, the
+    /// prompt-specific CPG/PPR retrieved-code context is computed and attached
+    /// to the **user-message** augmentation (never the system prompt). The
+    /// augmentation carries the `[Retrieved Code Context]` block and names the
+    /// relevant symbol, but does not embed the raw prompt text (the prompt is
+    /// appended after the block by the caller).
+    #[cfg(feature = "ast")]
+    #[test]
+    fn user_message_augmentation_carries_cpg_retrieved_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("calc.rs"),
+            "pub fn calculate_sum(a: i32, b: i32) -> i32 { a + b }\npub fn calculate_product(a: i32, b: i32) -> i32 { a * b }\n",
+        )
+        .unwrap();
+
+        let prompt = "Need the calculate_sum implementation";
+        let aug = build_user_turn_augmentation(tmp.path(), true, prompt);
+
+        assert!(
+            !aug.is_empty(),
+            "augmentation must carry the CPG/PPR retrieved context for this prompt"
+        );
+        assert!(
+            aug.contains("[Retrieved Code Context]"),
+            "the retrieved-code block header must land in the user message: {aug}"
+        );
+        assert!(
+            aug.contains("calculate_sum"),
+            "the relevant symbol must be named in the user message: {aug}"
+        );
+        assert!(
+            !aug.contains(prompt),
+            "the augmentation is a context prefix; the raw prompt is appended separately"
+        );
+        let _ = tmp;
     }
 }
