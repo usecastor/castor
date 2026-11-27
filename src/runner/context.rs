@@ -11,8 +11,8 @@ use crate::state::StateDir;
 
 use super::messages::strip_think_tags;
 
-pub(crate) const CONTEXT_CEILING_DIRECTIVE: &str = "[System: Working context budget has reached 90%. Do not execute further tools. \
-     Synthesize your final conclusions and response immediately.]";
+pub(crate) const CONTEXT_CEILING_DIRECTIVE: &str = "[System: Working context budget has reached 90%. Do not execute further workspace tools. \
+     Call finish(summary) or synthesize your final conclusions and response immediately.]";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PersistedMessage {

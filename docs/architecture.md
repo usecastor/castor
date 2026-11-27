@@ -117,6 +117,8 @@ Git operations (`git status`, `diff`, `log`, `commit`) and ad-hoc Python run nat
 - `ast`: Structural `ast_search` and `ast_replace` via ast-grep with automatic syntax rollback.
 - `paper`: Academic paper lookup (`paper_lookup`) against OpenAlex for verified research metadata and open-access PDFs.
 
+On top of the workspace tools, every build advertises the **`finish` control-flow termination tool**: it is *not* a workspace action (the session runner intercepts it in Phase 4 — after Phases 1→2→3 — and resolves the terminal outcome, never dispatching it to the executor). Its non-empty `summary` argument becomes the final report, so a model ends a session by calling `finish` rather than ending with plain text alone. Bounded plain-text nudges, a one-shot empty-`summary` rejection, and a one-shot unverified-code-edit verification intercept keep the loop honest and loop-proof.
+
 ### 7. Lazy Skills Engine
 
 Compatible with the [`agentskills.io`](https://agentskills.io) `SKILL.md` standard. Skills are
@@ -156,3 +158,4 @@ Castor registers three stdio MCP tools:
 | `ast_search` | `ast` | Structural AST search via ast-grep (metavariables `$VAR`, `$$$ARGS`) |
 | `ast_replace` | `ast` | Structural AST refactoring with automatic rollback on syntax error |
 | `paper_lookup` | `paper` | Academic metadata via OpenAlex (titles, DOIs, affiliations, open-access PDFs) |
+| `finish` | core (control-flow) | Termination tool: carries a non-empty `summary`; intercepted in Phase 4 (never dispatched) to resolve the terminal report |

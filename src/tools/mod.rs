@@ -4,9 +4,13 @@
 //! [`crate::runner::ToolExecutor`] that routes tool calls to filesystem,
 //! sandboxed shell, web search/fetch, or stdio extensions.
 //!
-//! Capability gates: the default build exposes a lean 8-tool surface
-//! (file I/O, search, shell, web). `ast` adds structural AST surgery
+//! Capability gates: the default build exposes a lean 8-tool *workspace*
+//! surface (file I/O, search, shell, web). `ast` adds structural AST surgery
 //! (`ast_search` / `ast_replace`) and `paper` adds OpenAlex `paper_lookup`.
+//! On top of those, every build advertises the `finish` **control-flow**
+//! termination tool ([`FINISH_TOOL_NAME`]): it is not a workspace tool — the
+//! session runner intercepts it in Phase 4 to resolve the terminal outcome —
+//! but the executor carries a safe fallback arm for it.
 
 #[cfg(feature = "ast")]
 pub mod ast;
@@ -33,6 +37,18 @@ use self::paper::PaperClient;
 use self::web::WebClient;
 use crate::engine::ToolSchema;
 use crate::runner::{ToolError, ToolExecutor, ToolOutcome};
+
+/// The explicit termination tool name.
+///
+/// `finish` is a *control-flow* tool, not a workspace tool: the session runner
+/// intercepts it in Phase 4 (it is never routed into the 3-phase workspace
+/// dispatch) and uses it to resolve the terminal [`crate::runner::SessionResult`].
+/// When all required work and verification are done, the model calls
+/// `finish(summary)` with its final grounded report instead of ending with
+/// plain narration. Normal sessions intercept it in
+/// [`crate::runner::session`]; this constant is the single source of truth for
+/// its name so the schema, the session loop, and the salvage pass all agree.
+pub const FINISH_TOOL_NAME: &str = "finish";
 
 /// The aggregate tool executor providing all built-in capabilities and extensions.
 pub struct CompositeExecutor {
@@ -144,10 +160,11 @@ impl CompositeExecutor {
 
 /// The standard set of built-in tool schemas exposed to the model.
 ///
-/// The default build exposes the lean 8-tool surface
+/// The default build exposes the lean 8-tool *workspace* surface
 /// (`read_file`, `write_file`, `edit_file`, `list_dir`, `search_code`,
-/// `bash`, `web_search`, `web_fetch`). `ast` appends the structural AST
-/// surgery tools; `paper` appends OpenAlex `paper_lookup`.
+/// `bash`, `web_search`, `web_fetch`) followed by the `finish` control-flow
+/// termination tool. `ast` appends the structural AST surgery tools; `paper`
+/// appends OpenAlex `paper_lookup`.
 pub fn builtin_tool_schemas() -> Vec<ToolSchema> {
     // The `edit_file` and `write_file` descriptions depend on the `ast` feature gate:
     // with `ast`, writes pass an in-memory AST syntax gate before commit; without it,
@@ -265,6 +282,18 @@ pub fn builtin_tool_schemas() -> Vec<ToolSchema> {
                     "pages": { "type": "string", "description": "Optional page range for PDF documents (e.g. '1-3', 'all', '5'). Defaults to first 3 pages." }
                 },
                 "required": ["url"]
+            }),
+        },
+        ToolSchema {
+            name: FINISH_TOOL_NAME.to_string(),
+            description: "Complete the task and return your final grounded summary to the Lead Architect. Always call this tool once all required work and verification are done; do not end with plain text alone.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "summary": { "type": "string", "description": "Concise, grounded final report covering changes, verification results, and exact file/line references." }
+                },
+                "required": ["summary"],
+                "additionalProperties": false
             }),
         },
     ];
@@ -536,6 +565,16 @@ impl ToolExecutor for CompositeExecutor {
                 }
             }
 
+            // Explicit termination: a control-flow tool, never a workspace
+            // action. Normal sessions intercept `finish` in
+            // `crate::runner::session` Phase 4, so this arm is a safe fallback
+            // for the rare caller that routes it here directly (e.g. the
+            // salvage retry path): it acknowledges completion without
+            // touching the workspace.
+            FINISH_TOOL_NAME => Ok(ToolOutcome {
+                text: "Task completed.".to_string(),
+            }),
+
             // Dynamic extensions
             other => {
                 if let Some(ref ext) = self.extensions {
@@ -646,11 +685,11 @@ mod tests {
         let ws = temp_workspace();
         let executor = CompositeExecutor::new(&ws, None).expect("failed to create executor");
 
-        // Check schemas list (feature-aware: 8 default, +2 under `ast`,
-        // +1 under `paper`).
+        // Check schemas list (feature-aware: 9 base (8 workspace + `finish`
+        // control-flow tool), +2 under `ast`, +1 under `paper`).
         let schemas = executor.tool_schemas();
         let expected =
-            8 + {
+            9 + {
                 #[cfg(feature = "ast")]
                 {
                     2
@@ -674,6 +713,7 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"web_search"));
+        assert!(names.contains(&FINISH_TOOL_NAME));
         #[cfg(feature = "ast")]
         assert!(names.contains(&"ast_search"));
         #[cfg(feature = "paper")]
