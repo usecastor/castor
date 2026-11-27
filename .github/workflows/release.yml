@@ -27,10 +27,18 @@ permissions:
 
 jobs:
   test:
-    name: Verify · Rust stable · ubuntu-latest
-    runs-on: ubuntu-latest
+    name: Verify · Rust stable · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
+      - name: Configure git line endings
+        shell: bash
+        run: git config --global core.autocrlf false
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -43,23 +51,112 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build all targets
+        shell: bash
         run: cargo build --all-targets
 
-      - name: Run clippy (-D warnings)
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Run clippy (-D warnings, all features)
+        shell: bash
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Run tests (authoritative gate)
-        run: cargo test --verbose
+      - name: Verify slim feature gate compiles (no-default + mcp)
+        shell: bash
+        run: cargo check --no-default-features --features mcp
 
-      - name: Test Node shim
+      - name: Run tests (authoritative gate, all features)
+        shell: bash
+        run: cargo test --all-features
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node bin/castor.js --help
+
+      - name: Test Node shim
+        shell: bash
+        run: |
+          node bin/castor.js --help
+          node --test tests/castor_shim_test.mjs
+
+  build-artifacts:
+    name: Build Release · ${{ matrix.target }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: windows-latest
+            target: win32-x64
+    steps:
+      - name: Configure git line endings
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Extract Tag Version
+        id: meta
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#v}"
+          else
+            VERSION="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")"
+            TAG="v${VERSION}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Package Linux archive
+        if: matrix.target == 'linux-x64'
+        shell: bash
+        run: |
+          mkdir -p dist
+          ARCHIVE="castor-v${{ steps.meta.outputs.version }}-linux-x64.tar.gz"
+          tar -czf "dist/${ARCHIVE}" -C target/release castor
+          (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+
+      - name: Package Windows archive
+        if: matrix.target == 'win32-x64'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $archive = "castor-v${{ steps.meta.outputs.version }}-win32-x64.zip"
+          Compress-Archive -Path "target/release/castor.exe" -DestinationPath "dist/$archive" -Force
+          $hash = (Get-FileHash -Path "dist/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $shaPath = Join-Path (Resolve-Path "dist").Path "$archive.sha256"
+          [System.IO.File]::WriteAllText($shaPath, "$hash  $archive`n")
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
 
   publish:
     name: GitHub Release & NPM Publish
-    needs: test
+    needs: [test, build-artifacts]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -76,27 +173,40 @@ jobs:
         with:
           node-version: 22
 
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
       - name: Upgrade npm for OIDC Trusted Publishing
         run: npm install -g npm@latest
 
       - name: Extract Tag Version
         id: meta
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#v}"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#v}"
+          else
+            VERSION="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")"
+            TAG="v${VERSION}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Create or Update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view "${{ steps.meta.outputs.tag }}" >/dev/null 2>&1; then
-            echo "Release ${{ steps.meta.outputs.tag }} exists, updating title..."
+            echo "Release ${{ steps.meta.outputs.tag }} exists, updating title and assets..."
             gh release edit "${{ steps.meta.outputs.tag }}" \
               --title "Castor ${{ steps.meta.outputs.version }}"
+            gh release upload "${{ steps.meta.outputs.tag }}" release-assets/* --clobber
           else
             gh release create "${{ steps.meta.outputs.tag }}" \
+              release-assets/* \
               --title "Castor ${{ steps.meta.outputs.version }}" \
               --generate-notes \
               --draft=false \

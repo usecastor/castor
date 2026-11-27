@@ -256,13 +256,31 @@ impl SandboxPolicy {
         }
         let expanded = self.expand_tilde_prefix(input);
         let posix = expanded.replace('\\', "/");
+        let is_drive_prefix = {
+            let mut ch = posix.chars();
+            matches!((ch.next(), ch.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic())
+        };
+        let is_drive_abs = is_drive_prefix && posix.as_bytes().get(2) == Some(&b'/');
+        if is_drive_prefix && !is_drive_abs {
+            return Err(SandboxError::PathEscape(format!(
+                "PathEscapeError: Access denied. Path '{}' is a drive-relative path and escapes all allowed roots",
+                input
+            )));
+        }
+        if cfg!(windows) && posix.starts_with('/') {
+            return Err(SandboxError::PathEscape(format!(
+                "PathEscapeError: Access denied. Path '{}' escapes all allowed roots",
+                input
+            )));
+        }
         // A relative path is resolved against the explicit base (the active
         // task cwd) when one is supplied, otherwise the primary write root
-        // (the workspace). An absolute path is used as-is.
+        // (the workspace). An absolute path (including Windows drive-anchored
+        // `X:/...` on any host) is used as-is.
         let base = base
             .map(path::normalize_lexical)
             .unwrap_or_else(|| self.write_roots.first().cloned().unwrap_or_default());
-        let p = if Path::new(&posix).is_absolute() {
+        let p = if posix.starts_with('/') || is_drive_abs || Path::new(&posix).is_absolute() {
             PathBuf::from(posix)
         } else {
             base.join(&posix)

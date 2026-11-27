@@ -57,7 +57,18 @@ pub(crate) const DEFAULT_HOME: &str = "/home/user";
 /// Critical system directories protected against *all* destructive verbs
 /// (not only `rm`). A dir and any path beneath it (`/etc/hosts`,
 /// `/usr/lib/...`) is protected; deeper subpaths of the *workspace* are not.
-const SYSTEM_DIRS: &[&str] = &["/etc", "/usr", "/var", "/boot", "/bin", "/lib", "/opt"];
+const SYSTEM_DIRS: &[&str] = &[
+    "/etc",
+    "/usr",
+    "/var",
+    "/boot",
+    "/bin",
+    "/lib",
+    "/opt",
+    "/mnt/c/windows",
+    "/mnt/c/program files",
+    "/mnt/c/program files (x86)",
+];
 const MAX_UNWRAP_DEPTH: usize = 4;
 /// Upper bound for group recursion (`(...)`, `{...}`). Group nesting is
 /// *provably* acyclic — each recursive level strictly shortens the string —
@@ -471,8 +482,17 @@ fn protected_roots() -> &'static [String] {
 }
 
 fn is_home_user(p: &str) -> bool {
-    let rest = p.strip_prefix("/home/").unwrap_or("");
-    !rest.is_empty() && !rest.contains('/')
+    let probe = p.strip_suffix("/*").unwrap_or(p);
+    let rest = probe.strip_prefix("/home/").or_else(|| {
+        let after_mnt = probe.strip_prefix("/mnt/")?;
+        let b = after_mnt.as_bytes();
+        if b.len() >= 8 && b[0].is_ascii_alphabetic() && after_mnt[1..].starts_with("/users/") {
+            Some(&after_mnt[8..])
+        } else {
+            None
+        }
+    });
+    matches!(rest, Some(r) if !r.is_empty() && !r.contains('/'))
 }
 
 fn is_dev_target(p: &str) -> bool {
@@ -826,6 +846,18 @@ fn analyze_substitutions(
     Ok(())
 }
 
+fn is_windows_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') || p.starts_with(r"\\")
+}
+
+fn is_windows_context(name: &str, cwd: &str, home: &str) -> bool {
+    cfg!(windows)
+        || matches!(name, "del" | "rd" | "remove-item" | "ri" | "erase")
+        || is_windows_path(cwd)
+        || is_windows_path(home)
+}
+
 fn analyze_segment(cmd: &str, cwd: &str, home: &str, depth: usize) -> Result<(), ShellPolicyError> {
     let tokens = tokenize(cmd);
     if tokens.is_empty() {
@@ -878,7 +910,7 @@ fn analyze_segment(cmd: &str, cwd: &str, home: &str, depth: usize) -> Result<(),
     }
 
     if DESTRUCTIVE.contains(&name.as_str()) {
-        let is_win = name != "rm";
+        let is_win = is_windows_context(&name, cwd, home);
         let mut operands = Vec::new();
         for tok in tokens.iter().skip(i + 1) {
             if let Some(eq) = tok.find('=')

@@ -508,6 +508,77 @@ mod system_dir_tests {
             Err(ShellPolicyError::ProtectedRoot(_, _))
         ));
     }
+
+    #[test]
+    fn windows_tilde_user_expansion_for_rm_and_subpaths() {
+        let (cwd, home) = ctx("C:\\work", "C:\\Users\\bob");
+        let err = validate_with_context("rm -rf ~alice", &cwd, &home).unwrap_err();
+        match err {
+            ShellPolicyError::ProtectedRoot(op, norm) => {
+                assert_eq!(op, "~alice");
+                assert_eq!(norm, "/mnt/c/users/alice");
+            }
+            other => panic!("expected ProtectedRoot, got {other:?}"),
+        }
+        assert!(
+            validate_with_context("rm -rf ~alice/project/dist", &cwd, &home).is_ok(),
+            "deeper subpath under Windows ~alice must remain allowed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_non_rm_destructive_verb_expands_tilde_to_unix_home() {
+        let (cwd, home) = ctx("/workspace", "/home/bob");
+        let err = validate_with_context("mv ~alice /tmp/x", &cwd, &home).unwrap_err();
+        match err {
+            ShellPolicyError::ProtectedRoot(op, norm) => {
+                assert_eq!(op, "~alice");
+                assert_eq!(norm, "/home/alice");
+            }
+            other => panic!("expected ProtectedRoot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_protected_system_subpaths_blocked() {
+        for cmd in [
+            "rm -rf C:\\Windows\\System32",
+            "rm -rf /mnt/c/Windows/System32/drivers",
+            "rm -rf \"C:\\Program Files\\Git\"",
+            "rm -rf \"/mnt/c/Program Files/Common Files\"",
+            "del /f /s /q \"C:\\Program Files (x86)\\App\"",
+            "mv C:\\Windows\\notepad.exe /tmp/",
+        ] {
+            assert!(
+                matches!(validate(cmd), Err(ShellPolicyError::ProtectedRoot(_, _))),
+                "expected '{cmd}' to be blocked as ProtectedRoot"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_user_profile_root_blocked_but_project_subpath_allowed() {
+        for cmd in [
+            "rm -rf /mnt/c/Users/alice",
+            "rm -rf C:\\Users\\alice",
+            "rm -rf C:\\Users\\alice\\*",
+        ] {
+            assert!(
+                matches!(validate(cmd), Err(ShellPolicyError::ProtectedRoot(_, _))),
+                "expected '{cmd}' to be blocked as ProtectedRoot"
+            );
+        }
+        for cmd in [
+            "rm -rf /mnt/c/Users/alice/project/target",
+            "rm -rf C:\\Users\\alice\\project\\dist",
+        ] {
+            assert!(
+                validate(cmd).is_ok(),
+                "expected project subpath '{cmd}' to be allowed"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

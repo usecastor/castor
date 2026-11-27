@@ -162,14 +162,16 @@ fn legit_in_tree_paths_pass() {
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn canonical_identity_case_insensitivity() {
-    let root = test_root("ci_identity");
+    // Canonicalize the temp root so `root` and its case-flipped sibling share
+    // an identical parent prefix (e.g., when `std::env::temp_dir()` returns an
+    // 8.3 short path on Windows).
+    let root = canonical_or_self(&test_root("ci_identity"));
     // A differently-cased spelling of the *root itself* matches iff the
     // volume is case-insensitive — the primary byte-wise check fails on
     // the case difference, so a `true` outcome proves the canonical
     // fallback, and a `false` outcome proves a case-sensitive store is
     // never over-permissive.
-    let re_cased = canonical_or_self(&root);
-    let mixed = re_cased
+    let mixed = root
         .file_name()
         .map(|f| {
             let s = f.to_string_lossy().into_owned();
@@ -178,20 +180,20 @@ fn canonical_identity_case_insensitivity() {
             } else {
                 s.to_ascii_uppercase()
             };
-            re_cased.parent().unwrap_or(Path::new("/")).join(flipped)
+            root.parent().unwrap_or(Path::new("/")).join(flipped)
         })
         .expect("test root has a file name");
     let matches = is_within(&mixed, &root);
     assert_eq!(
         matches,
-        volume_is_case_insensitive(&canonical_or_self(&root)),
+        volume_is_case_insensitive(&root),
         "the is_within fallback must agree with the canonical-identity \
          volume probe on the host's real filesystem"
     );
     // A *different* location with the same lowercased form is never
     // treated as inside (no byte-wise or case-insensitive prefix match
     // can relate them), regardless of the store's case policy.
-    let other = test_root("ci_identity_other");
+    let other = canonical_or_self(&test_root("ci_identity_other"));
     assert!(!is_within(&other, &root));
 }
 
@@ -920,4 +922,54 @@ fn binary_file_denial_scopes_the_bash_exception() {
         msg.contains("does NOT authorize bypassing any other denial"),
         "binary denial must not authorize bypassing other denials: {msg}"
     );
+}
+
+#[test]
+fn policy_drive_relative_paths_rejected() {
+    let ws = test_root("policy_drive_rel");
+    let sub = ws.join("src");
+    let policy = SandboxPolicy::workspace_only(&ws);
+
+    for raw in [
+        "D:foo.txt",
+        "d:foo.txt",
+        "C:../outside.txt",
+        "D:",
+        "C:bar\\baz.rs",
+    ] {
+        let err_root = policy.resolve_with_base(raw, None).unwrap_err();
+        assert!(
+            matches!(err_root, SandboxError::PathEscape(_)),
+            "expected PathEscape for '{raw}' with default base, got {err_root:?}"
+        );
+        let err_sub = policy.resolve_with_base(raw, Some(&sub)).unwrap_err();
+        assert!(
+            matches!(err_sub, SandboxError::PathEscape(_)),
+            "expected PathEscape for '{raw}' with explicit base, got {err_sub:?}"
+        );
+    }
+
+    // Drive-anchored Windows absolute paths outside the workspace are also
+    // treated as absolute (not joined under `base`) on every host OS.
+    let err_abs = policy
+        .resolve_with_base("D:/outside.txt", Some(&sub))
+        .unwrap_err();
+    assert!(
+        matches!(err_abs, SandboxError::PathEscape(_)),
+        "expected PathEscape for drive-anchored path, got {err_abs:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn policy_windows_mnt_paths_rejected() {
+    let ws = test_root("policy_win_mnt");
+    let policy = SandboxPolicy::workspace_only(&ws);
+    for raw in ["/mnt/c/Windows", "/mnt/d/foo.txt", "/etc/passwd"] {
+        let err = policy.resolve_with_base(raw, Some(&ws)).unwrap_err();
+        assert!(
+            matches!(err, SandboxError::PathEscape(_)),
+            "expected PathEscape for '{raw}' on Windows, got {err:?}"
+        );
+    }
 }

@@ -17,6 +17,7 @@
 //! spawn if down → release), best-effort, never blocking the MCP server.
 
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -699,18 +700,25 @@ pub async fn run_wait_cli(
 
     // Candidate wait URLs: loopback first, then (under WSL) the host
     // gateway IP from `/etc/resolv.conf`.
-    let mut candidate_urls = vec![format!(
+    #[cfg(unix)]
+    let candidate_urls = {
+        let mut urls = vec![format!(
+            "http://127.0.0.1:{port}/task/{task_id}/wait?timeout_s={timeout_s}"
+        )];
+        if crate::platform::is_wsl()
+            && let Some(host_ip) = get_wsl_host_ip()
+        {
+            urls.push(format!(
+                "http://{host_ip}:{port}/task/{task_id}/wait?timeout_s={timeout_s}"
+            ));
+        }
+        urls
+    };
+
+    #[cfg(not(unix))]
+    let candidate_urls = vec![format!(
         "http://127.0.0.1:{port}/task/{task_id}/wait?timeout_s={timeout_s}"
     )];
-
-    #[cfg(unix)]
-    if crate::platform::is_wsl()
-        && let Some(host_ip) = get_wsl_host_ip()
-    {
-        candidate_urls.push(format!(
-            "http://{host_ip}:{port}/task/{task_id}/wait?timeout_s={timeout_s}"
-        ));
-    }
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_s.saturating_add(5)))
@@ -1221,6 +1229,7 @@ mod tests {
     }
 
     /// Local state dir stand-in for the WSL `~/.castor` (no task file).
+    #[cfg(unix)]
     fn wsl_local_state() -> StateDir {
         let n = TMP.fetch_add(1, Ord::SeqCst);
         let p =
