@@ -29,7 +29,7 @@ const RESULT_CAP_BYTES: usize = 20 * 1024;
 const TRUNCATION_MARKER: &str = "\n\n[... result truncated: exceeded 20KB cap ...]";
 
 /// Handshake / per-call deadlines.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -340,6 +340,10 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Serialize tests that cold-boot Python MCP subprocesses so concurrent
+    /// test threads do not saturate CPU-constrained runners during startup.
+    static SUBPROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// A minimal stdio JSON-RPC MCP server (newline-delimited) implementing
     /// just enough of the protocol for the bridge to handshake and exercise
     /// tools: `initialize`, `notifications/initialized`, `tools/list`,
@@ -495,6 +499,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn spawn_and_list_freezes_schemas() {
+        let _guard = SUBPROCESS_TEST_LOCK.lock().await;
         let bridge = ExtensionBridge::spawn(&[mock_command()]).await.unwrap();
         let schemas = bridge.tool_schemas();
         // The mock exposes `echo` and `big`, name-spaced under the derived
@@ -517,6 +522,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn call_returns_result() {
+        let _guard = SUBPROCESS_TEST_LOCK.lock().await;
         let bridge = ExtensionBridge::spawn(&[mock_command()]).await.unwrap();
         let full = bridge
             .tool_schemas()
@@ -536,6 +542,7 @@ for line in sys.stdin:
     /// failed tool call rather than a successful one.
     #[tokio::test]
     async fn call_is_error_true_prepend_error_prefix() {
+        let _guard = SUBPROCESS_TEST_LOCK.lock().await;
         let bridge = ExtensionBridge::spawn(&[mock_command()]).await.unwrap();
         let full = bridge
             .tool_schemas()
@@ -557,6 +564,7 @@ for line in sys.stdin:
     /// `Error:` must NOT be double-prefixed.
     #[tokio::test]
     async fn call_is_error_true_no_double_prefix() {
+        let _guard = SUBPROCESS_TEST_LOCK.lock().await;
         let bridge = ExtensionBridge::spawn(&[mock_command()]).await.unwrap();
         let full = bridge
             .tool_schemas()
@@ -576,6 +584,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn unknown_tool_is_typed_error() {
+        let _guard = SUBPROCESS_TEST_LOCK.lock().await;
         let bridge = ExtensionBridge::spawn(&[mock_command()]).await.unwrap();
         let err = bridge.call("nope__doesnotexist", "{}").await.unwrap_err();
         assert!(
@@ -587,6 +596,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn oversized_result_is_truncated_with_marker() {
+        let _guard = SUBPROCESS_TEST_LOCK.lock().await;
         let bridge = ExtensionBridge::spawn(&[mock_command()]).await.unwrap();
         let full = bridge
             .tool_schemas()
@@ -618,6 +628,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn shutdown_all_exits_children_no_orphans() {
+        let _guard = SUBPROCESS_TEST_LOCK.lock().await;
         let bridge = ExtensionBridge::spawn(&[mock_command()]).await.unwrap();
         let pids = bridge.pids();
         assert!(!pids.is_empty(), "expected at least one child pid");
@@ -649,6 +660,7 @@ for line in sys.stdin:
     ///      healthy fitness score.
     #[tokio::test]
     async fn motion_mcp_server_tools_discovered_and_scored() {
+        let _guard = SUBPROCESS_TEST_LOCK.lock().await;
         let script = std::path::Path::new("scripts/motion/motion_mcp_server.py");
         let py = if cfg!(windows) { "python" } else { "python3" };
         let cmd = format!("{} {}", py, script.display());
