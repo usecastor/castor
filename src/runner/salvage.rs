@@ -7,7 +7,7 @@ use tracing::warn;
 
 use crate::engine::{Completion, Message, ToolSchema};
 use crate::runner::events::EventLogger;
-use crate::runner::messages::{completion_text, msg};
+use crate::runner::messages::{completion_text, msg, strip_reasoning_tags};
 use crate::runner::skeleton::spill_tool_output;
 use crate::runner::{ChatEngine, RunnerError, SessionOptions, ToolExecutor, ToolOutcome};
 use crate::tools::FINISH_TOOL_NAME;
@@ -121,9 +121,15 @@ pub(crate) async fn run_reasoning_ceiling_salvage(
             // run each tool call, log results, append them to history,
             // and perform a single-shot synthesis call.
             if !sc.tool_calls.is_empty() {
+                let open_tag = options
+                    .map(|o| o.effective_open_tag())
+                    .unwrap_or_else(|| concat!("<th", "ink>").to_string());
+                let close_tag = options
+                    .map(|o| o.effective_close_tag())
+                    .unwrap_or_else(|| concat!("</th", "ink>").to_string());
                 messages.push(Message {
                     role: "assistant".into(),
-                    content: sc.content.clone(),
+                    content: strip_reasoning_tags(&sc.content, &open_tag, &close_tag),
                     tool_calls: sc.tool_calls.clone(),
                     tool_call_id: None,
                 });
@@ -204,8 +210,8 @@ pub(crate) async fn run_reasoning_ceiling_salvage(
                         metrics: sc.metrics,
                     };
                 } else {
-                    // Single follow-up request to synthesize findings based on
-                    // the tool outputs (the pre-`finish` behaviour).
+                    // Single follow-up request to synthesize findings from the
+                    // salvage tool outputs when no `finish(summary)` was emitted.
                     match engine.chat(messages, &[], false, effort).await {
                         Ok(follow_up) => {
                             sc = follow_up;

@@ -40,7 +40,7 @@ const MAX_OUTLINE_BYTES: usize = 4 * 1024;
 /// Bytes reserved in [`MAX_OUTPUT_BYTES`] for everything after the head:
 /// the `"\n\n"` separator (2), the truncation notice (the headingful variant
 /// with the largest possible byte counts, ~104), and the code-fence closer
-/// (3). The head budget is `MAX_OUTPUT_BYTES - OVERHEAD - outline_len`, so
+/// (4). The head budget is `MAX_OUTPUT_BYTES - OVERHEAD - outline_len`, so
 /// the total can never exceed [`MAX_OUTPUT_BYTES`].
 const TRUNCATION_OVERHEAD_BYTES: usize = 128;
 
@@ -609,10 +609,45 @@ pub(crate) fn generate_markdown_outline(text: &str) -> Option<String> {
         Some((level, cur.to_string()))
     }
 
+    /// Parse a CommonMark fenced code block opener/closer prefix (` ``` ` or `~~~`).
+    fn fence_marker(line: &str) -> Option<(char, usize, &str)> {
+        let s = line.trim_start();
+        let first = s.chars().next()?;
+        if first != '`' && first != '~' {
+            return None;
+        }
+        let count = s.chars().take_while(|&c| c == first).count();
+        if count >= 3 {
+            Some((first, count, &s[count..]))
+        } else {
+            None
+        }
+    }
+
     let lines: Vec<&str> = text.lines().collect();
     let mut sections: Vec<(usize, String)> = Vec::new();
+    let mut active_fence: Option<(char, usize)> = None;
     let mut i = 0usize;
     while i < lines.len() {
+        if let Some((open_ch, open_len)) = active_fence {
+            if let Some((ch, len, rest)) = fence_marker(lines[i])
+                && ch == open_ch
+                && len >= open_len
+                && rest.trim().is_empty()
+            {
+                active_fence = None;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some((ch, len, rest)) = fence_marker(lines[i])
+            && (ch != '`' || !rest.contains('`'))
+        {
+            active_fence = Some((ch, len));
+            i += 1;
+            continue;
+        }
+
         let trimmed = lines[i].trim();
         if trimmed.starts_with('#') {
             // ATX heading: 1..=6 hashes followed by whitespace (per CommonMark;
@@ -675,7 +710,7 @@ pub(crate) fn generate_markdown_outline(text: &str) -> Option<String> {
 ///
 /// Budget model — the total output (`head + notice + outline`) is **always**
 /// `<= MAX_OUTPUT_BYTES`:
-/// - the appended outline is first strictly bounded to `<= 4,000` bytes
+/// - the appended outline is first strictly bounded to `<= 4,096` bytes
 ///   (UTF-8 char-boundary cut, [`OUTLINE_TRUNC_SUFFIX`] appended inside that
 ///   bound when the outline exceeds it);
 /// - the head gets at most `MAX_OUTPUT_BYTES - OVERHEAD - outline_len`, where
@@ -720,7 +755,10 @@ fn cap_output(text: &str, full_len: usize) -> String {
     let shown = &text[..cut];
     let mut out = shown.to_string();
     // Close an open markdown code fence so the document stays well-formed.
-    let fence_count = out.lines().filter(|l| l.starts_with("```")).count();
+    let fence_count = out
+        .lines()
+        .filter(|l| l.trim_start().starts_with("```"))
+        .count();
     if fence_count % 2 == 1 {
         out.push_str("\n```");
     }
@@ -1581,7 +1619,7 @@ pub(crate) mod tests {
             capped.contains("## Document Outline"),
             "headingful truncation must append the outline"
         );
-        // The outline string itself is bounded to 4,000 bytes (truncated with a
+        // The outline string itself is bounded to 4,096 bytes (truncated with a
         // marker when it exceeds it).
         let outline = capped
             .split("## Document Outline")
@@ -1619,10 +1657,7 @@ pub(crate) mod tests {
         // The notice reports the exact cut position and the full length.
         // Mirror `cap_output`'s head budget *exactly*: for a headingless doc
         // the outline is `None`, so its length contributes 0 and
-        // `head_cap = MAX_OUTPUT_BYTES - TRUNCATION_OVERHEAD_BYTES`. (The
-        // earlier version budgeted from `MAX_OUTPUT_BYTES` directly, which
-        // over-estimated the head by the overhead and made the expected
-        // `cut` land past the real one.)
+        // `head_cap = MAX_OUTPUT_BYTES - TRUNCATION_OVERHEAD_BYTES`.
         let outline_len = 0; // headingless ⇒ no outline is appended
         let head_cap = MAX_OUTPUT_BYTES
             .saturating_sub(TRUNCATION_OVERHEAD_BYTES)
@@ -1651,5 +1686,31 @@ pub(crate) mod tests {
         );
         // The head must be a verbatim prefix of the document.
         assert!(doc.starts_with(&capped[..capped.len().min(2000)]));
+    }
+
+    #[test]
+    fn outline_ignores_hashes_inside_fenced_code_blocks() {
+        let md = "\
+# Real Heading
+
+```python
+# Not a heading inside backtick fence
+## Also not a heading
+```
+
+  ~~~bash
+# Not a heading inside tilde fence
+Not a setext heading
+====================
+  ~~~
+
+## Second Real Heading
+";
+        let outline = generate_markdown_outline(md).expect("real headings exist");
+        assert!(outline.contains("* [Real Heading](#real-heading)"));
+        assert!(outline.contains("  * [Second Real Heading](#second-real-heading)"));
+        assert!(!outline.contains("Not a heading"));
+        assert!(!outline.contains("Also not a heading"));
+        assert!(!outline.contains("Not a setext heading"));
     }
 }

@@ -190,13 +190,14 @@ pub struct SessionOptions {
     pub lease_context: Option<LeaseYieldContext>,
     /// Per-turn watchdog wall-clock ceiling (seconds). When `Some(s)` with
     /// `s > 0`, each `engine.chat` call is wrapped in
-    /// [`tokio::time::timeout`]. A timeout triggers a single retry at `"low"`
-    /// reasoning effort. `None` disables the timeout.
+    /// [`tokio::time::timeout`]. A timeout triggers a single retry with the
+    /// session's reasoning effort preserved and a concise directive appended
+    /// at the tail. `None` disables the timeout.
     pub turn_timeout_secs: Option<u64>,
     /// Per-turn watchdog reasoning-token budget. When `Some(n)` with
     /// `n > 0`, a turn that returns `finish_reason == "length"` with empty
     /// `tool_calls` and `metrics.reasoning_tokens >= n` is treated as a
-    /// stall and retried once at `"low"` reasoning effort.
+    /// stall and retried once with the session's reasoning effort preserved.
     /// `None` or `0` disables the token-budget trigger.
     pub max_turn_reasoning_tokens: Option<u32>,
     /// Maximum bytes of a single tool output before it is spilled
@@ -242,8 +243,9 @@ impl SessionOptions {
     /// `engine.chat` call in a wall-clock timeout (`turn_timeout_secs`, `0`
     /// disables) and treats a `length`/empty-tool-call turn that burned at
     /// least `max_turn_reasoning_tokens` reasoning tokens (`0` disables) as a
-    /// stall; either trigger retries the turn once at `"low"` reasoning
-    /// effort. Returns `Self` for chaining.
+    /// stall; either trigger retries the turn once with the session's reasoning
+    /// effort preserved and a concise directive appended at the tail. Returns
+    /// `Self` for chaining.
     pub fn with_turn_watchdog(
         self,
         turn_timeout_secs: u64,

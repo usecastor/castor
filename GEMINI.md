@@ -19,7 +19,7 @@ Operating contract for the Cloud Lead Architect (Claude Code / Antigravity Gemin
    - **Single-concern slices**: Keep slices focused; partition multi-domain tasks into focused sequential or concurrent contracts.
 4. **Concurrent Dispatch Sizing (Dynamic)**:
    - Dispatch independent single-concern slices in parallel and let the
-     token-budgeted slot semaphore (`src/task/semaphore.rs`) admit, FIFO-defer,
+     token-budgeted slot semaphore (`src/task/semaphore/`) admit, FIFO-defer,
      or yield every dispatch automatically against the engine's aggregate KV
      pool (see `AGENTS.md` §3.5) — no manual per-size worker-count rules.
    - Per-workspace concurrent slices share one warm KV prefix; stall/timeout

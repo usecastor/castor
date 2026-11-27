@@ -4,7 +4,7 @@ use futures_util::future::join_all;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use crate::engine::{Message, ToolCall, ToolSchema};
+use crate::engine::{Completion, Message, ToolCall, ToolSchema};
 use crate::runner::budget::{LOOP_THRESHOLD, LOOP_WINDOW};
 use crate::runner::context::{
     CONTEXT_CEILING_DIRECTIVE, history_tokens, in_flight_ceiling_tokens, in_flight_context_tokens,
@@ -31,6 +31,49 @@ use crate::tools::FINISH_TOOL_NAME;
 /// `finish` control-flow tool. Bounded so a model that neither calls tools nor
 /// calls `finish` can never loop the session on repeated nudges.
 const MAX_NO_TOOL_NUDGES: u32 = 2;
+
+/// Push queued visual attachment `user` messages after all `role: "tool"`
+/// messages of a turn have been appended, replacing any earlier visual
+/// attachment to respect the 1-image limit.
+fn push_image_attachments(messages: &mut Vec<Message>, attachments: Vec<String>) {
+    for data_url in attachments {
+        for m in messages.iter_mut() {
+            if m.role == "user" && m.content.starts_with("[Visual Inspection Attachment:") {
+                m.content = "[Prior visual attachment cleared to stay within the 1-image limit]"
+                    .to_string();
+            }
+        }
+        messages.push(Message {
+            role: "user".into(),
+            content: format!("[Visual Inspection Attachment: {data_url}]"),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        });
+    }
+}
+
+/// Persist the turn's message history and record its token footprint on the
+/// held slot lease so the aggregate KV pool reflects active sessions.
+fn persist_and_record_turn(
+    options: Option<&SessionOptions>,
+    session_id: &str,
+    messages: &[Message],
+    completion: &Completion,
+) {
+    if let Some(state) = options.and_then(|o| o.state.as_ref()) {
+        save_messages(state, session_id, messages);
+    }
+
+    if let Some(ctx) = options.and_then(|o| o.lease_context.as_ref()) {
+        let prompt_tokens = completion.metrics.prompt_tokens;
+        let completion_tokens = completion.metrics.completion_tokens;
+        let turn_tokens = prompt_tokens
+            .map(|p| p as u32)
+            .unwrap_or_else(|| history_tokens(messages) as u32)
+            .saturating_add(completion_tokens.map(|c| c as u32).unwrap_or(0));
+        ctx.sem.update_context_tokens(&ctx.task_id, turn_tokens);
+    }
+}
 
 /// Append one `role: "tool"` result message and ledger event for a Phase-4
 /// `finish` call. Returns the (trimmed, non-empty) `summary` carried by the
@@ -684,6 +727,7 @@ pub async fn run_session(
                 let finish_summary = completion
                     .tool_calls
                     .iter()
+                    .rev()
                     .find(|tc| tc.name == FINISH_TOOL_NAME)
                     .and_then(|tc| extract_finish_summary(&tc.arguments));
                 for tc in &completion.tool_calls {
@@ -837,6 +881,7 @@ pub async fn run_session(
 
         let has_bash = completion.tool_calls.iter().any(|tc| tc.name == "bash");
         let mut deferred_advisory: Option<String> = None;
+        let mut pending_image_attachments: Vec<String> = Vec::new();
         for (_idx, tc, outcome) in all_results {
             tool_activity = true;
             record_verification_state(
@@ -891,19 +936,7 @@ pub async fn run_session(
             });
 
             if let Some(data_url) = image_attachment {
-                for m in &mut messages {
-                    if m.role == "user" && m.content.starts_with("[Visual Inspection Attachment:") {
-                        m.content =
-                            "[Prior visual attachment cleared to stay within the 1-image limit]"
-                                .to_string();
-                    }
-                }
-                messages.push(Message {
-                    role: "user".into(),
-                    content: format!("[Visual Inspection Attachment: {data_url}]"),
-                    tool_call_id: None,
-                    tool_calls: Vec::new(),
-                });
+                pending_image_attachments.push(data_url);
             }
 
             logger
@@ -978,6 +1011,8 @@ impasse, state your findings and ask for alignment rather than continuing to re-
                     "Finish deferred: verifiable code was modified without running \
                      verification via bash. Run verification now, then call finish(summary).",
                 );
+                push_image_attachments(&mut messages, pending_image_attachments);
+                persist_and_record_turn(options, session_id, &messages, &completion);
                 continue;
             }
 
@@ -998,13 +1033,15 @@ impasse, state your findings and ask for alignment rather than continuing to re-
                     &phase4_finish,
                     "Finish rejected: provide a non-empty grounded `summary` argument.",
                 );
+                push_image_attachments(&mut messages, pending_image_attachments);
+                persist_and_record_turn(options, session_id, &messages, &completion);
                 continue;
             }
 
             // Clean terminal completion: acknowledge `finish`, land the report
-            // as the final text, and break *before* the deferred loop advisory
-            // and any trailing `user` nudge so `messages.json` ends on the
-            // clean `assistant(tool_calls)` + `tool(results)` tail.
+            // as the final text, and break *before* pushing trailing `user`
+            // image attachments, loop advisories, or nudges so `messages.json`
+            // ends on the clean `assistant(tool_calls)` + `tool(results)` tail.
             append_finish_results(
                 &mut messages,
                 logger,
@@ -1015,6 +1052,8 @@ impasse, state your findings and ask for alignment rather than continuing to re-
             final_text = resolved_summary.unwrap_or_else(|| completion_text(&completion));
             break;
         }
+
+        push_image_attachments(&mut messages, pending_image_attachments);
 
         if let Some(advisory) = deferred_advisory {
             messages.push(msg("user", advisory));
@@ -1034,22 +1073,9 @@ impasse, state your findings and ask for alignment rather than continuing to re-
         }
 
         // End of turn: persist the sanitized history so a later dispatch can
-        // resume it (subject to the 90% ceiling-aligned resume watermark on load).
-        if let Some(state) = options.and_then(|o| o.state.as_ref()) {
-            save_messages(state, session_id, &messages);
-        }
-
-        // Per-turn slot bookkeeping: record the turn's token footprint on the held lease
-        // so the aggregate KV pool accurately reflects all active sessions.
-        if let Some(ctx) = options.and_then(|o| o.lease_context.as_ref()) {
-            let prompt_tokens = completion.metrics.prompt_tokens;
-            let completion_tokens = completion.metrics.completion_tokens;
-            let turn_tokens = prompt_tokens
-                .map(|p| p as u32)
-                .unwrap_or_else(|| history_tokens(&messages) as u32)
-                .saturating_add(completion_tokens.map(|c| c as u32).unwrap_or(0));
-            ctx.sem.update_context_tokens(&ctx.task_id, turn_tokens);
-        }
+        // resume it (subject to the 90% ceiling-aligned resume watermark on load),
+        // and record the turn's token footprint on the held lease.
+        persist_and_record_turn(options, session_id, &messages, &completion);
     }
 
     // Record the final event.
@@ -2474,5 +2500,125 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    #[tokio::test]
+    async fn image_attachment_preserves_tool_adjacency_with_other_tool_and_finish() {
+        // Case A: `[read_file(img), other_tool]` -> `assistant(tool_calls)` ->
+        // `tool(img)` -> `tool(other_tool)` -> `user(image)`.
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_img_adj_other");
+        let engine = RecordingEngine::new(vec![
+            comp(
+                "",
+                vec![
+                    tc("r1", "read_file", r#"{"path":"img.png"}"#),
+                    tc("b1", "bash", r#"{"command":"echo ok"}"#),
+                ],
+                None,
+            ),
+            comp(
+                "",
+                vec![tc("f1", FINISH_TOOL_NAME, r#"{"summary":"Inspected."}"#)],
+                None,
+            ),
+        ]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(
+                vec![
+                    "[IMAGE_ATTACHMENT:data:image/png;base64,iVBORw0KGgo=:path:img.png]\nLoaded image."
+                        .to_string(),
+                    "ok".to_string(),
+                ]
+                .into(),
+            ),
+        };
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "inspect",
+            &[
+                tool_schema("read_file"),
+                tool_schema("bash"),
+                tool_schema(FINISH_TOOL_NAME),
+            ],
+            Some(&SessionOptions::with_state(state.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status, "completed");
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        let turn2_msgs = &calls[1].messages;
+        let roles: Vec<&str> = turn2_msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["system", "user", "assistant", "tool", "tool", "user"],
+            "tool results must stay contiguous before trailing visual attachment: {turn2_msgs:?}"
+        );
+        assert_eq!(turn2_msgs[3].tool_call_id.as_deref(), Some("r1"));
+        assert_eq!(turn2_msgs[4].tool_call_id.as_deref(), Some("b1"));
+        assert!(
+            turn2_msgs[5]
+                .content
+                .starts_with("[Visual Inspection Attachment: data:image/png;base64,"),
+            "visual attachment must appear after all tool results: {:?}",
+            turn2_msgs[5]
+        );
+        drop(calls);
+        let _ = std::fs::remove_dir_all(state.root());
+
+        // Case B: `[read_file(img), finish]` -> `assistant(tool_calls)` ->
+        // `tool(img)` -> `tool(finish)` with no trailing `user(image)` message.
+        let state2 = tmp_state();
+        let logger2 = EventLogger::new(&state2, "sess_img_adj_finish");
+        let engine2 = RecordingEngine::new(vec![comp(
+            "",
+            vec![
+                tc("r1", "read_file", r#"{"path":"img.png"}"#),
+                tc("f1", FINISH_TOOL_NAME, r#"{"summary":"Done with image."}"#),
+            ],
+            None,
+        )]);
+        let executor2 = MockExecutor {
+            results: tokio::sync::Mutex::new(
+                vec![
+                    "[IMAGE_ATTACHMENT:data:image/png;base64,iVBORw0KGgo=:path:img.png]\nLoaded image."
+                        .to_string(),
+                ]
+                .into(),
+            ),
+        };
+
+        let res2 = run_session(
+            &engine2,
+            &executor2,
+            &logger2,
+            "sys",
+            "inspect",
+            &[tool_schema("read_file"), tool_schema(FINISH_TOOL_NAME)],
+            Some(&SessionOptions::with_state(state2.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res2.status, "completed");
+        assert_eq!(res2.final_text, "Done with image.");
+
+        let persisted = crate::runner::context::load_messages(&state2, logger2.session_id())
+            .expect("persisted history must exist");
+        let persisted_roles: Vec<&str> = persisted.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            persisted_roles,
+            vec!["user", "assistant", "tool", "tool"],
+            "terminal finish must omit trailing user image attachment: {persisted:?}"
+        );
+        assert_eq!(persisted[2].tool_call_id.as_deref(), Some("r1"));
+        assert_eq!(persisted[3].tool_call_id.as_deref(), Some("f1"));
+
+        let _ = std::fs::remove_dir_all(state2.root());
     }
 }

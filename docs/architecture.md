@@ -85,7 +85,7 @@ against the aggregate KV pool (`pool_capacity_tokens`). Dispatches that would sa
 the pool are enqueued in a dynamic FIFO wait-queue and admitted as slots free up.
 When pressure builds, the **cooperative yield gate** (`pool_yield_gate`) lets younger
 sessions voluntarily yield to older ones, preventing GPU VRAM thrashing under concurrency spikes.
-See [`src/task/semaphore.rs`](../src/task/semaphore.rs).
+See [`src/task/semaphore/`](../src/task/semaphore/).
 
 ### 4. Stream Proxy & Sanitizer
 

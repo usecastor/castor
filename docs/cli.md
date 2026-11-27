@@ -36,8 +36,8 @@ against your own ledger to measure your own savings.
 
 ```bash
 # Clone repository
-git clone https://github.com/ApatheticMioz/Castor.git
-cd Castor
+git clone https://github.com/usecastor/castor.git
+cd castor
 
 # Build release binary
 cargo build --release

@@ -623,6 +623,9 @@ impl FsExecutor {
                         out_lines.push(format!("{}{}{}", win_base_ws, extra_spaces, content));
                     }
                 }
+                if out_lines.is_empty() {
+                    return String::new();
+                }
                 let mut res = out_lines.join(newline_sep);
                 if trailing_newline {
                     res.push_str(newline_sep);
@@ -2453,6 +2456,26 @@ mod tests {
         assert!(
             !out_none.contains("case-insensitive matches"),
             "no header when the CI pass also finds nothing: {out_none}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn edit_tier2_3_empty_replacement_deletes_without_stray_newline() {
+        let root = test_root("tier2_3_delete");
+        let file = root.join("sample.txt");
+        // File uses 4-space indentation; target uses 2-space indentation so Tier 1
+        // does not match and Tier 2/3 relative-indentation matching runs.
+        fs::write(&file, "before\n    line_a\n    line_b\nafter\n").unwrap();
+        let ex = executor(&root);
+
+        ex.edit_file("sample.txt", "  line_a\n  line_b", "", false)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "before\nafter\n",
+            "deleting a multi-line block via Tier 2/3 must leave no stray blank line"
         );
 
         let _ = fs::remove_dir_all(&root);

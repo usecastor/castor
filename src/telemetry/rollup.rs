@@ -2037,9 +2037,9 @@ mod tests {
         let _ = fs::remove_dir_all(&state);
     }
 
-    /// Backward compatibility: `stats.json` files written by an older build
-    /// (pre-`total_tasks_salvaged` / `total_tasks_rejected_decomposition`)
-    /// still deserialize, with the new fields defaulting to zero.
+    /// `stats.json` payloads omitting `total_tasks_salvaged` or
+    /// `total_tasks_rejected_decomposition` deserialize cleanly with both
+    /// fields defaulting to zero.
     #[test]
     fn stats_json_without_new_task_fields_deserializes() {
         let legacy = serde_json::json!({
