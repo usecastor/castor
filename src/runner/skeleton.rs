@@ -129,7 +129,9 @@ pub fn build_workspace_skeleton(workspace: &Path) -> String {
 /// and format them into a bounded prompt context block (<=2,500 tokens).
 #[cfg(feature = "ast")]
 pub fn build_prompt_retrieved_context(workspace: &Path, prompt: &str) -> String {
-    let graph = crate::tools::graph::CodePropertyGraph::build_from_workspace(workspace, 120);
+    let graph = crate::tools::graph::CodePropertyGraph::build_from_workspace_for_prompt(
+        workspace, 120, prompt,
+    );
     let relevant = graph.retrieve_relevant_symbols(prompt, 8);
     crate::tools::graph::render_graph_context(&relevant, 10_000)
 }

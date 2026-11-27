@@ -4,7 +4,7 @@ use futures_util::future::join_all;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use crate::engine::{Message, ToolCall, ToolSchema};
+use crate::engine::{Completion, Message, ToolCall, ToolSchema};
 use crate::runner::budget::{LOOP_THRESHOLD, LOOP_WINDOW};
 use crate::runner::context::{
     CONTEXT_CEILING_DIRECTIVE, history_tokens, in_flight_ceiling_tokens, in_flight_context_tokens,
@@ -16,13 +16,98 @@ use crate::runner::messages::{
     completion_text, metrics_json, msg, sanitize_tool_delimiters, strip_reasoning_tags,
 };
 use crate::runner::salvage::{
-    is_reasoning_ceiling, run_degenerate_final_salvage, run_reasoning_ceiling_salvage,
+    extract_finish_summary, is_reasoning_ceiling, run_degenerate_final_salvage,
+    run_reasoning_ceiling_salvage,
 };
 use crate::runner::skeleton::spill_tool_output;
 use crate::runner::watchdog::chat_with_watchdog;
 use crate::runner::{
     ChatEngine, RunnerError, SessionOptions, SessionResult, ToolExecutor, ToolOutcome,
 };
+use crate::tools::FINISH_TOOL_NAME;
+
+/// Maximum consecutive plain-text (no-tool-call) turns the runner will nudge
+/// before landing the session, when the session opted into the explicit
+/// `finish` control-flow tool. Bounded so a model that neither calls tools nor
+/// calls `finish` can never loop the session on repeated nudges.
+const MAX_NO_TOOL_NUDGES: u32 = 2;
+
+/// Push queued visual attachment `user` messages after all `role: "tool"`
+/// messages of a turn have been appended, replacing any earlier visual
+/// attachment to respect the 1-image limit.
+fn push_image_attachments(messages: &mut Vec<Message>, attachments: Vec<String>) {
+    for data_url in attachments {
+        for m in messages.iter_mut() {
+            if m.role == "user" && m.content.starts_with("[Visual Inspection Attachment:") {
+                m.content = "[Prior visual attachment cleared to stay within the 1-image limit]"
+                    .to_string();
+            }
+        }
+        messages.push(Message {
+            role: "user".into(),
+            content: format!("[Visual Inspection Attachment: {data_url}]"),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        });
+    }
+}
+
+/// Persist the turn's message history and record its token footprint on the
+/// held slot lease so the aggregate KV pool reflects active sessions.
+fn persist_and_record_turn(
+    options: Option<&SessionOptions>,
+    session_id: &str,
+    messages: &[Message],
+    completion: &Completion,
+) {
+    if let Some(state) = options.and_then(|o| o.state.as_ref()) {
+        save_messages(state, session_id, messages);
+    }
+
+    if let Some(ctx) = options.and_then(|o| o.lease_context.as_ref()) {
+        let prompt_tokens = completion.metrics.prompt_tokens;
+        let completion_tokens = completion.metrics.completion_tokens;
+        let turn_tokens = prompt_tokens
+            .map(|p| p as u32)
+            .unwrap_or_else(|| history_tokens(messages) as u32)
+            .saturating_add(completion_tokens.map(|c| c as u32).unwrap_or(0));
+        ctx.sem.update_context_tokens(&ctx.task_id, turn_tokens);
+    }
+}
+
+/// Append one `role: "tool"` result message and ledger event for a Phase-4
+/// `finish` call. Returns the (trimmed, non-empty) `summary` carried by the
+/// last such call, if any, so the caller can resolve the final report. The
+/// result message is appended in the caller's dispatch order, preserving the
+/// `assistant(tool_calls)` → `tool(results)` alternation a resumed session
+/// requires.
+fn append_finish_results(
+    messages: &mut Vec<Message>,
+    logger: &EventLogger,
+    turns: u32,
+    finish_calls: &[(usize, &ToolCall)],
+    result: &str,
+) -> Option<String> {
+    let mut last_summary: Option<String> = None;
+    for (_idx, tc) in finish_calls {
+        last_summary = extract_finish_summary(&tc.arguments);
+        messages.push(Message {
+            role: "tool".into(),
+            content: result.to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tc.id.clone()),
+        });
+        let _ = logger.append(serde_json::json!({
+            "type": "tool_result",
+            "turn": turns,
+            "tool_call_id": tc.id,
+            "name": tc.name,
+            "is_error": false,
+            "output": result,
+        }));
+    }
+    last_summary
+}
 
 /// Helper to decide whether a resumed history should be kept: the 90%
 /// ceiling-aligned watermark (`in_flight_ceiling_tokens` / `watermark_tokens`)
@@ -475,6 +560,26 @@ pub async fn run_session(
     // turn and the session can never loop on it.
     let mut unverified_code_edit = false;
     let mut verification_nudge_sent = false;
+    // Explicit `finish` opt-in, detected by *schema name presence*: the session
+    // is considered to have advertised the `finish` control-flow tool iff some
+    // tool schema in the (unchanged, byte-identical) list is named `finish`
+    // (the `function.name` slot in the OpenAI wire shape; the Rust
+    // [`ToolSchema`] carries it directly as `.name`). This preserves every
+    // existing mock-tool test — they pass plain `tool_schema(name)` fixtures
+    // that are never named `finish` — so `explicit_finish_enabled` stays
+    // `false` and the new nudge / Phase-4 interception paths remain inert for
+    // them. Detection never mutates `tools`, so the KV prefix cache stays
+    // intact.
+    let explicit_finish_enabled = tools.iter().any(|t| t.name == FINISH_TOOL_NAME);
+    // Bounded plain-text nudge counter (explicit `finish` sessions only):
+    // reset on any turn that executes at least one tool call; at most
+    // `MAX_NO_TOOL_NUDGES` consecutive no-tool turns get a nudge before the
+    // session lands, so a model that neither calls tools nor `finish` can
+    // never loop the session.
+    let mut consecutive_no_tool_nudges: u32 = 0;
+    // One-shot latch: an empty / malformed `finish(summary)` is rejected (with
+    // a tool result asking for a non-empty summary) at most once per session.
+    let mut empty_finish_rejected = false;
     let mut last_prompt_tokens: Option<usize> = if ceiling_tokens > 0 {
         engine.count_tokens(&messages, tools).await
     } else {
@@ -609,7 +714,47 @@ pub async fn run_session(
         });
 
         if break_after_turn {
-            final_text = completion_text(&completion);
+            // The in-flight 90% context ceiling: no workspace tool is executed
+            // on this turn. If the model still emitted tool calls, close every
+            // one with a well-formed `role: "tool"` result so a resumed session
+            // never carries a dangling, unanswered `tool_call` (a hard
+            // provider rejection on reload). `finish` is acknowledged as
+            // completed; any workspace tool is recorded as skipped. The final
+            // text prefers an explicit `finish(summary)` argument, else the
+            // turn's own synthesis. `status` stays `"completed"` — this path
+            // lands the completion in the remaining headroom and never nudges.
+            if !completion.tool_calls.is_empty() {
+                let finish_summary = completion
+                    .tool_calls
+                    .iter()
+                    .rev()
+                    .find(|tc| tc.name == FINISH_TOOL_NAME)
+                    .and_then(|tc| extract_finish_summary(&tc.arguments));
+                for tc in &completion.tool_calls {
+                    let response = if tc.name == FINISH_TOOL_NAME {
+                        "Task completed.".to_string()
+                    } else {
+                        "Skipped: 90% working-context ceiling reached.".to_string()
+                    };
+                    messages.push(Message {
+                        role: "tool".into(),
+                        content: response.clone(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some(tc.id.clone()),
+                    });
+                    let _ = logger.append(serde_json::json!({
+                        "type": "tool_result",
+                        "turn": turns,
+                        "tool_call_id": tc.id,
+                        "name": tc.name,
+                        "is_error": false,
+                        "output": response,
+                    }));
+                }
+                final_text = finish_summary.unwrap_or_else(|| completion_text(&completion));
+            } else {
+                final_text = completion_text(&completion);
+            }
             break;
         }
 
@@ -618,6 +763,7 @@ pub async fn run_session(
             final_text = completion_text(&completion);
 
             if ceiling_hit {
+                // Reasoning ceiling: salvage first, never nudged.
                 let outcome = run_reasoning_ceiling_salvage(
                     engine,
                     executor,
@@ -635,12 +781,35 @@ pub async fn run_session(
                 break;
             }
 
+            // Degenerate empty final after real tool activity: salvage second,
+            // never nudged.
             if final_text.trim().is_empty() && tool_activity {
                 let outcome =
                     run_degenerate_final_salvage(engine, logger, &mut messages, effort, turns)
                         .await?;
                 final_text = outcome.final_text;
                 status = outcome.status;
+                break;
+            }
+
+            // After both salvage paths: when the session opted into the
+            // explicit `finish` tool, nudge a plain-text (no-tool-call) turn at
+            // most `MAX_NO_TOOL_NUDGES` times in a row before landing. Zero
+            // prose regexes — the decision is purely structural. Any turn that
+            // does call tools (below) resets the counter.
+            if explicit_finish_enabled && consecutive_no_tool_nudges < MAX_NO_TOOL_NUDGES {
+                consecutive_no_tool_nudges += 1;
+                let _ = logger.append(serde_json::json!({
+                    "type": "no_tool_nudge",
+                    "turn": turns,
+                    "count": consecutive_no_tool_nudges,
+                }));
+                messages.push(msg(
+                    "user",
+                    "[System: No tool call received. Continue calling tools if work remains, or \
+                     call `finish(summary)` to return your final response.]",
+                ));
+                continue;
             }
 
             break;
@@ -650,12 +819,18 @@ pub async fn run_session(
         // Phase 1: Read-only tools dispatched concurrently.
         // Phase 2: Mutation tools executed after Phase 1.
         // Phase 3: Shell commands (bash) barrier executed after Phase 2.
+        // Phase 4: the explicit `finish` control-flow tool — partitioned out of
+        // Phases 1–3 so it is *never* dispatched to the workspace executor;
+        // Phases 1 → 2 → 3 always run before `finish` is evaluated.
         let mut phase1 = Vec::new();
         let mut phase2 = Vec::new();
         let mut phase3 = Vec::new();
+        let mut phase4_finish = Vec::new();
 
         for (i, tc) in completion.tool_calls.iter().enumerate() {
-            if is_phase1_read(&tc.name) {
+            if tc.name == FINISH_TOOL_NAME {
+                phase4_finish.push((i, tc));
+            } else if is_phase1_read(&tc.name) {
                 phase1.push((i, tc));
             } else if is_phase2_write(&tc.name) {
                 phase2.push((i, tc));
@@ -693,6 +868,11 @@ pub async fn run_session(
         }
 
         // Deterministic Reassembly (Index-Sorted for KV Prefix Invariant)
+        //
+        // Any turn that executed at least one tool call resets the no-tool
+        // nudge counter (the counter only counts *consecutive* no-tool turns).
+        consecutive_no_tool_nudges = 0;
+
         let mut all_results = Vec::with_capacity(completion.tool_calls.len());
         all_results.extend(phase1_results);
         all_results.extend(phase2_results);
@@ -701,6 +881,7 @@ pub async fn run_session(
 
         let has_bash = completion.tool_calls.iter().any(|tc| tc.name == "bash");
         let mut deferred_advisory: Option<String> = None;
+        let mut pending_image_attachments: Vec<String> = Vec::new();
         for (_idx, tc, outcome) in all_results {
             tool_activity = true;
             record_verification_state(
@@ -755,19 +936,7 @@ pub async fn run_session(
             });
 
             if let Some(data_url) = image_attachment {
-                for m in &mut messages {
-                    if m.role == "user" && m.content.starts_with("[Visual Inspection Attachment:") {
-                        m.content =
-                            "[Prior visual attachment cleared to stay within the 1-image limit]"
-                                .to_string();
-                    }
-                }
-                messages.push(Message {
-                    role: "user".into(),
-                    content: format!("[Visual Inspection Attachment: {data_url}]"),
-                    tool_call_id: None,
-                    tool_calls: Vec::new(),
-                });
+                pending_image_attachments.push(data_url);
             }
 
             logger
@@ -803,6 +972,89 @@ impasse, state your findings and ask for alignment rather than continuing to re-
             }
         }
 
+        // Phase 4: the explicit `finish` control-flow tool. The Phases 1→2→3
+        // workspace calls above have all been executed and their `role: "tool"`
+        // results appended in dispatch-index order *before* `finish` is
+        // evaluated. `finish` itself was never dispatched to the executor
+        // (partitioned out above) and never fed to the loop detector. We now
+        // resolve it, appending its canned result(s) in dispatch-index order
+        // so the turn ends on a clean `assistant(tool_calls)` +
+        // `tool(results)` tail with no dangling, unanswered `tool_call`.
+        if !phase4_finish.is_empty() {
+            // The last `finish` call carries the report; when its `summary`
+            // is empty/malformed, fall back to the turn's own synthesis.
+            let resolved_summary = phase4_finish
+                .last()
+                .and_then(|(_, tc)| extract_finish_summary(&tc.arguments))
+                .or_else(|| {
+                    let ct = completion_text(&completion);
+                    if ct.trim().is_empty() { None } else { Some(ct) }
+                });
+
+            if unverified_code_edit && !has_bash && !verification_nudge_sent {
+                // One-shot verification intercept: verifiable code changed this
+                // turn without a `bash` verification command. Defer `finish`
+                // with a tool result telling the model to verify first; set the
+                // latch so the duplicate end-of-turn advisory (below) is
+                // skipped.
+                verification_nudge_sent = true;
+                let _ = logger.append(serde_json::json!({
+                    "type": "finish_deferred",
+                    "turn": turns,
+                    "reason": "unverified_code_edit",
+                }));
+                append_finish_results(
+                    &mut messages,
+                    logger,
+                    turns,
+                    &phase4_finish,
+                    "Finish deferred: verifiable code was modified without running \
+                     verification via bash. Run verification now, then call finish(summary).",
+                );
+                push_image_attachments(&mut messages, pending_image_attachments);
+                persist_and_record_turn(options, session_id, &messages, &completion);
+                continue;
+            }
+
+            if resolved_summary.is_none() && tool_activity && !empty_finish_rejected {
+                // One-shot empty/malformed guard: reject the empty `finish`
+                // once, asking for a non-empty grounded summary, then let the
+                // model retry.
+                empty_finish_rejected = true;
+                let _ = logger.append(serde_json::json!({
+                    "type": "finish_rejected",
+                    "turn": turns,
+                    "reason": "empty_summary",
+                }));
+                append_finish_results(
+                    &mut messages,
+                    logger,
+                    turns,
+                    &phase4_finish,
+                    "Finish rejected: provide a non-empty grounded `summary` argument.",
+                );
+                push_image_attachments(&mut messages, pending_image_attachments);
+                persist_and_record_turn(options, session_id, &messages, &completion);
+                continue;
+            }
+
+            // Clean terminal completion: acknowledge `finish`, land the report
+            // as the final text, and break *before* pushing trailing `user`
+            // image attachments, loop advisories, or nudges so `messages.json`
+            // ends on the clean `assistant(tool_calls)` + `tool(results)` tail.
+            append_finish_results(
+                &mut messages,
+                logger,
+                turns,
+                &phase4_finish,
+                "Task completed.",
+            );
+            final_text = resolved_summary.unwrap_or_else(|| completion_text(&completion));
+            break;
+        }
+
+        push_image_attachments(&mut messages, pending_image_attachments);
+
         if let Some(advisory) = deferred_advisory {
             messages.push(msg("user", advisory));
         } else if unverified_code_edit && !has_bash && !verification_nudge_sent {
@@ -821,22 +1073,9 @@ impasse, state your findings and ask for alignment rather than continuing to re-
         }
 
         // End of turn: persist the sanitized history so a later dispatch can
-        // resume it (subject to the 90% ceiling-aligned resume watermark on load).
-        if let Some(state) = options.and_then(|o| o.state.as_ref()) {
-            save_messages(state, session_id, &messages);
-        }
-
-        // Per-turn slot bookkeeping: record the turn's token footprint on the held lease
-        // so the aggregate KV pool accurately reflects all active sessions.
-        if let Some(ctx) = options.and_then(|o| o.lease_context.as_ref()) {
-            let prompt_tokens = completion.metrics.prompt_tokens;
-            let completion_tokens = completion.metrics.completion_tokens;
-            let turn_tokens = prompt_tokens
-                .map(|p| p as u32)
-                .unwrap_or_else(|| history_tokens(&messages) as u32)
-                .saturating_add(completion_tokens.map(|c| c as u32).unwrap_or(0));
-            ctx.sem.update_context_tokens(&ctx.task_id, turn_tokens);
-        }
+        // resume it (subject to the 90% ceiling-aligned resume watermark on load),
+        // and record the turn's token footprint on the held lease.
+        persist_and_record_turn(options, session_id, &messages, &completion);
     }
 
     // Record the final event.
@@ -917,7 +1156,7 @@ mod tests {
 
     /// One recorded `chat` call: the exact messages and tool schemas it was
     /// invoked with.
-    #[derive(Default, Clone)]
+    #[derive(Default, Clone, Debug)]
     struct RecordedCall {
         messages: Vec<Message>,
         tools: Vec<ToolSchema>,
@@ -1554,5 +1793,832 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    // (1) The explicit `finish` control-flow tool terminates the session in a
+    // single turn: it is never dispatched to the executor (no workspace side
+    // effect) and its non-empty `summary` argument becomes the final report.
+    #[tokio::test]
+    async fn finish_tool_terminates_session_with_summary() {
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_fin_1");
+        let engine = RecordingEngine::new(vec![comp(
+            "",
+            vec![tc(
+                "f1",
+                FINISH_TOOL_NAME,
+                r#"{"summary":"All work done and verified."}"#,
+            )],
+            None,
+        )]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(VecDeque::new()),
+        };
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "work",
+            &[tool_schema("bash"), tool_schema(FINISH_TOOL_NAME)],
+            Some(&SessionOptions::with_state(state.clone())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.status, "completed");
+        assert_eq!(
+            res.final_text, "All work done and verified.",
+            "the `finish` summary argument becomes the final report"
+        );
+        assert_eq!(res.turns, 1);
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(calls.len(), 1, "the session must land on the `finish` turn");
+
+        // `finish` is a control-flow tool: the executor must never run it, so
+        // no scripted workspace result is consumed and no other call is made.
+        let events = logger.read_all();
+        assert!(
+            events.iter().any(|e| {
+                e["type"] == "tool_result"
+                    && e["tool_call_id"] == "f1"
+                    && e["output"] == "Task completed."
+            }),
+            "the `finish` call must be acknowledged with a canned result: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    // (2) A `finish` call with an empty / malformed `summary` (after real
+    // prior tool activity) is rejected — a non-empty-summary request is
+    // appended as the `finish` tool result — and the session continues rather
+    // than terminating.
+    #[tokio::test]
+    async fn empty_tool_call_with_explicit_finish_nudges_and_continues() {
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_fin_2");
+        let engine = RecordingEngine::new(vec![
+            // Real tool activity first: `tool_activity` becomes true, which is
+            // the precondition for the empty-`finish` rejection guard.
+            comp("", vec![tc("b1", "bash", r#"{"command":"echo hi"}"#)], None),
+            comp(
+                "",
+                vec![tc("f1", FINISH_TOOL_NAME, r#"{"summary":""}"#)],
+                None,
+            ),
+            comp(
+                "",
+                vec![tc("f2", FINISH_TOOL_NAME, r#"{"summary":"Done now."}"#)],
+                None,
+            ),
+        ]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(vec!["ok".to_string()].into()),
+        };
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "work",
+            &[tool_schema("bash"), tool_schema(FINISH_TOOL_NAME)],
+            Some(&SessionOptions::with_state(state.clone())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.status, "completed");
+        assert_eq!(
+            res.final_text, "Done now.",
+            "the retried non-empty summary wins"
+        );
+        assert_eq!(
+            res.turns, 3,
+            "turn 1 (bash) + turn 2 (empty finish, rejected) + turn 3 (good finish)"
+        );
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(calls.len(), 3);
+        // The rejection result must be in context on the retry turn.
+        assert!(
+            calls[2]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("provide a non-empty grounded")),
+            "the retry turn must carry the rejection tool result: {calls:?}"
+        );
+        // One-shot latch: exactly one `finish_rejected` event across the run.
+        let events = logger.read_all();
+        let rejected = events
+            .iter()
+            .filter(|e| e["type"] == "finish_rejected")
+            .count();
+        assert_eq!(
+            rejected, 1,
+            "the empty-`finish` rejection must fire exactly once: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    // (3) A model that answers every turn with plain text (no tool calls, no
+    // `finish`) gets nudged at most `MAX_NO_TOOL_NUDGES` times before the
+    // session lands — it can never loop on repeated nudges.
+    #[tokio::test]
+    async fn empty_tool_call_nudge_is_bounded_and_terminates() {
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_fin_3");
+        // Three plain-text answers with no tool calls. `prompt_tokens` stays
+        // well under the 90% in-flight ceiling (900 of 1000), so the nudge
+        // path — not the ceiling — governs termination.
+        let engine = RecordingEngine::new(vec![
+            comp("Still working on it…", Vec::new(), Some(100)),
+            comp("Still working on it…", Vec::new(), Some(100)),
+            comp("Okay, I am done.", Vec::new(), Some(100)),
+        ]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(VecDeque::new()),
+        };
+        let mut options = SessionOptions::with_state(state.clone());
+        options.max_context = 1_000; // 90% ceiling = 900 > 100, so it never trips
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "work",
+            &[tool_schema("bash"), tool_schema(FINISH_TOOL_NAME)],
+            Some(&options),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.status, "completed");
+        assert_eq!(
+            res.final_text, "Okay, I am done.",
+            "lands on the third plain turn"
+        );
+        assert_eq!(
+            res.turns, 3,
+            "turn 1 (nudge 1) + turn 2 (nudge 2) + turn 3 (land) — bounded, never loops"
+        );
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(calls.len(), 3);
+        let events = logger.read_all();
+        let nudges = events
+            .iter()
+            .filter(|e| e["type"] == "no_tool_nudge")
+            .count();
+        assert_eq!(
+            nudges, 2,
+            "at most `MAX_NO_TOOL_NUDGES` (2) nudges, then the session lands: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    // (4) A `finish` issued on the same turn as an unverified code edit is
+    // deferred once (verification nudge). After the model runs `bash` and
+    // retries `finish`, the session completes.
+    #[tokio::test]
+    async fn finish_after_unverified_edit_defers_once_then_completes_after_bash() {
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_fin_4");
+        let engine = RecordingEngine::new(vec![
+            comp(
+                "Editing then stopping.",
+                vec![
+                    tc(
+                        "e1",
+                        "edit_file",
+                        r#"{"path":"src/lib.rs","content":"fn x(){}"}"#,
+                    ),
+                    tc("f1", FINISH_TOOL_NAME, r#"{"summary":"Done."}"#),
+                ],
+                None,
+            ),
+            comp(
+                "Verifying then stopping.",
+                vec![
+                    tc("b1", "bash", r#"{"command":"cargo check"}"#),
+                    tc(
+                        "f2",
+                        FINISH_TOOL_NAME,
+                        r#"{"summary":"Verified and done."}"#,
+                    ),
+                ],
+                None,
+            ),
+        ]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(vec!["ok".to_string(), "ok".to_string()].into()),
+        };
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "work",
+            &[
+                tool_schema("edit_file"),
+                tool_schema("bash"),
+                tool_schema(FINISH_TOOL_NAME),
+            ],
+            Some(&SessionOptions::with_state(state.clone())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.status, "completed");
+        assert_eq!(
+            res.final_text, "Verified and done.",
+            "the post-bash retry `finish` summary is the report"
+        );
+        assert_eq!(res.turns, 2);
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        // The deferred `finish` on turn 1 must not land the session: the retry
+        // turn carries the deferral tool result.
+        assert!(
+            calls[1]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("Run verification now")),
+            "the retry turn must carry the deferral tool result: {calls:?}"
+        );
+        let events = logger.read_all();
+        let deferred = events
+            .iter()
+            .filter(|e| e["type"] == "finish_deferred")
+            .count();
+        assert_eq!(
+            deferred, 1,
+            "the verification intercept must fire exactly once: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    // (5) A single turn mixing a phase-1 read, a phase-2 write, a phase-3
+    // bash, and a `finish` executes the workspace calls in phase order
+    // (read → write → bash) and lands on the `finish` summary — all in one
+    // turn, `finish` partitioned out of the executor entirely.
+    #[tokio::test]
+    async fn batched_phases_1_2_3_and_finish_execute_in_order() {
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_fin_5");
+        let engine = RecordingEngine::new(vec![comp(
+            "",
+            vec![
+                tc("r1", "read_file", r#"{"path":"src/lib.rs"}"#),
+                tc(
+                    "w1",
+                    "write_file",
+                    r#"{"path":"src/lib.rs","content":"fn y(){}"}"#,
+                ),
+                tc("b1", "bash", r#"{"command":"cargo check"}"#),
+                tc("f1", FINISH_TOOL_NAME, r#"{"summary":"All phases ran."}"#),
+            ],
+            None,
+        )]);
+        // Phase order: phase 1 read → phase 2 write → phase 3 bash.
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(
+                vec!["READ".to_string(), "WRITE".to_string(), "BASH".to_string()].into(),
+            ),
+        };
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "work",
+            &[
+                tool_schema("read_file"),
+                tool_schema("write_file"),
+                tool_schema("bash"),
+                tool_schema(FINISH_TOOL_NAME),
+            ],
+            Some(&SessionOptions::with_state(state.clone())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.status, "completed");
+        assert_eq!(res.final_text, "All phases ran.");
+        assert_eq!(res.turns, 1, "all four calls resolve on a single turn");
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(calls.len(), 1, "a single turn");
+        drop(calls);
+
+        // The `tool_result` ledger events are appended in dispatch-index
+        // order, so their sequence proves the phase ordering (read → write →
+        // bash) and that `finish` (last) carried the canned result rather than
+        // a workspace side effect.
+        let events = logger.read_all();
+        let results: Vec<(&str, &str, &str)> = events
+            .iter()
+            .filter(|e| e["type"] == "tool_result")
+            .map(|e| {
+                (
+                    e["tool_call_id"].as_str().unwrap_or(""),
+                    e["name"].as_str().unwrap_or(""),
+                    e["output"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("r1", "read_file", "READ"),
+                ("w1", "write_file", "WRITE"),
+                ("b1", "bash", "BASH"),
+                ("f1", FINISH_TOOL_NAME, "Task completed."),
+            ],
+            "workspace phases run read → write → bash, `finish` last with a canned \
+             result (never dispatched to the executor): {results:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    // (6) On the 90% in-flight ceiling turn the model still emits a `finish`
+    // plus a workspace tool: no tool is executed, every `tool_call` is closed
+    // with a well-formed `role: "tool"` result (no dangling call on resume),
+    // the `finish` summary becomes the report, and the turn is not nudged.
+    #[tokio::test]
+    async fn context_ceiling_90_percent_with_finish_extracts_summary_and_closes_tool_calls() {
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_fin_6");
+        let big_prompt = "x".repeat(3_700); // ~925 chars/4 → triggers the 90% gate at max_context=1000
+        let engine = RecordingEngine::new(vec![comp(
+            "done",
+            vec![
+                tc("f1", FINISH_TOOL_NAME, r#"{"summary":"Ceiling report."}"#),
+                tc("b1", "bash", r#"{"command":"cargo check"}"#),
+            ],
+            Some(950),
+        )]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(VecDeque::new()),
+        };
+        let mut options = SessionOptions::with_state(state.clone());
+        options.max_context = 1_000;
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            &big_prompt,
+            &[tool_schema("bash"), tool_schema(FINISH_TOOL_NAME)],
+            Some(&options),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.status, "completed");
+        assert_eq!(
+            res.final_text, "Ceiling report.",
+            "the `finish` summary is extracted on the ceiling turn"
+        );
+        assert_eq!(res.turns, 1);
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            1,
+            "the ceiling turn lands without another chat call"
+        );
+
+        // Every emitted `tool_call` must be answered by a `role: "tool"` result
+        // so a resumed session carries no dangling, unanswered call.
+        let events = logger.read_all();
+        let finish_res = events
+            .iter()
+            .find(|e| e["type"] == "tool_result" && e["tool_call_id"] == "f1")
+            .expect("the `finish` call must be closed");
+        assert_eq!(finish_res["output"], "Task completed.");
+        let bash_res = events
+            .iter()
+            .find(|e| e["type"] == "tool_result" && e["tool_call_id"] == "b1")
+            .expect("the workspace `bash` call must be closed");
+        assert_eq!(
+            bash_res["output"],
+            "Skipped: 90% working-context ceiling reached."
+        );
+
+        let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    // (7) On the 90% in-flight ceiling turn the model answers with plain text
+    // (no tool calls): the session lands immediately without injecting a
+    // `no_tool_nudge` (the ceiling path bypasses the nudge).
+    #[tokio::test]
+    async fn context_ceiling_90_percent_with_plain_text_breaks_without_nudging() {
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_fin_7");
+        let big_prompt = "x".repeat(3_700);
+        let engine = RecordingEngine::new(vec![comp("Final synthesis.", Vec::new(), Some(950))]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(VecDeque::new()),
+        };
+        let mut options = SessionOptions::with_state(state.clone());
+        options.max_context = 1_000;
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            &big_prompt,
+            &[tool_schema("bash"), tool_schema(FINISH_TOOL_NAME)],
+            Some(&options),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.status, "completed");
+        assert_eq!(res.final_text, "Final synthesis.");
+        assert_eq!(res.turns, 1);
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            1,
+            "the plain-text ceiling turn must not trigger a nudge turn"
+        );
+        let events = logger.read_all();
+        assert!(
+            events.iter().any(|e| e["type"] == "context_ceiling"),
+            "a context_ceiling event must be recorded: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["type"] == "no_tool_nudge"),
+            "the ceiling turn must break without a `no_tool_nudge`: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    // (8) A `length` reasoning-ceiling turn in an explicit-`finish` session
+    // runs the salvage path first (never nudged), and a `finish(summary)`
+    // during salvage is adopted directly — no redundant empty-tools synthesis
+    // call is made.
+    #[tokio::test]
+    async fn reasoning_ceiling_length_with_explicit_finish_runs_salvage_without_nudging() {
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_fin_8");
+        // Force the `length` finish reason on the ceiling turn.
+        let mut ceiling = comp("partial thoughts", Vec::new(), None);
+        ceiling.finish_reason = Some("length".into());
+        let engine = RecordingEngine::new(vec![
+            ceiling,
+            comp(
+                "",
+                vec![tc(
+                    "f1",
+                    FINISH_TOOL_NAME,
+                    r#"{"summary":"Salvaged finish report."}"#,
+                )],
+                None,
+            ),
+        ]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(VecDeque::new()),
+        };
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "work",
+            &[tool_schema("bash"), tool_schema(FINISH_TOOL_NAME)],
+            Some(&SessionOptions::with_state(state.clone())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            res.status, "reasoning_budget_exhausted",
+            "the honest ceiling status is preserved"
+        );
+        assert!(
+            res.final_text.contains("Salvaged finish report."),
+            "the `finish` summary adopted during salvage becomes the report: {}",
+            res.final_text
+        );
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            2,
+            "ceiling turn + one salvage call; a `finish` during salvage must skip the \
+             redundant empty-tools synthesis (no third call): {calls:?}"
+        );
+        let events = logger.read_all();
+        assert!(
+            !events.iter().any(|e| e["type"] == "no_tool_nudge"),
+            "the reasoning-ceiling path must salvage, never nudge: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    // (9) A degenerate empty final after real tool activity in an
+    // explicit-`finish` session runs the (empty-final) salvage path before any
+    // nudge, and the salvage retry's text becomes the report.
+    #[tokio::test]
+    async fn degenerate_empty_final_with_explicit_finish_runs_salvage_without_nudging() {
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_fin_9");
+        let engine = RecordingEngine::new(vec![
+            comp(
+                "",
+                vec![tc("b1", "bash", r#"{"command":"cargo check"}"#)],
+                None,
+            ),
+            comp("", Vec::new(), None),
+            comp("Degenerate salvage summary.", Vec::new(), None),
+        ]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(vec!["ok".to_string()].into()),
+        };
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "work",
+            &[tool_schema("bash"), tool_schema(FINISH_TOOL_NAME)],
+            Some(&SessionOptions::with_state(state.clone())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.status, "completed");
+        assert_eq!(
+            res.final_text, "Degenerate salvage summary.",
+            "the empty-final salvage retry text becomes the report"
+        );
+        assert_eq!(res.turns, 2);
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            3,
+            "tool turn + empty final + one salvage retry"
+        );
+        let events = logger.read_all();
+        assert!(
+            events.iter().any(|e| e["type"] == "salvage"),
+            "a salvage event must be recorded: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["type"] == "no_tool_nudge"),
+            "the degenerate path must salvage, never nudge: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    // (10) A persisted session that ended on a clean `assistant(tool_calls)` +
+    // `tool(results)` `finish` tail resumes with a well-formed message list
+    // (every assistant `tool_call` answered by a matching `role: "tool"`
+    // result, alternating) and the resumed turn continues from there.
+    #[tokio::test]
+    async fn resumed_session_after_finish_preserves_valid_message_alternation() {
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_fin_10");
+
+        // Seed a persisted history exactly as the Phase-4 `finish` path would
+        // land it: a `finish` tool call closed by its canned `role: "tool"`
+        // result, with no dangling unanswered call.
+        let prior = vec![
+            msg("user", "work"),
+            Message {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: vec![tc("f1", FINISH_TOOL_NAME, r#"{"summary":"Prior done."}"#)],
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: "Task completed.".into(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("f1".into()),
+            },
+        ];
+        crate::runner::context::save_messages(&state, logger.session_id(), &prior);
+
+        // The resumed session immediately calls `finish` again (clean
+        // termination) — one chat call. Its *pre-turn* message snapshot
+        // includes the persisted history plus the new user prompt, which is
+        // what we validate for valid alternation.
+        let engine = RecordingEngine::new(vec![comp(
+            "",
+            vec![tc(
+                "f2",
+                FINISH_TOOL_NAME,
+                r#"{"summary":"More work done."}"#,
+            )],
+            None,
+        )]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(VecDeque::new()),
+        };
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "more work",
+            &[tool_schema("bash"), tool_schema(FINISH_TOOL_NAME)],
+            Some(&SessionOptions::with_state(state.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status, "completed");
+        assert_eq!(res.turns, 1, "the resumed session lands on its single turn");
+        assert_eq!(res.final_text, "More work done.");
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(calls.len(), 1, "one chat call on the resumed session");
+        let msgs = &calls[0].messages;
+
+        // The persisted `finish` tail must be replayed verbatim (system is
+        // re-prepended, the `role: "tool"` result keeps its `tool_call_id`),
+        // and the resumed turn's new user prompt is appended last.
+        assert!(msgs.iter().any(|m| m.role == "system"));
+        // The new user prompt is present (the session resumed, not rolled over).
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == "user" && m.content == "more work"),
+            "the new user prompt must be present in the resumed context: {msgs:?}"
+        );
+        // The persisted finish tool call and its result must both be present.
+        assert!(
+            msgs.iter().any(|m| {
+                m.role == "assistant" && m.tool_calls.iter().any(|t| t.name == FINISH_TOOL_NAME)
+            }),
+            "the prior `finish` tool call must be replayed: {msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| { m.role == "tool" && m.tool_call_id.as_deref() == Some("f1") }),
+            "the prior `finish` tool result (tool_call_id = f1) must be replayed: {msgs:?}"
+        );
+
+        // Every assistant message that carries `tool_calls` must be followed by
+        // a `role: "tool"` message answering the first call — no dangling call.
+        for (i, m) in msgs.iter().enumerate() {
+            if m.role == "assistant" && !m.tool_calls.is_empty() {
+                let first_id = m.tool_calls[0].id.clone();
+                let answered = msgs.get(i + 1..).is_some_and(|tail| {
+                    tail.iter().any(|r| {
+                        r.role == "tool" && r.tool_call_id.as_deref() == Some(first_id.as_str())
+                    })
+                });
+                assert!(
+                    answered,
+                    "assistant tool_call {first_id} at index {i} must be answered: {msgs:?}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(state.root());
+    }
+
+    #[tokio::test]
+    async fn image_attachment_preserves_tool_adjacency_with_other_tool_and_finish() {
+        // Case A: `[read_file(img), other_tool]` -> `assistant(tool_calls)` ->
+        // `tool(img)` -> `tool(other_tool)` -> `user(image)`.
+        let state = tmp_state();
+        let logger = EventLogger::new(&state, "sess_img_adj_other");
+        let engine = RecordingEngine::new(vec![
+            comp(
+                "",
+                vec![
+                    tc("r1", "read_file", r#"{"path":"img.png"}"#),
+                    tc("b1", "bash", r#"{"command":"echo ok"}"#),
+                ],
+                None,
+            ),
+            comp(
+                "",
+                vec![tc("f1", FINISH_TOOL_NAME, r#"{"summary":"Inspected."}"#)],
+                None,
+            ),
+        ]);
+        let executor = MockExecutor {
+            results: tokio::sync::Mutex::new(
+                vec![
+                    "[IMAGE_ATTACHMENT:data:image/png;base64,iVBORw0KGgo=:path:img.png]\nLoaded image."
+                        .to_string(),
+                    "ok".to_string(),
+                ]
+                .into(),
+            ),
+        };
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "inspect",
+            &[
+                tool_schema("read_file"),
+                tool_schema("bash"),
+                tool_schema(FINISH_TOOL_NAME),
+            ],
+            Some(&SessionOptions::with_state(state.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status, "completed");
+
+        let calls = engine.calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        let turn2_msgs = &calls[1].messages;
+        let roles: Vec<&str> = turn2_msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["system", "user", "assistant", "tool", "tool", "user"],
+            "tool results must stay contiguous before trailing visual attachment: {turn2_msgs:?}"
+        );
+        assert_eq!(turn2_msgs[3].tool_call_id.as_deref(), Some("r1"));
+        assert_eq!(turn2_msgs[4].tool_call_id.as_deref(), Some("b1"));
+        assert!(
+            turn2_msgs[5]
+                .content
+                .starts_with("[Visual Inspection Attachment: data:image/png;base64,"),
+            "visual attachment must appear after all tool results: {:?}",
+            turn2_msgs[5]
+        );
+        drop(calls);
+        let _ = std::fs::remove_dir_all(state.root());
+
+        // Case B: `[read_file(img), finish]` -> `assistant(tool_calls)` ->
+        // `tool(img)` -> `tool(finish)` with no trailing `user(image)` message.
+        let state2 = tmp_state();
+        let logger2 = EventLogger::new(&state2, "sess_img_adj_finish");
+        let engine2 = RecordingEngine::new(vec![comp(
+            "",
+            vec![
+                tc("r1", "read_file", r#"{"path":"img.png"}"#),
+                tc("f1", FINISH_TOOL_NAME, r#"{"summary":"Done with image."}"#),
+            ],
+            None,
+        )]);
+        let executor2 = MockExecutor {
+            results: tokio::sync::Mutex::new(
+                vec![
+                    "[IMAGE_ATTACHMENT:data:image/png;base64,iVBORw0KGgo=:path:img.png]\nLoaded image."
+                        .to_string(),
+                ]
+                .into(),
+            ),
+        };
+
+        let res2 = run_session(
+            &engine2,
+            &executor2,
+            &logger2,
+            "sys",
+            "inspect",
+            &[tool_schema("read_file"), tool_schema(FINISH_TOOL_NAME)],
+            Some(&SessionOptions::with_state(state2.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res2.status, "completed");
+        assert_eq!(res2.final_text, "Done with image.");
+
+        let persisted = crate::runner::context::load_messages(&state2, logger2.session_id())
+            .expect("persisted history must exist");
+        let persisted_roles: Vec<&str> = persisted.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            persisted_roles,
+            vec!["user", "assistant", "tool", "tool"],
+            "terminal finish must omit trailing user image attachment: {persisted:?}"
+        );
+        assert_eq!(persisted[2].tool_call_id.as_deref(), Some("r1"));
+        assert_eq!(persisted[3].tool_call_id.as_deref(), Some("f1"));
+
+        let _ = std::fs::remove_dir_all(state2.root());
     }
 }

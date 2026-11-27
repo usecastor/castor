@@ -7,9 +7,26 @@ use tracing::warn;
 
 use crate::engine::{Completion, Message, ToolSchema};
 use crate::runner::events::EventLogger;
-use crate::runner::messages::{completion_text, msg};
+use crate::runner::messages::{completion_text, msg, strip_reasoning_tags};
 use crate::runner::skeleton::spill_tool_output;
 use crate::runner::{ChatEngine, RunnerError, SessionOptions, ToolExecutor, ToolOutcome};
+use crate::tools::FINISH_TOOL_NAME;
+
+/// Extract a trimmed, non-empty `summary` string from a `finish` tool call's
+/// JSON `arguments`. Returns `None` when the arguments are malformed, the
+/// `summary` field is absent or not a string, or it trims to empty. This is
+/// the single source of truth shared by the session Phase-4 `finish` handler
+/// and the reasoning-ceiling salvage path, so both agree on what counts as a
+/// usable final report.
+pub(crate) fn extract_finish_summary(arguments: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    let summary = value.get("summary")?.as_str()?.trim();
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary.to_string())
+    }
+}
 
 pub(crate) const REASONING_CEILING_FINISH: &str = "length";
 
@@ -104,13 +121,44 @@ pub(crate) async fn run_reasoning_ceiling_salvage(
             // run each tool call, log results, append them to history,
             // and perform a single-shot synthesis call.
             if !sc.tool_calls.is_empty() {
+                let open_tag = options
+                    .map(|o| o.effective_open_tag())
+                    .unwrap_or_else(|| concat!("<th", "ink>").to_string());
+                let close_tag = options
+                    .map(|o| o.effective_close_tag())
+                    .unwrap_or_else(|| concat!("</th", "ink>").to_string());
                 messages.push(Message {
                     role: "assistant".into(),
-                    content: sc.content.clone(),
+                    content: strip_reasoning_tags(&sc.content, &open_tag, &close_tag),
                     tool_calls: sc.tool_calls.clone(),
                     tool_call_id: None,
                 });
+                // If the peer engineer called `finish` during salvage, that is
+                // the explicit terminal signal: a control-flow tool we never
+                // execute, acknowledged with a canned result. Its non-empty
+                // `summary` (if any) becomes the recovered report directly.
+                let mut finish_summary: Option<String> = None;
                 for tc in &sc.tool_calls {
+                    if tc.name == FINISH_TOOL_NAME {
+                        if finish_summary.is_none() {
+                            finish_summary = extract_finish_summary(&tc.arguments);
+                        }
+                        let _ = logger.append(serde_json::json!({
+                            "type": "tool_result",
+                            "turn": turns + 1,
+                            "tool_call_id": tc.id,
+                            "name": tc.name,
+                            "is_error": false,
+                            "output": "Task completed.",
+                        }));
+                        messages.push(Message {
+                            role: "tool".into(),
+                            content: "Task completed.".into(),
+                            tool_calls: vec![],
+                            tool_call_id: Some(tc.id.clone()),
+                        });
+                        continue;
+                    }
                     let outcome = match executor.execute(&tc.name, &tc.arguments).await {
                         Ok(o) => o,
                         Err(e) => ToolOutcome {
@@ -150,13 +198,27 @@ pub(crate) async fn run_reasoning_ceiling_salvage(
                         tool_call_id: Some(tc.id.clone()),
                     });
                 }
-                // Single follow-up request to synthesize findings based on tool outputs.
-                match engine.chat(messages, &[], false, effort).await {
-                    Ok(follow_up) => {
-                        sc = follow_up;
-                    }
-                    Err(e) => {
-                        warn!(session = %session_id, "salvage tool follow-up synthesis failed: {e}");
+                if let Some(finish) = finish_summary {
+                    // Explicit termination with a grounded summary: adopt it
+                    // directly as the recovered report, skipping the redundant
+                    // empty-tools synthesis call.
+                    sc = Completion {
+                        content: finish,
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                        finish_reason: Some("stop".into()),
+                        metrics: sc.metrics,
+                    };
+                } else {
+                    // Single follow-up request to synthesize findings from the
+                    // salvage tool outputs when no `finish(summary)` was emitted.
+                    match engine.chat(messages, &[], false, effort).await {
+                        Ok(follow_up) => {
+                            sc = follow_up;
+                        }
+                        Err(e) => {
+                            warn!(session = %session_id, "salvage tool follow-up synthesis failed: {e}");
+                        }
                     }
                 }
             }
@@ -322,5 +384,27 @@ mod tests {
             },
         };
         assert!(!is_reasoning_ceiling(&completion));
+    }
+
+    #[test]
+    fn extract_finish_summary_parses_and_trims() {
+        assert_eq!(
+            extract_finish_summary(r#"{"summary": "  All work done.  "}"#),
+            Some("All work done.".to_string())
+        );
+        assert_eq!(
+            extract_finish_summary(r#"{"summary":"x","extra":"y"}"#),
+            Some("x".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_finish_summary_rejects_malformed_or_empty() {
+        assert_eq!(extract_finish_summary("not json"), None);
+        assert_eq!(extract_finish_summary(r#"{}"#), None);
+        assert_eq!(extract_finish_summary(r#"{"summary":""}"#), None);
+        assert_eq!(extract_finish_summary(r#"{"summary":"   "}"#), None);
+        assert_eq!(extract_finish_summary(r#"{"summary":42}"#), None);
+        assert_eq!(extract_finish_summary(r#"{"other":"x"}"#), None);
     }
 }

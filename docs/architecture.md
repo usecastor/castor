@@ -85,7 +85,7 @@ against the aggregate KV pool (`pool_capacity_tokens`). Dispatches that would sa
 the pool are enqueued in a dynamic FIFO wait-queue and admitted as slots free up.
 When pressure builds, the **cooperative yield gate** (`pool_yield_gate`) lets younger
 sessions voluntarily yield to older ones, preventing GPU VRAM thrashing under concurrency spikes.
-See [`src/task/semaphore.rs`](../src/task/semaphore.rs).
+See [`src/task/semaphore/`](../src/task/semaphore/).
 
 ### 4. Stream Proxy & Sanitizer
 
@@ -116,6 +116,8 @@ Git operations (`git status`, `diff`, `log`, `commit`) and ad-hoc Python run nat
 
 - `ast`: Structural `ast_search` and `ast_replace` via ast-grep with automatic syntax rollback.
 - `paper`: Academic paper lookup (`paper_lookup`) against OpenAlex for verified research metadata and open-access PDFs.
+
+On top of the workspace tools, every build advertises the **`finish` control-flow termination tool**: it is *not* a workspace action (the session runner intercepts it in Phase 4 — after Phases 1→2→3 — and resolves the terminal outcome, never dispatching it to the executor). Its non-empty `summary` argument becomes the final report, so a model ends a session by calling `finish` rather than ending with plain text alone. Bounded plain-text nudges, a one-shot empty-`summary` rejection, and a one-shot unverified-code-edit verification intercept keep the loop honest and loop-proof.
 
 ### 7. Lazy Skills Engine
 
@@ -156,3 +158,4 @@ Castor registers three stdio MCP tools:
 | `ast_search` | `ast` | Structural AST search via ast-grep (metavariables `$VAR`, `$$$ARGS`) |
 | `ast_replace` | `ast` | Structural AST refactoring with automatic rollback on syntax error |
 | `paper_lookup` | `paper` | Academic metadata via OpenAlex (titles, DOIs, affiliations, open-access PDFs) |
+| `finish` | core (control-flow) | Termination tool: carries a non-empty `summary`; intercepted in Phase 4 (never dispatched) to resolve the terminal report |

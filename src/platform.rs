@@ -264,17 +264,37 @@ pub fn to_wsl_path(p: impl AsRef<std::path::Path>) -> String {
     }
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_GIT_BASH_CANDIDATES: [&str; 4] = [
+    r"C:\Program Files\Git\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\bin\bash.exe",
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+];
+
+/// Resolves `bash.exe` relative to a discovered `git.exe` path
+/// (`<git_dir>\<subdir>\git.exe`), preferring `bin\bash.exe` and falling back
+/// to `usr\bin\bash.exe`.
+#[cfg(any(windows, test))]
+fn bash_from_git_exe(git_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let git_dir = git_path.parent()?.parent()?;
+    [
+        git_dir.join("bin").join("bash.exe"),
+        git_dir.join("usr").join("bin").join("bash.exe"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
 /// Returns the path to the bash executable.
 ///
-/// On Windows, prefers Git for Windows bash (`C:\Program Files\Git\bin\bash.exe`)
-/// over Windows' System32 `bash.exe` stub (which redirects to WSL).
+/// On Windows, prefers Git for Windows bash (`bin\bash.exe`, falling back to
+/// `usr\bin\bash.exe`) over Windows' System32 `bash.exe` stub (which redirects
+/// to WSL).
 pub fn bash_path() -> std::path::PathBuf {
     #[cfg(windows)]
     {
-        for candidate in [
-            r"C:\Program Files\Git\bin\bash.exe",
-            r"C:\Program Files (x86)\Git\bin\bash.exe",
-        ] {
+        for candidate in WINDOWS_GIT_BASH_CANDIDATES {
             let p = std::path::Path::new(candidate);
             if p.is_file() {
                 return p.to_path_buf();
@@ -288,11 +308,8 @@ pub fn bash_path() -> std::path::PathBuf {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let git_path = std::path::Path::new(line.trim());
-                if let Some(git_dir) = git_path.parent().and_then(|p| p.parent()) {
-                    let bash_bin = git_dir.join("bin").join("bash.exe");
-                    if bash_bin.is_file() {
-                        return bash_bin;
-                    }
+                if let Some(bash_bin) = bash_from_git_exe(git_path) {
+                    return bash_bin;
                 }
             }
         }
@@ -645,5 +662,52 @@ mod tests {
         let norm5 = normalize_launch_command(cmd5);
         assert!(norm5.contains("LLM_Ecosystem/scripts/start.sh"));
         assert!(!norm5.contains('\\'));
+    }
+
+    #[test]
+    fn test_windows_git_bash_candidates_and_usr_bin_fallback() {
+        assert_eq!(
+            WINDOWS_GIT_BASH_CANDIDATES,
+            [
+                r"C:\Program Files\Git\bin\bash.exe",
+                r"C:\Program Files (x86)\Git\bin\bash.exe",
+                r"C:\Program Files\Git\usr\bin\bash.exe",
+                r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+            ]
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "castor_platform_bash_fallback_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cmd_dir = root.join("cmd");
+        let bin_dir = root.join("bin");
+        let usr_bin_dir = root.join("usr").join("bin");
+        std::fs::create_dir_all(&cmd_dir).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&usr_bin_dir).unwrap();
+
+        let git_exe = cmd_dir.join("git.exe");
+        std::fs::write(&git_exe, b"").unwrap();
+        assert_eq!(bash_from_git_exe(&git_exe), None);
+
+        let usr_bin_bash = usr_bin_dir.join("bash.exe");
+        std::fs::write(&usr_bin_bash, b"").unwrap();
+        assert_eq!(
+            bash_from_git_exe(&git_exe),
+            Some(usr_bin_bash.clone()),
+            "should fall back to <git_dir>/usr/bin/bash.exe when bin/bash.exe is absent"
+        );
+
+        let bin_bash = bin_dir.join("bash.exe");
+        std::fs::write(&bin_bash, b"").unwrap();
+        assert_eq!(
+            bash_from_git_exe(&git_exe),
+            Some(bin_bash),
+            "should prefer <git_dir>/bin/bash.exe when both exist"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

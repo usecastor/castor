@@ -1,11 +1,12 @@
 #![cfg(feature = "ast")]
 //! In-memory Code Property Graph (CPG) & Seeded Personalized PageRank (PPR) retrieval.
 //!
-//! Inspired by Patchwork M1 (`m1_graph`) and M2 (`m2_retrieval`):
-//! - M1: Tree-sitter AST property graph extracting definitions (functions, structs, classes,
+//! Architecture:
+//! - AST Property Graph: Tree-sitter extraction of definitions (functions, structs, classes,
 //!   impls), module structure, calls, and symbol references across workspace source files.
-//! - M2: Seeded Personalized PageRank (Haveliwala 2003 / Page 1999) + BM25F lexical
-//!   symbol scoring (Cormack 2009 RRF, k=60) to rank top relevant code symbols for a prompt.
+//! - Retrieval & Ranking: Seeded Personalized PageRank (Haveliwala 2003 / Page 1999) combined
+//!   with path-aware lexical symbol scoring via Reciprocal Rank Fusion (Cormack 2009 RRF, k=60)
+//!   to rank top relevant code symbols for a prompt.
 //!
 //! When enabled, top-ranked symbols are packed into a bounded context block
 //! (<=2,500 tokens / ~10,000 characters) in the Turn-1 workspace skeleton,
@@ -100,7 +101,7 @@ impl CodePropertyGraph {
     /// [`build_from_workspace`] index every file first — so the complete
     /// `name_to_nodes` table is available — and only then link references.
     pub fn index_file(&mut self, path: &Path, content: &str) -> Range<usize> {
-        let lang = match infer_lang_by_extension(path) {
+        let lang = match infer_lang_by_extension(path).filter(|&l| is_cpg_lang(l)) {
             Some(l) => l,
             None => return 0..0,
         };
@@ -170,6 +171,7 @@ impl CodePropertyGraph {
             })
             .collect();
 
+        let mut seen_targets: HashSet<usize> = HashSet::new();
         for (node_idx, sym_lower, start_line, end_line) in entries {
             if start_line == 0
                 || start_line > end_line
@@ -179,31 +181,25 @@ impl CodePropertyGraph {
                 continue;
             }
             // Body slice: lines from `start_line` (1-based) up to `end_line`,
-            // inclusive of both.
+            // inclusive of both. Scan identifiers zero-allocation and only track
+            // targets that actually exist in `name_to_nodes`.
             let body_slice = &lines[start_line - 1..end_line];
-            let mut mentioned = HashSet::new();
+            seen_targets.clear();
             for line in body_slice {
-                for word in extract_identifiers(line) {
-                    let lower = word.to_ascii_lowercase();
-                    if lower != sym_lower {
-                        mentioned.insert(lower);
+                for_each_lower_identifier(line, |lower| {
+                    if lower != sym_lower
+                        && let Some(targets) = self.name_to_nodes.get(lower)
+                    {
+                        for &target_idx in targets {
+                            if target_idx != node_idx {
+                                seen_targets.insert(target_idx);
+                            }
+                        }
                     }
-                }
+                });
             }
-            for word in mentioned {
-                // Copy the target indices out of the map (dropping the
-                // immutable borrow) before adding edges, so the loop can
-                // mutably borrow `self`.
-                let targets: Vec<usize> = self
-                    .name_to_nodes
-                    .get(&word)
-                    .map(|v| v.to_vec())
-                    .unwrap_or_default();
-                for target_idx in targets {
-                    if target_idx != node_idx {
-                        self.add_edge(node_idx, target_idx, 1.0);
-                    }
-                }
+            for &target_idx in &seen_targets {
+                self.add_edge(node_idx, target_idx, 1.0);
             }
         }
     }
@@ -282,7 +278,24 @@ impl CodePropertyGraph {
             }
         }
 
+        let mut pending_test_attr = false;
         for child in node.children() {
+            let ck = child.kind();
+            let ck = ck.as_ref();
+            if ck == "attribute_item" {
+                if is_test_attribute(child.text().as_ref()) {
+                    pending_test_attr = true;
+                }
+                continue;
+            }
+            if ck == "line_comment" || ck == "block_comment" {
+                continue;
+            }
+            let skip_test_item = pending_test_attr;
+            pending_test_attr = false;
+            if skip_test_item {
+                continue;
+            }
             Self::collect_declarations(&child, file_path, out);
         }
     }
@@ -294,7 +307,12 @@ impl CodePropertyGraph {
         for child in node.children() {
             let ck = child.kind();
             let ck = ck.as_ref();
-            if ck == "identifier" || ck == "type_identifier" || ck == "name" {
+            if ck == "identifier"
+                || ck == "type_identifier"
+                || ck == "property_identifier"
+                || ck == "field_identifier"
+                || ck == "name"
+            {
                 let text = child.text().trim().to_string();
                 if !text.is_empty() {
                     return text;
@@ -340,6 +358,10 @@ impl CodePropertyGraph {
 
     /// Build a CodePropertyGraph by scanning a workspace root directory.
     ///
+    /// Excludes non-production eval/benchmark/fixture directories by default and
+    /// visits production source roots (`src/`, `lib/`, `crates/`, etc.) before
+    /// secondary directories.
+    ///
     /// Two passes over the collected files:
     ///   - **Pass 1** ([`index_file`]) parses every file, appending its symbol
     ///     nodes to `nodes` and populating the `name_to_nodes` symbol table, so
@@ -350,9 +372,43 @@ impl CodePropertyGraph {
     ///
     /// `workspace_root` is canonicalized once (falling back to the raw path if
     /// canonicalization fails); [`collect_source_files`] then skips symlinks and
-    /// any entry whose canonical path escapes the canonical root, so traversal
-    /// can never read files outside the workspace.
+    /// any directory whose canonical path escapes the canonical root, so
+    /// traversal can never read files outside the workspace.
     pub fn build_from_workspace(workspace_root: &Path, max_files: usize) -> Self {
+        Self::build_with_options(
+            workspace_root,
+            max_files,
+            CollectOptions {
+                include_evals: false,
+                include_tests: true,
+            },
+        )
+    }
+
+    /// Build a CodePropertyGraph tuned to a specific prompt, skipping
+    /// non-production eval/benchmark and test directories unless the prompt
+    /// explicitly references them.
+    pub fn build_from_workspace_for_prompt(
+        workspace_root: &Path,
+        max_files: usize,
+        prompt: &str,
+    ) -> Self {
+        let query = PromptQuery::parse(prompt);
+        Self::build_with_options(
+            workspace_root,
+            max_files,
+            CollectOptions {
+                include_evals: query.wants_evals,
+                include_tests: query.wants_tests,
+            },
+        )
+    }
+
+    fn build_with_options(
+        workspace_root: &Path,
+        max_files: usize,
+        options: CollectOptions,
+    ) -> Self {
         let mut graph = Self::new();
 
         // Canonicalize the root once so symlink containment is checked against a
@@ -361,10 +417,10 @@ impl CodePropertyGraph {
             dunce::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
 
         let mut files = Vec::new();
-        collect_source_files(&canon_root, &mut files, max_files, &canon_root);
+        collect_source_files(&canon_root, &mut files, max_files, &canon_root, options);
 
         // Pass 1: index every file first so the symbol table is complete.
-        let mut pending: Vec<(PathBuf, Range<usize>, String)> = Vec::new();
+        let mut pending: Vec<(Range<usize>, String)> = Vec::new();
         for path in files {
             if let Ok(content) = fs::read_to_string(&path) {
                 let rel = path
@@ -373,64 +429,126 @@ impl CodePropertyGraph {
                     .to_path_buf();
                 let range = graph.index_file(&rel, &content);
                 if !range.is_empty() {
-                    pending.push((rel, range, content));
+                    pending.push((range, content));
                 }
             }
         }
 
         // Pass 2: link references across all files using the complete table.
-        for (_rel, range, content) in pending {
+        for (range, content) in pending {
             graph.link_range(range, &content);
         }
         graph
     }
 
-    /// Extract prompt seed nodes and compute initial BM25F-style lexical weights.
+    /// Extract prompt seed nodes and compute initial path-aware lexical weights.
     pub fn extract_prompt_seeds(&self, prompt: &str) -> Vec<(usize, f64)> {
-        if self.nodes.is_empty() {
-            return Vec::new();
-        }
-        let prompt_lower = prompt.to_ascii_lowercase();
-        let prompt_tokens: HashSet<String> = extract_identifiers(&prompt_lower)
-            .into_iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
+        self.compute_query_matches(prompt).0
+    }
 
+    fn compute_query_matches(&self, prompt: &str) -> (Vec<(usize, f64)>, Vec<f64>) {
+        let n = self.nodes.len();
+        if n == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let query = PromptQuery::parse(prompt);
         let mut seeds = Vec::new();
+        let mut prod_factors = vec![1.0; n];
+
         for (idx, node) in self.nodes.iter().enumerate() {
-            let mut weight = 0.0;
+            let rel_path = normalize_rel_path(&node.file);
+            let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path.as_str());
+            let file_stem = strip_extension(file_name);
+            let rel_stem = strip_extension(&rel_path);
             let name_lower = node.name.to_ascii_lowercase();
-            let file_str = node.file.to_string_lossy().to_ascii_lowercase();
 
-            // 1. Exact symbol name in prompt (highest confidence).
-            if prompt_tokens.contains(&name_lower) {
-                weight += 3.0;
-            } else if prompt_lower.contains(&name_lower) && name_lower.len() >= 3 {
-                weight += 2.0;
-            }
+            // 1. Explicit file path / filename / stem matching.
+            let mut explicit_file_match = false;
+            let mut file_weight: f64 = 0.0;
 
-            // 2. File path match.
-            if let Some(file_name) = node.file.file_name().and_then(|f| f.to_str()) {
-                let fname_lower = file_name.to_ascii_lowercase();
-                if prompt_lower.contains(&fname_lower) {
-                    weight += 2.0;
-                }
-            } else if prompt_lower.contains(&file_str) {
-                weight += 2.0;
-            }
-
-            // 3. Signature keyword overlap.
-            for sig_word in extract_identifiers(&node.signature.to_ascii_lowercase()) {
-                if sig_word.len() >= 4 && prompt_tokens.contains(&sig_word) {
-                    weight += 0.5;
+            for pt in &query.path_tokens {
+                if rel_path == *pt || rel_path.ends_with(&format!("/{pt}")) {
+                    file_weight = file_weight.max(24.0);
+                    explicit_file_match = true;
+                } else if rel_stem == *pt || rel_stem.ends_with(&format!("/{pt}")) {
+                    file_weight = file_weight.max(16.0);
+                    explicit_file_match = true;
+                } else if rel_path.starts_with(&format!("{pt}/")) {
+                    file_weight = file_weight.max(4.0);
                 }
             }
 
-            if weight > 0.0 {
-                seeds.push((idx, weight));
+            for ft in &query.file_tokens {
+                if file_name == *ft {
+                    file_weight = file_weight.max(16.0);
+                    explicit_file_match = true;
+                }
+            }
+
+            if !explicit_file_match {
+                if file_stem.len() >= 4
+                    && !is_generic_file_stem(file_stem)
+                    && query.tokens.contains(file_stem)
+                {
+                    file_weight += 4.0;
+                }
+                let matched_segments = rel_path
+                    .split('/')
+                    .filter(|seg| {
+                        let s = strip_extension(seg);
+                        s.len() >= 4 && !is_generic_file_stem(s) && query.tokens.contains(s)
+                    })
+                    .count();
+                if matched_segments >= 2 {
+                    file_weight += 4.0;
+                }
+            }
+
+            // 2. Symbol name & qualified id matching.
+            let mut sym_weight = 0.0;
+            let id_lower = node.id.to_ascii_lowercase();
+            if query.lower.contains(&id_lower) {
+                sym_weight += 20.0;
+                explicit_file_match = true;
+            }
+            if query.tokens.contains(&name_lower) {
+                if is_generic_symbol(&name_lower) || name_lower.len() < 4 {
+                    sym_weight += 1.0;
+                } else if name_lower.contains('_') || name_lower.len() >= 7 {
+                    sym_weight += 6.0;
+                } else {
+                    sym_weight += 3.5;
+                }
+            } else if name_lower.len() >= 6
+                && !is_generic_symbol(&name_lower)
+                && query.lower.contains(&name_lower)
+            {
+                sym_weight += 2.5;
+            }
+
+            // 3. Signature keyword overlap (capped to avoid common-word inflation).
+            let mut sig_weight: f64 = 0.0;
+            for_each_lower_identifier(&node.signature, |sig_word| {
+                if sig_word.len() >= 4
+                    && !is_generic_symbol(sig_word)
+                    && query.tokens.contains(sig_word)
+                {
+                    sig_weight += 0.4;
+                }
+            });
+            sig_weight = sig_weight.min(2.0);
+
+            // 4. Non-production noise down-weighting unless explicitly requested.
+            let prod_factor =
+                compute_prod_factor(&rel_path, &name_lower, explicit_file_match, &query);
+            prod_factors[idx] = prod_factor;
+
+            let total_weight = (file_weight + sym_weight + sig_weight) * prod_factor;
+            if total_weight > 0.0 {
+                seeds.push((idx, total_weight));
             }
         }
-        seeds
+        (seeds, prod_factors)
     }
 
     /// Run Seeded Personalized PageRank (PPR) over the graph.
@@ -510,15 +628,16 @@ impl CodePropertyGraph {
     }
 
     /// Retrieve the top-k most relevant symbols for a user prompt, combining
-    /// Seeded Personalized PageRank and BM25F lexical scoring via Reciprocal
-    /// Rank Fusion (RRF, k=60).
+    /// Seeded Personalized PageRank and path-aware lexical scoring via
+    /// Reciprocal Rank Fusion (RRF, k=60) with normalized lexical affinity and
+    /// non-production noise suppression.
     pub fn retrieve_relevant_symbols(&self, prompt: &str, top_k: usize) -> Vec<&SymbolNode> {
         let n = self.nodes.len();
         if n == 0 {
             return Vec::new();
         }
 
-        let seeds = self.extract_prompt_seeds(prompt);
+        let (seeds, prod_factors) = self.compute_query_matches(prompt);
         let ppr_scores = self.personalized_pagerank(&seeds, 0.85, 20);
 
         // Lexical score array.
@@ -526,6 +645,7 @@ impl CodePropertyGraph {
         for &(idx, w) in &seeds {
             lex_scores[idx] = w;
         }
+        let max_lex = lex_scores.iter().copied().fold(0.0_f64, f64::max);
 
         // Rank indices by PPR score.
         let mut ppr_ranked: Vec<usize> = (0..n).collect();
@@ -554,13 +674,30 @@ impl CodePropertyGraph {
             lex_rank_map[idx] = rank + 1;
         }
 
-        // Compute RRF(i) = 1/(60 + rank_PPR) + 1/(60 + rank_Lex).
+        // Compute RRF(i) = ppr_rrf + lex_rrf + normalized lexical boost, scaled
+        // by production preference. Nodes with zero lexical match receive no
+        // lexical RRF contribution so unseeded PageRank hubs cannot outrank
+        // explicit file or symbol matches.
         const RRF_K: f64 = 60.0;
         let mut rrf_scores: Vec<(usize, f64)> = (0..n)
             .map(|i| {
-                let score = (1.0 / (RRF_K + ppr_rank_map[i] as f64))
-                    + (1.0 / (RRF_K + lex_rank_map[i] as f64));
-                (i, score)
+                let ppr_rrf = if ppr_scores[i] > 0.0 {
+                    1.0 / (RRF_K + ppr_rank_map[i] as f64)
+                } else {
+                    0.0
+                };
+                let lex_rrf = if lex_scores[i] > 0.0 {
+                    1.0 / (RRF_K + lex_rank_map[i] as f64)
+                } else {
+                    0.0
+                };
+                let lex_norm = if max_lex > 0.0 {
+                    lex_scores[i] / max_lex
+                } else {
+                    0.0
+                };
+                let raw = ppr_rrf + lex_rrf + 0.06 * lex_norm;
+                (i, raw * prod_factors[i])
             })
             .collect();
 
@@ -617,38 +754,351 @@ pub fn render_graph_context(symbols: &[&SymbolNode], max_chars: usize) -> String
     out
 }
 
-/// Extract clean alphanumeric identifier tokens from a string.
-fn extract_identifiers(text: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    for c in text.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            current.push(c);
-        } else if !current.is_empty() {
-            if current.len() >= 2 {
-                words.push(current.clone());
+#[derive(Debug, Clone, Copy)]
+struct CollectOptions {
+    include_evals: bool,
+    include_tests: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathTier {
+    Prod,
+    Test,
+    EvalOrBench,
+}
+
+struct PromptQuery {
+    lower: String,
+    tokens: HashSet<String>,
+    path_tokens: Vec<String>,
+    file_tokens: Vec<String>,
+    wants_evals: bool,
+    wants_tests: bool,
+    wants_mocks: bool,
+}
+
+impl PromptQuery {
+    fn parse(prompt: &str) -> Self {
+        let lower = prompt.to_ascii_lowercase();
+        let mut tokens = HashSet::new();
+        for_each_lower_identifier(prompt, |tok| {
+            tokens.insert(tok.to_string());
+        });
+
+        let mut path_tokens = Vec::new();
+        let mut file_tokens = Vec::new();
+
+        for raw in prompt.split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '"' | '\'' | '`' | '<' | '>'
+                )
+        }) {
+            if raw.is_empty() {
+                continue;
             }
-            current.clear();
+            let mut normalized = raw.replace('\\', "/").to_ascii_lowercase();
+            // Skip URLs so host/path components do not register as file paths.
+            if normalized.contains("://") {
+                continue;
+            }
+            // Strip trailing line/fragment suffixes (`src/task/wait.rs:199`, `wait.rs#L10`).
+            if let Some((before_hash, after_hash)) = normalized.split_once('#') {
+                if !after_hash.is_empty() {
+                    for_each_lower_identifier(after_hash, |tok| {
+                        tokens.insert(tok.to_string());
+                    });
+                }
+                normalized = before_hash.to_string();
+            }
+            while let Some((head, tail)) = normalized.rsplit_once(':') {
+                if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+                    normalized = head.to_string();
+                } else {
+                    break;
+                }
+            }
+            let cleaned = normalized
+                .trim_start_matches("./")
+                .trim_matches(|c: char| matches!(c, '/' | '.' | ':' | '?' | '!'));
+            if cleaned.is_empty() {
+                continue;
+            }
+            if cleaned.contains('/') {
+                if !path_tokens.iter().any(|p| p == cleaned) {
+                    path_tokens.push(cleaned.to_string());
+                }
+            } else if let Some((_, ext)) = cleaned.rsplit_once('.')
+                && !ext.is_empty()
+                && ext.len() <= 8
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && !file_tokens.iter().any(|f| f == cleaned)
+            {
+                file_tokens.push(cleaned.to_string());
+            }
+        }
+
+        let wants_evals = tokens.iter().any(|t| {
+            matches!(
+                t.as_str(),
+                "eval" | "evals" | "benchmark" | "benchmarks" | "benches" | "fixture" | "fixtures"
+            )
+        }) || lower.contains("known-fail")
+            || path_tokens.iter().any(|p| {
+                p.split('/').any(|seg| {
+                    matches!(
+                        seg,
+                        "evals" | "eval" | "benchmarks" | "benches" | "fixtures" | "fixture"
+                    )
+                })
+            });
+
+        let wants_tests = tokens.iter().any(|t| {
+            matches!(
+                t.as_str(),
+                "test" | "tests" | "testing" | "unittest" | "unittests" | "spec"
+            )
+        }) || path_tokens
+            .iter()
+            .any(|p| classify_non_prod_path(p) == PathTier::Test)
+            || file_tokens
+                .iter()
+                .any(|f| classify_non_prod_path(f) == PathTier::Test);
+
+        let wants_mocks = tokens.iter().any(|t| {
+            matches!(t.as_str(), "mock" | "mocks" | "mocking" | "fake" | "stub")
+                || t.starts_with("mock_")
+                || t.starts_with("fake_")
+                || t.starts_with("stub_")
+        });
+
+        Self {
+            lower,
+            tokens,
+            path_tokens,
+            file_tokens,
+            wants_evals,
+            wants_tests,
+            wants_mocks,
         }
     }
-    if current.len() >= 2 {
-        words.push(current);
+}
+
+fn is_cpg_lang(lang: SupportLang) -> bool {
+    !matches!(
+        lang,
+        SupportLang::Html | SupportLang::Css | SupportLang::Json | SupportLang::Yaml
+    )
+}
+
+fn is_test_attribute(attr_text: &str) -> bool {
+    let compact: String = attr_text.chars().filter(|c| !c.is_whitespace()).collect();
+    compact == "#[cfg(test)]"
+        || compact == "#[test]"
+        || compact == "#[tokio::test]"
+        || compact.starts_with("#[tokio::test(")
+        || compact == "#[rstest]"
+        || compact.starts_with("#[rstest(")
+}
+
+#[inline]
+fn for_each_lower_identifier<F>(text: &str, mut f: F)
+where
+    F: FnMut(&str),
+{
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut buf = [0u8; 128];
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let len = i - start;
+            if len >= 2 {
+                if len <= buf.len() {
+                    for (dst, &src) in buf[..len].iter_mut().zip(&bytes[start..i]) {
+                        *dst = src.to_ascii_lowercase();
+                    }
+                    let s = std::str::from_utf8(&buf[..len]).expect("ascii identifier");
+                    f(s);
+                } else {
+                    let owned = text[start..i].to_ascii_lowercase();
+                    f(&owned);
+                }
+            }
+        } else {
+            i += 1;
+        }
     }
-    words
+}
+
+fn normalize_rel_path(path: &Path) -> String {
+    let s = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    s.trim_start_matches("./").to_string()
+}
+
+fn strip_extension(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.contains('/') => stem,
+        _ => name,
+    }
+}
+
+fn is_generic_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "new"
+            | "default"
+            | "from"
+            | "into"
+            | "clone"
+            | "fmt"
+            | "drop"
+            | "run"
+            | "init"
+            | "main"
+            | "get"
+            | "set"
+            | "add"
+            | "put"
+            | "del"
+            | "len"
+            | "is_empty"
+            | "as_str"
+            | "process"
+            | "handle"
+            | "execute"
+            | "build"
+            | "start"
+            | "stop"
+            | "test"
+            | "tests"
+            | "setup"
+            | "teardown"
+            | "helper"
+            | "mock"
+            | "self"
+            | "true"
+            | "false"
+            | "none"
+            | "some"
+            | "result"
+            | "option"
+            | "string"
+            | "error"
+            | "async"
+            | "pub"
+    )
+}
+
+fn is_generic_file_stem(stem: &str) -> bool {
+    matches!(
+        stem,
+        "mod"
+            | "lib"
+            | "main"
+            | "test"
+            | "tests"
+            | "index"
+            | "init"
+            | "utils"
+            | "util"
+            | "helpers"
+            | "src"
+    )
+}
+
+fn classify_non_prod_path(rel_path: &str) -> PathTier {
+    for seg in rel_path.split('/') {
+        if matches!(
+            seg,
+            "evals"
+                | "eval"
+                | "benchmarks"
+                | "benchmark"
+                | "benches"
+                | "fixtures"
+                | "fixture"
+                | "known-fail"
+        ) {
+            return PathTier::EvalOrBench;
+        }
+        if matches!(seg, "tests" | "test" | "__tests__") {
+            return PathTier::Test;
+        }
+    }
+    let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    if file_name.starts_with("test_")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_test.py")
+        || file_name.ends_with("_test.go")
+        || file_name.ends_with(".test.ts")
+        || file_name.ends_with(".test.js")
+        || file_name.ends_with(".spec.ts")
+        || file_name.ends_with(".spec.js")
+    {
+        return PathTier::Test;
+    }
+    PathTier::Prod
+}
+
+fn is_mock_symbol(name_lower: &str) -> bool {
+    name_lower == "mock"
+        || name_lower == "fake"
+        || name_lower == "stub"
+        || name_lower.starts_with("mock_")
+        || name_lower.starts_with("fake_")
+        || name_lower.starts_with("stub_")
+        || name_lower.starts_with("dummy_")
+        || name_lower.contains("_mock")
+}
+
+fn compute_prod_factor(
+    rel_path: &str,
+    name_lower: &str,
+    explicit_file_match: bool,
+    query: &PromptQuery,
+) -> f64 {
+    if explicit_file_match {
+        return 1.0;
+    }
+    match classify_non_prod_path(rel_path) {
+        PathTier::EvalOrBench if !query.wants_evals => 0.02,
+        PathTier::Test if !query.wants_tests => 0.05,
+        _ if is_mock_symbol(name_lower) && !query.wants_mocks => 0.05,
+        _ => 1.0,
+    }
+}
+
+fn dir_priority(name: &str) -> u8 {
+    match name {
+        "src" | "lib" | "crates" | "app" | "pkg" | "packages" => 0,
+        "bin" => 1,
+        "tests" | "test" | "examples" | "docs" => 3,
+        _ => 2,
+    }
 }
 
 /// Recursively collect source files for graph indexing, excluding build/cache
-/// dirs, symlinks, and any path whose canonical form escapes the canonical
-/// workspace root.
+/// dirs, symlinks, and any directory whose canonical form escapes the
+/// canonical workspace root.
 ///
-/// `canon_root` is the canonicalized workspace root (resolved once by
-/// [`build_from_workspace`]). Each directory entry is classified by its raw
-/// `file_type()` (lstat semantics): symlinked directories are never descended
-/// into, and symlinked files are never indexed. Every remaining file is
-/// canonicalized and admitted only when its canonical path stays under
-/// `canon_root`, so CPG traversal can never read a file outside the workspace
-/// even through a non-symlink path that resolves externally.
-fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>, max_files: usize, canon_root: &Path) {
+/// Production source directories (`src/`, `lib/`, `crates/`, etc.) are visited
+/// before secondary directories so bounded `max_files` budgets always prioritize
+/// production source code.
+fn collect_source_files(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    max_files: usize,
+    canon_root: &Path,
+    options: CollectOptions,
+) {
     if out.len() >= max_files {
         return;
     }
@@ -668,9 +1118,20 @@ fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>, max_files: usize, ca
         "dist",
         "build",
     ];
+    const EVAL_DIRS: &[&str] = &[
+        "evals",
+        "benchmarks",
+        "benches",
+        "fixtures",
+        "fixture",
+        "known-fail",
+    ];
+    const TEST_DIRS: &[&str] = &["tests", "__tests__"];
+
+    let mut local_files: Vec<PathBuf> = Vec::new();
+    let mut subdirs: Vec<(u8, String, PathBuf)> = Vec::new();
 
     for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if EXCLUDED.contains(&name.as_str()) || name.starts_with('.') {
             continue;
@@ -685,23 +1146,45 @@ fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>, max_files: usize, ca
             // outside the workspace root.
             continue;
         }
+        let path = entry.path();
         if file_type.is_dir() {
-            collect_source_files(&path, out, max_files, canon_root);
-        } else if file_type.is_file() {
-            if infer_lang_by_extension(&path).is_none() {
+            if !options.include_evals && EVAL_DIRS.contains(&name.as_str()) {
                 continue;
             }
-            // Canonicalize and enforce containment under the workspace root.
-            let Ok(canon) = dunce::canonicalize(&path) else {
+            if !options.include_tests && TEST_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            let Ok(canon_sub) = dunce::canonicalize(&path) else {
                 continue;
             };
-            if !canon.starts_with(canon_root) {
+            if !canon_sub.starts_with(canon_root) {
                 continue;
             }
-            out.push(path);
-            if out.len() >= max_files {
-                return;
+            subdirs.push((dir_priority(&name), name, canon_sub));
+        } else if file_type.is_file() {
+            if infer_lang_by_extension(&path)
+                .filter(|&l| is_cpg_lang(l))
+                .is_none()
+            {
+                continue;
             }
+            local_files.push(path);
+        }
+    }
+
+    local_files.sort();
+    for path in local_files {
+        out.push(path);
+        if out.len() >= max_files {
+            return;
+        }
+    }
+
+    subdirs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, _, sub_path) in subdirs {
+        collect_source_files(&sub_path, out, max_files, canon_root, options);
+        if out.len() >= max_files {
+            return;
         }
     }
 }
@@ -966,6 +1449,113 @@ pub fn unrelated_math_function(x: i32) -> i32 {
         assert!(
             !graph.nodes.is_empty(),
             "the repository must yield at least one indexed symbol"
+        );
+    }
+
+    #[test]
+    fn cfg_test_items_excluded_while_cfg_not_test_preserved() {
+        let source = r#"
+pub fn handle_proxy() {}
+
+#[cfg(not(test))]
+pub fn prod_only() {}
+
+#[cfg(test)]
+pub fn serve_ephemeral() {}
+
+#[cfg(test)]
+mod tests {
+    pub fn mock_upstream_handler() {}
+}
+"#;
+        let mut graph = CodePropertyGraph::new();
+        graph.add_file(Path::new("src/proxy/mod.rs"), source);
+
+        let names: Vec<&str> = graph.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"handle_proxy"));
+        assert!(names.contains(&"prod_only"));
+        assert!(!names.contains(&"serve_ephemeral"));
+        assert!(!names.contains(&"mock_upstream_handler"));
+    }
+
+    #[test]
+    fn explicit_file_path_ranks_target_file_above_evals_and_hubs() {
+        let mut graph = CodePropertyGraph::new();
+        graph.add_file(
+            Path::new("evals/tasks/canary/fixture/legacy.js"),
+            "function process() {}\nfunction caller1() { process(); }\nfunction caller2() { process(); }\nfunction caller3() { process(); }\n",
+        );
+        graph.add_file(
+            Path::new("src/proxy/mod.rs"),
+            "pub fn proxy_hub() {}\npub fn call_a() { proxy_hub(); }\npub fn call_b() { proxy_hub(); }\n#[cfg(test)]\nmod tests {\n    fn mock_upstream_handler() { proxy_hub(); }\n}\n",
+        );
+        graph.add_file(
+            Path::new("src/task/mod.rs"),
+            "pub fn task_entry() { proxy_hub(); }\n",
+        );
+        graph.add_file(
+            Path::new("src/task/wait.rs"),
+            "pub struct StatusServer {}\npub async fn wait_handler() {}\npub async fn run_wait_cli() {}\n",
+        );
+
+        let by_full_path =
+            graph.retrieve_relevant_symbols("Fix timeout bug in src/task/wait.rs", 3);
+        assert!(!by_full_path.is_empty());
+        assert!(
+            by_full_path
+                .iter()
+                .all(|n| n.file == Path::new("src/task/wait.rs")),
+            "expected all top results from src/task/wait.rs, got: {:?}",
+            by_full_path.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+
+        let by_file_name = graph.retrieve_relevant_symbols("Inspect wait.rs", 3);
+        assert!(
+            by_file_name
+                .iter()
+                .all(|n| n.file == Path::new("src/task/wait.rs")),
+            "expected all top results from wait.rs, got: {:?}",
+            by_file_name.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+
+        // Path-qualified `src/task/mod.rs` must not match `src/proxy/mod.rs`.
+        let by_mod_path = graph.retrieve_relevant_symbols("Update src/task/mod.rs", 1);
+        assert_eq!(by_mod_path[0].id, "src/task/mod.rs#task_entry");
+    }
+
+    #[test]
+    fn evals_and_mock_noise_downweighted_on_normal_prompts() {
+        let mut graph = CodePropertyGraph::new();
+        graph.add_file(
+            Path::new("evals/tasks/canary/fixture/legacy.js"),
+            "function process() {}\nfunction caller_a() { process(); }\nfunction caller_b() { process(); }\n",
+        );
+        graph.add_file(
+            Path::new("src/runner/engine.rs"),
+            "pub fn process_turn() {}\n",
+        );
+        graph.add_file(
+            Path::new("src/proxy/mock_helper.rs"),
+            "pub fn mock_server() { process_turn(); }\n",
+        );
+
+        let normal = graph.retrieve_relevant_symbols("Investigate process_turn handling", 3);
+        assert!(!normal.is_empty());
+        assert_eq!(normal[0].id, "src/runner/engine.rs#process_turn");
+        assert!(
+            !normal
+                .iter()
+                .any(|n| n.file.to_string_lossy().contains("evals")),
+            "evals noise must not appear for normal prompt: {:?}",
+            normal.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+
+        let explicit_eval =
+            graph.retrieve_relevant_symbols("Fix evals/tasks/canary/fixture/legacy.js", 2);
+        assert!(!explicit_eval.is_empty());
+        assert_eq!(
+            explicit_eval[0].file,
+            Path::new("evals/tasks/canary/fixture/legacy.js")
         );
     }
 }

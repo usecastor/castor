@@ -43,7 +43,7 @@ which one it is before acting.
 | Persona | Runtime | Mandate | Hard Limits |
 |---|---|---|---|
 | **Lead Architect** | Cloud (Claude Code: GLM 5.3 text-only Plan / GLM 5.3-flash vision Exec; Antigravity: Gemini 3.8 Flash vision) | Architecture, task decomposition, plan & manifest authorship, supervisory steering, final synthesis. Proactively parallelizes independent work across concurrent coworker tasks. | **Never** bulk-read source into cloud context; **never** author code; offloads exploration in single-concern slices; **no manual concurrency sizing** — every dispatch is admitted, FIFO-deferred, or yielded automatically by the token-budgeted slot semaphore against the engine's aggregate KV pool (see §3.5); dispatch concurrent slices per-workspace so they share one warm KV prefix; **never** falls back to direct shell/file execution when coworker is offline. |
-| **Autonomous Execution Coworker** | Local peer programmer (Ternary-Bonsai-2-27B or configured model) inside the sandboxed Castor runtime (lean 8-tool core) | Hands-on execution & peer engineering: explore, file editing, git and Python via the `bash` shell, structural AST surgery (feature-gated), local visual inspection (images and PDFs), web and academic research (the latter feature-gated) — all inside the sandbox. Proactively challenges flawed assumptions, proposes architectural alternatives, and returns grounded facts. The lean 8-tool core is: `read_file`, `write_file`, `edit_file`, `list_dir`, `search_code`, `bash`, `web_search`, `web_fetch`; the `ast` feature gate adds `ast_search` / `ast_replace` and the `paper` feature gate adds `paper_lookup`. Git operations and ad-hoc Python execution run natively through `bash`. | **Never** authors high-level plans/roadmaps; **never** escapes the sandbox root. |
+| **Autonomous Execution Coworker** | Local peer programmer (Ternary-Bonsai-2-27B or configured model) inside the sandboxed Castor runtime (lean 8-tool core) | Hands-on execution & peer engineering: explore, file editing, git and Python via the `bash` shell, structural AST surgery (feature-gated), local visual inspection (images and PDFs), web and academic research (the latter feature-gated) — all inside the sandbox. Proactively challenges flawed assumptions, proposes architectural alternatives, and returns grounded facts. The lean 8-tool core is: `read_file`, `write_file`, `edit_file`, `list_dir`, `search_code`, `bash`, `web_search`, `web_fetch`; the `ast` feature gate adds `ast_search` / `ast_replace` and the `paper` feature gate adds `paper_lookup`. On top of those, every build advertises the `finish` **control-flow** termination tool — it is not a workspace tool (the session runner intercepts it in Phase 4 to resolve the terminal outcome; its `summary` argument becomes the final report) so a model ends sessions by calling `finish` rather than ending with plain text alone. Git operations and ad-hoc Python execution run natively through `bash`. | **Never** authors high-level plans/roadmaps; **never** escapes the sandbox root. |
 | **Autonomous Optimizer (Evo)** | Local, offline batch runner | Closed-loop mutation: propose -> evaluate -> select/revert against a deterministic fitness metric. | **Snapshot before mutating**; **revert on regression**; never edits files outside the candidate's snapshot list. |
 
 > **Honest attribution:** No agent may claim "we" or coworker collaboration
@@ -191,19 +191,33 @@ src/
   config.rs              # Configuration loader (serde, env > json > defaults)
   platform.rs            # Cross-OS path translation and process tree management
   skills.rs              # agentskills.io SKILL.md indexer
-  telemetry.rs           # JSONL event ledger & derived statistics
-  pruner.rs              # State dir retention pruner
+  telemetry/
+    mod.rs               # Telemetry subsystem root
+    emit.rs              # JSONL event ledger emission
+    derive.rs            # Session and tool metrics derivation
+    rollup.rs            # Cross-session aggregate statistics & retention
+  pruner/
+    mod.rs               # State dir retention pruner root
+    cleanup.rs           # Session, lease, and task pruning logic
+    tests.rs             # Pruner unit tests
   state/
     mod.rs               # State dir layout, locks, and session persistence
   mcp/
     mod.rs               # rmcp stdio transport, tool schemas, and server
     dgi.rs               # Decomposition Granularity Index (DGI) 1-forward pass logit probe
+    dgi_anchors.json     # Calibrated DGI prototype anchor set
     worker.rs            # Detached worker process execution loop
   task/
     mod.rs               # Task management subsystem
     registry.rs          # Task lifecycle, disk mirror synchronization, and persistence
     wait.rs              # Long-poll HTTP wait endpoint (:18021) and `castor wait` CLI
-    semaphore.rs         # File-backed cross-process slot semaphore
+    trace.rs             # Local execution trace visualizer (:18030)
+    trace.html           # Embedded trace visualizer UI asset
+    semaphore/
+      mod.rs             # File-backed cross-process slot semaphore & admission gate
+      lease.rs           # Atomic O_EXCL slot lease lifecycle & PID liveness
+      ranking.rs         # KV-cache priority ranking & cooperative yield gate
+      tests.rs           # Semaphore unit tests
   proxy/
     mod.rs               # Stream proxy server (:18022)
     sanitize.rs          # SSE UTF-8 reassembly, repetition detector, error frame translation
@@ -216,15 +230,31 @@ src/
     supervisor.rs        # Engine supervisor (start/stop/status, auto-heal supervision)
     detached.rs          # Detached engine process supervision
   runner/
-    mod.rs               # Multi-turn autonomous agent loop
+    mod.rs               # Autonomous agent runner root & SessionOptions
+    budget.rs            # Loop-detection and token-budget constants
+    context.rs           # Context watermark, rollover, and session history persistence
     events.rs            # Session event ledger writer and replayer
     loop_detector.rs     # Action-hash sliding window loop breaker
+    messages.rs          # Message shaping, reasoning-tag stripping, and metrics projection
+    salvage.rs           # Reasoning-ceiling and degenerate-final salvage recovery
+    session.rs           # Multi-turn autonomous session loop & Phase-4 finish resolution
+    skeleton.rs          # Workspace skeleton and tool-output disk spill helpers
+    watchdog.rs          # Per-turn wall-clock timeout and repetition/reasoning stall retry
+    tests.rs             # Runner unit tests
   tools/
-    mod.rs               # Composite tool executor (lean 8-tool core + feature-gated ast/paper) implementing runner::ToolExecutor
+    mod.rs               # Composite tool executor (lean 8-tool core + feature-gated ast/paper + `finish` control-flow tool) implementing runner::ToolExecutor
     fs.rs                # Filesystem tools (read, write, edit, list, search)
     graph.rs             # [feature: ast] Code Property Graph (CPG) & Personalized PageRank Turn-1 context retrieval
-    sandbox.rs           # Zero-trust path containment and workspace security policy
-    shell.rs             # Safe bash executor and lexical command scanner (regex/segment tokenizer; not a code AST parser; git ops and Python run here)
+    sandbox/
+      mod.rs             # Zero-trust path containment and workspace security policy root
+      path.rs            # Lexical path normalizer, root guard, and symlink resolution
+      binary.rs          # Magic-number binary file sniff guard
+      tests.rs           # Sandbox containment unit tests
+    shell/
+      mod.rs             # Safe bash executor root
+      process.rs         # Sandboxed child process execution and timeout management
+      scanner.rs         # Lexical command scanner (regex/segment tokenizer; not a code AST parser; git ops and Python run here)
+      tests.rs           # Shell scanner and executor unit tests
     ast.rs               # [feature: ast] Structural AST search and replace via native ast-grep
     web.rs               # Web search (SearXNG -> Brave) and fetch (markdown conversion)
     paper.rs             # [feature: paper] Academic paper lookup via OpenAlex (metadata, affiliations, OA PDFs)
@@ -260,7 +290,7 @@ exact same system-prompt bytes so the prior conversation's KV prefix cache is
 preserved from token 0, with the CPG/PPR context riding on the new user prompt.
 
 Concurrency is governed **entirely dynamically** by the microkernel's
-token-budgeted slot semaphore (`src/task/semaphore.rs`, file-backed cross-process
+token-budgeted slot semaphore (`src/task/semaphore/`, file-backed cross-process
 leases); no manual context-size rules or human-rationing tables apply.
 
 - **The admission gate** (`token_budget_admits`) runs on every
@@ -357,13 +387,13 @@ explicit `ALLOW_ENGINE_INTERRUPT=1` opt-in before they execute.
 ## 6. Security & Reporting
 
 - The sandbox is a **zero-trust** defense-in-depth boundary over all file and
-  shell paths (`src/tools/sandbox.rs`). The path-containment pipeline runs five
+  shell paths (`src/tools/sandbox/`). The path-containment pipeline runs five
   layers in order: lexical path Normalizer (null-byte / tilde / reserved-device /
   `.`-`..` collapse) -> Workspace Root Guard (canonicalize the root) -> Symlink
   Realpath resolution (refuse escapes) -> Out-of-tree refusal -> `check_binary`
   (layer 5: magic-number sniff -> `BinaryFileError` fail-fast on read). These
   layers govern *path access*; they do not parse code.
-- The **shell command scanner** (`src/tools/shell.rs` `validate`) is a separate
+- The **shell command scanner** (`src/tools/shell/scanner.rs` `validate`) is a separate
   *lexical* gate, not a path layer: it tokenizes and splits the command into
   segments and matches dangerous patterns with regexes (fork bombs, disk wipes,
   `rm`/`del` on protected roots, `dd` to devices, `sudo`/wrapper unwrapping,
@@ -378,7 +408,7 @@ explicit `ALLOW_ENGINE_INTERRUPT=1` opt-in before they execute.
   path access nor the shell command scanner.
 - **Never** open a public issue for a security vulnerability. Report
   privately per [`SECURITY.md`](SECURITY.md).
-- The sandbox containment test suite (`src/tools/sandbox.rs`) is the regression net for the boundary.
+- The sandbox containment test suite (`src/tools/sandbox/tests.rs`) is the regression net for the boundary.
 
 ---
 
@@ -404,7 +434,7 @@ The project version is represented in three distinct locations that **must remai
 
 ### 8.2 npm OIDC Trusted Publishing Architecture (`--provenance`)
 - **Zero Static Tokens**: Releases do NOT use a static `NPM_TOKEN` secret. Instead, npm authenticates via GitHub Actions OpenID Connect (OIDC) (`permissions: id-token: write`).
-- **Cryptographic Attestation**: When `npm publish --provenance` runs, npm requests a signed JWT from GitHub's OIDC provider containing the repository (`ApatheticMioz/Castor`), the git ref (`refs/tags/vX.Y.Z`), and the exact commit SHA.
+- **Cryptographic Attestation**: When `npm publish --provenance` runs, npm requests a signed JWT from GitHub's OIDC provider containing the repository (`usecastor/castor`), the git ref (`refs/tags/vX.Y.Z`), and the exact commit SHA.
 - **Sigstore Transparency**: npm mints a short-lived certificate via Sigstore Fulcio and records the provenance attestation in the Rekor public ledger, verifying that the published package originated from this exact workflow run.
 - **Registry Immutability & Fail-Fast**: The npm registry enforces strict version immutability. Once a version is published, it can never be replaced. If `package.json` has not been bumped to match the git tag, `npm publish` fails fast with `403 Forbidden` (`You cannot publish over previously published versions`). Subsequent promotion (`npm dist-tag add`) will fail with `404 Not Found`.
 

@@ -649,7 +649,8 @@ pub async fn run_job_with_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Completion, EngineError, Message, Metrics, ToolSchema};
+    use crate::engine::{Completion, EngineError, Message, Metrics, ToolCall, ToolSchema};
+    use crate::tools::FINISH_TOOL_NAME;
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -689,6 +690,33 @@ mod tests {
         (state, dir)
     }
 
+    /// A scripted completion that ends the session via the explicit `finish`
+    /// control-flow tool: the `summary` argument becomes the final report and
+    /// the session lands in a single turn (no plain-text turn, which would
+    /// otherwise be nudged now that the `finish` tool is advertised).
+    fn finish_completion(summary: &str) -> Completion {
+        Completion {
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                index: 0,
+                id: "finish_1".to_string(),
+                name: FINISH_TOOL_NAME.to_string(),
+                arguments: format!(r#"{{"summary":{summary:?}}}"#),
+            }],
+            finish_reason: Some("tool_calls".to_string()),
+            metrics: Metrics {
+                ttft_ms: None,
+                total_ms: 10.0,
+                tokens_per_sec: None,
+                prompt_tokens: None,
+                cached_tokens: None,
+                completion_tokens: None,
+                reasoning_tokens: None,
+            },
+        }
+    }
+
     #[tokio::test]
     async fn run_job_happy_path_transitions_to_completed() {
         let (state, dir) = tmp_state();
@@ -713,21 +741,9 @@ mod tests {
         };
 
         let engine = ScriptedEngine {
-            responses: tokio::sync::Mutex::new(VecDeque::from(vec![Completion {
-                content: "Task successfully finished.".to_string(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                finish_reason: Some("stop".to_string()),
-                metrics: Metrics {
-                    ttft_ms: None,
-                    total_ms: 10.0,
-                    tokens_per_sec: None,
-                    prompt_tokens: None,
-                    cached_tokens: None,
-                    completion_tokens: None,
-                    reasoning_tokens: None,
-                },
-            }])),
+            responses: tokio::sync::Mutex::new(VecDeque::from(vec![finish_completion(
+                "Task successfully finished.",
+            )])),
         };
 
         let loaded = crate::config::load().expect("load default config");
@@ -791,21 +807,9 @@ mod tests {
         };
 
         let engine = ScriptedEngine {
-            responses: tokio::sync::Mutex::new(VecDeque::from(vec![Completion {
-                content: "Task successfully finished.".to_string(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                finish_reason: Some("stop".to_string()),
-                metrics: Metrics {
-                    ttft_ms: None,
-                    total_ms: 10.0,
-                    tokens_per_sec: None,
-                    prompt_tokens: None,
-                    cached_tokens: None,
-                    completion_tokens: None,
-                    reasoning_tokens: None,
-                },
-            }])),
+            responses: tokio::sync::Mutex::new(VecDeque::from(vec![finish_completion(
+                "Task successfully finished.",
+            )])),
         };
 
         let loaded = crate::config::load().expect("load default config");
@@ -859,21 +863,9 @@ mod tests {
         };
 
         let engine = ScriptedEngine {
-            responses: tokio::sync::Mutex::new(VecDeque::from(vec![Completion {
-                content: "done at xhigh".to_string(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                finish_reason: Some("stop".to_string()),
-                metrics: Metrics {
-                    ttft_ms: None,
-                    total_ms: 10.0,
-                    tokens_per_sec: None,
-                    prompt_tokens: None,
-                    cached_tokens: None,
-                    completion_tokens: None,
-                    reasoning_tokens: None,
-                },
-            }])),
+            responses: tokio::sync::Mutex::new(VecDeque::from(vec![finish_completion(
+                "done at xhigh",
+            )])),
         };
 
         let loaded = crate::config::load().expect("load default config");
