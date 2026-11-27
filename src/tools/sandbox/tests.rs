@@ -921,3 +921,53 @@ fn binary_file_denial_scopes_the_bash_exception() {
         "binary denial must not authorize bypassing other denials: {msg}"
     );
 }
+
+#[test]
+fn policy_drive_relative_paths_rejected() {
+    let ws = test_root("policy_drive_rel");
+    let sub = ws.join("src");
+    let policy = SandboxPolicy::workspace_only(&ws);
+
+    for raw in [
+        "D:foo.txt",
+        "d:foo.txt",
+        "C:../outside.txt",
+        "D:",
+        "C:bar\\baz.rs",
+    ] {
+        let err_root = policy.resolve_with_base(raw, None).unwrap_err();
+        assert!(
+            matches!(err_root, SandboxError::PathEscape(_)),
+            "expected PathEscape for '{raw}' with default base, got {err_root:?}"
+        );
+        let err_sub = policy.resolve_with_base(raw, Some(&sub)).unwrap_err();
+        assert!(
+            matches!(err_sub, SandboxError::PathEscape(_)),
+            "expected PathEscape for '{raw}' with explicit base, got {err_sub:?}"
+        );
+    }
+
+    // Drive-anchored Windows absolute paths outside the workspace are also
+    // treated as absolute (not joined under `base`) on every host OS.
+    let err_abs = policy
+        .resolve_with_base("D:/outside.txt", Some(&sub))
+        .unwrap_err();
+    assert!(
+        matches!(err_abs, SandboxError::PathEscape(_)),
+        "expected PathEscape for drive-anchored path, got {err_abs:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn policy_windows_mnt_paths_rejected() {
+    let ws = test_root("policy_win_mnt");
+    let policy = SandboxPolicy::workspace_only(&ws);
+    for raw in ["/mnt/c/Windows", "/mnt/d/foo.txt", "/etc/passwd"] {
+        let err = policy.resolve_with_base(raw, Some(&ws)).unwrap_err();
+        assert!(
+            matches!(err, SandboxError::PathEscape(_)),
+            "expected PathEscape for '{raw}' on Windows, got {err:?}"
+        );
+    }
+}

@@ -25,8 +25,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, windows-latest]
     steps:
+      - name: Configure git line endings
+        shell: bash
+        run: git config --global core.autocrlf false
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -39,19 +43,28 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build all targets
+        shell: bash
         run: cargo build --all-targets
 
       - name: Run clippy (-D warnings, all features)
+        shell: bash
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Verify slim feature gate compiles (no-default + mcp)
+        shell: bash
         run: cargo check --no-default-features --features mcp
 
       - name: Run tests (authoritative gate, all features)
+        shell: bash
         run: cargo test --all-features
 
-      - name: Test Node shim
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node bin/castor.js --help
+
+      - name: Test Node shim
+        shell: bash
+        run: |
+          node bin/castor.js --help
+          node --test tests/castor_shim_test.mjs
