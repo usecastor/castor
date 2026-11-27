@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use castor::runner::ToolExecutor;
 use castor::tools::fs::FsExecutor;
@@ -18,7 +19,17 @@ use castor::tools::web::WebClient;
 use serde_json::json;
 
 fn setup_test_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("castor_adv_edit_{}_{}", name, std::process::id()));
+    // Per-test unique directory: parallel tests in the same process must never
+    // remove_dir_all another test's in-flight tree (CI flake on shared PID-only
+    // temp dirs).
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "castor_adv_edit_{}_{}_{}",
+        name,
+        std::process::id(),
+        seq
+    ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
