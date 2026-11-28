@@ -185,7 +185,7 @@ pub fn builtin_tool_schemas() -> Vec<ToolSchema> {
     let mut schemas = vec![
         ToolSchema {
             name: "read_file".to_string(),
-            description: "Read a file from disk (whole file or 1-based line range; omitting end_line reads up to the default ceiling of 800 lines). Natively extracts text from PDFs and loads images (.png, .jpg, .webp, .gif, .bmp) for visual inspection. Prefer a single encompassing line range over repeated small reads on the same file.".to_string(),
+            description: "Read a file from disk (whole file or 1-based line range; omitting end_line reads up to the default ceiling of 300 lines). Natively extracts text from PDFs and loads images (.png, .jpg, .webp, .gif, .bmp) for visual inspection. Prefer targeted line ranges, ast_search, or search_code over broad whole-file reads or repeated small reads on the same file.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -242,7 +242,7 @@ pub fn builtin_tool_schemas() -> Vec<ToolSchema> {
                 "properties": {
                     "query": { "type": "string", "description": "Text pattern to search for" },
                     "path": { "type": "string", "description": "Subdirectory to limit search (default: current workspace)" },
-                    "max_results": { "type": "integer", "description": "Maximum matches to return (default: 50)" }
+                    "max_results": { "type": "integer", "description": "Maximum matches to return (default: 25)" }
                 },
                 "required": ["query"]
             }),
@@ -424,7 +424,7 @@ impl ToolExecutor for CompositeExecutor {
                                 text: "No matches found.".to_string(),
                             })
                         } else {
-                            const MAX_AST_MATCH_CHARS: usize = 1000;
+                            const MAX_AST_MATCH_CHARS: usize = 500;
                             let lines: Vec<String> = matches
                                 .into_iter()
                                 .map(|m| {
@@ -794,6 +794,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Execute { .. }));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(feature = "ast")]
+    #[tokio::test]
+    async fn ast_search_truncates_per_match_at_500_chars() {
+        let ws = temp_workspace();
+        let long_body = "x".repeat(700);
+        std::fs::write(
+            ws.join("long.rs"),
+            format!("fn big_match() {{ let s = \"{long_body}\"; }}\n"),
+        )
+        .unwrap();
+        let executor = CompositeExecutor::new(&ws, None).expect("failed to create executor");
+
+        let out = executor
+            .execute(
+                "ast_search",
+                r#"{"pattern":"fn big_match() { $$$BODY }","lang":"rs"}"#,
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.contains("... [truncated]"),
+            "expected truncation: {out}"
+        );
+        let match_part = out.split_once(": ").unwrap().1;
+        let prefix = match_part.strip_suffix(" ... [truncated]").unwrap();
+        assert_eq!(
+            prefix.chars().count(),
+            500,
+            "per-match snippet must cap at 500 chars"
+        );
 
         let _ = std::fs::remove_dir_all(&ws);
     }

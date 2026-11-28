@@ -167,7 +167,7 @@ pub struct Config {
     /// Env: `CASTOR_MAX_TURN_REASONING_TOKENS`.
     pub max_turn_reasoning_tokens: u32,
     /// Maximum bytes of a single tool output before it is spilled to disk
-    /// (keeping only a head/tail preview in the conversation). Default 16384.
+    /// (keeping only a head/tail preview in the conversation). Default 8192.
     /// Env: `CASTOR_TOOL_SPILL_BYTES`.
     pub tool_spill_bytes: usize,
     /// When `true`, a compact `[Workspace Skeleton]` block listing the
@@ -584,7 +584,7 @@ pub fn load_with(get_env: impl Fn(&str) -> Option<String>) -> Result<LoadedConfi
 
     // KV prefix-caching efficiency knobs (env-only, no config.json keys).
     let (tool_spill_bytes, src_tool_spill_bytes) =
-        pick_usize(env_usize("CASTOR_TOOL_SPILL_BYTES")?, None, 16384);
+        pick_usize(env_usize("CASTOR_TOOL_SPILL_BYTES")?, None, 8192);
     let (workspace_skeleton_prefix, src_workspace_skeleton_prefix) =
         pick_bool(env_bool("CASTOR_WORKSPACE_SKELETON")?, true);
 

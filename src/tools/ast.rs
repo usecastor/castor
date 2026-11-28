@@ -44,7 +44,7 @@ const IGNORED_DIRS: &[&str] = &[
 const MAX_FILE_BYTES: u64 = 1_000_000;
 
 /// Global cap on matches returned by a search (single file or directory scan).
-const MAX_MATCHES: usize = 50;
+const MAX_MATCHES: usize = 25;
 
 #[derive(Debug, Error)]
 pub enum AstError {
@@ -197,10 +197,14 @@ fn resolve_files(target: &Path) -> Result<Vec<PathBuf>, AstError> {
     Ok(files)
 }
 
-/// Run the sandbox containment layers for a raw target path string, returning
-/// the resolved in-tree path.
-fn resolve_target(root: &Path, raw: &str) -> Result<PathBuf, AstError> {
+/// Run the sandbox containment layers for an optional raw target path string,
+/// returning the resolved in-tree path. When `path` is `None` or blank,
+/// returns the resolved workspace root directly.
+fn resolve_target(root: &Path, path: Option<&str>) -> Result<PathBuf, AstError> {
     let resolved_root = sandbox::resolve_workspace_root(root)?;
+    let Some(raw) = path.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(resolved_root);
+    };
     let normalized = sandbox::normalize_traversal(&resolved_root, raw)?;
     sandbox::refuse_out_of_tree(&resolved_root, &normalized)?;
     sandbox::verify_symlink_containment(&normalized, &resolved_root)?;
@@ -223,11 +227,7 @@ pub fn ast_search(
             "AST search requires a non-empty pattern".into(),
         ));
     }
-    let raw = match path {
-        Some(p) if !p.trim().is_empty() => p.trim(),
-        _ => &root.to_string_lossy(),
-    };
-    let target = resolve_target(root, raw)?;
+    let target = resolve_target(root, path)?;
     let files = resolve_files(&target)?;
 
     let target_lang = parse_lang(lang)?;
@@ -281,11 +281,7 @@ pub fn ast_replace(
             "AST replace requires a non-empty pattern".into(),
         ));
     }
-    let raw = match path {
-        Some(p) if !p.trim().is_empty() => p.trim(),
-        _ => &root.to_string_lossy(),
-    };
-    let target = resolve_target(root, raw)?;
+    let target = resolve_target(root, path)?;
     let files = resolve_files(&target)?;
     let target_lang = parse_lang(lang)?;
 
@@ -308,9 +304,14 @@ pub fn ast_replace(
             Err(_) => continue,
         };
 
+        let is_pure_crlf =
+            original.contains("\r\n") && !original.replace("\r\n", "").contains('\n');
         let result = replace_in_memory(&original, pattern, replacement, target_lang);
         match result {
-            Ok((new_content, replacements)) => {
+            Ok((mut new_content, replacements)) => {
+                if is_pure_crlf {
+                    new_content = new_content.replace("\r\n", "\n").replace('\n', "\r\n");
+                }
                 if new_content == original {
                     continue; // no match -> not counted
                 }
@@ -689,10 +690,10 @@ pub fn byte_to_line_col(source: &str, mut byte_offset: usize) -> (usize, usize) 
     (line, col)
 }
 
-/// Recursively walk the AST to collect syntax errors (`ERROR`, `UNDEFINED`, `MISSING` nodes).
+/// Iteratively walk the AST to collect syntax errors (`ERROR`, `UNDEFINED`, `MISSING` nodes).
 /// Does not descend into child nodes of an error node to avoid duplicate cascading reports.
-fn collect_syntax_errors(
-    node: &Node<ast_grep_core::tree_sitter::StrDoc<SupportLang>>,
+fn collect_syntax_errors<'a>(
+    node: &Node<'a, ast_grep_core::tree_sitter::StrDoc<SupportLang>>,
     source: &str,
     errors: &mut Vec<SyntaxErrorDetail>,
     limit: usize,
@@ -700,38 +701,45 @@ fn collect_syntax_errors(
     if errors.len() >= limit {
         return;
     }
-    let kind = node.kind();
-    if node.is_error()
-        || node.is_missing()
-        || kind == "ERROR"
-        || kind == "UNDEFINED"
-        || kind == "MISSING"
-    {
-        let range = node.range();
-        let (line, col) = byte_to_line_col(source, range.start);
-        let line_content = source.lines().nth(line.saturating_sub(1)).unwrap_or("");
-        let text = node.text();
-        let trimmed_text = text.trim();
-        let raw_snippet = if !trimmed_text.is_empty() {
-            trimmed_text
-        } else if !line_content.trim().is_empty() {
-            line_content.trim()
-        } else {
-            "<end of file>"
-        };
-        let snippet = if raw_snippet.chars().count() > 60 {
-            let s: String = raw_snippet.chars().take(60).collect();
-            format!("{s}...")
-        } else {
-            raw_snippet.to_string()
-        };
-        errors.push(SyntaxErrorDetail { line, col, snippet });
-        return;
-    }
-    for child in node.children() {
-        collect_syntax_errors(&child, source, errors, limit);
+    let mut stack = vec![node.clone()];
+    while let Some(current) = stack.pop() {
         if errors.len() >= limit {
             break;
+        }
+        let kind = current.kind();
+        if current.is_error()
+            || current.is_missing()
+            || kind == "ERROR"
+            || kind == "UNDEFINED"
+            || kind == "MISSING"
+        {
+            let range = current.range();
+            let (line, col) = byte_to_line_col(source, range.start);
+            let line_content = source.lines().nth(line.saturating_sub(1)).unwrap_or("");
+            let text = current.text();
+            let trimmed_text = text.trim();
+            let raw_snippet = if !trimmed_text.is_empty() {
+                trimmed_text
+            } else if !line_content.trim().is_empty() {
+                line_content.trim()
+            } else {
+                "<end of file>"
+            };
+            let snippet = if raw_snippet.chars().count() > 60 {
+                let s: String = raw_snippet.chars().take(60).collect();
+                format!("{s}...")
+            } else {
+                raw_snippet.to_string()
+            };
+            errors.push(SyntaxErrorDetail { line, col, snippet });
+            if errors.len() >= limit {
+                break;
+            }
+            continue;
+        }
+        let children: Vec<_> = current.children().collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
         }
     }
 }
@@ -836,22 +844,29 @@ pub fn count_syntax_errors(path: &Path, content: &str) -> Option<usize> {
     Some(errors.len())
 }
 
-fn walk_for_errors(node: &Node<ast_grep_core::tree_sitter::StrDoc<SupportLang>>, out: &mut bool) {
+fn walk_for_errors<'a>(
+    node: &Node<'a, ast_grep_core::tree_sitter::StrDoc<SupportLang>>,
+    out: &mut bool,
+) {
     if *out {
         return;
     }
-    let kind = node.kind();
-    if node.is_error()
-        || node.is_missing()
-        || kind == "ERROR"
-        || kind == "UNDEFINED"
-        || kind == "MISSING"
-    {
-        *out = true;
-        return;
-    }
-    for child in node.children() {
-        walk_for_errors(&child, out);
+    let mut stack = vec![node.clone()];
+    while let Some(current) = stack.pop() {
+        let kind = current.kind();
+        if current.is_error()
+            || current.is_missing()
+            || kind == "ERROR"
+            || kind == "UNDEFINED"
+            || kind == "MISSING"
+        {
+            *out = true;
+            return;
+        }
+        let children: Vec<_> = current.children().collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
     }
 }
 
@@ -1710,5 +1725,75 @@ mod tests {
             sig.ends_with('…'),
             "truncated signature must end with ellipsis: {sig_line}"
         );
+    }
+
+    #[test]
+    fn search_and_replace_blank_path_use_resolved_root() {
+        let root = test_root("blank_path");
+        let file = root.join("src").join("app.ts");
+        fs::write(&file, "function target() {}\n").unwrap();
+
+        let matches = ast_search(&root, "function target() {}", "ts", Some("   ")).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].file, file.to_string_lossy());
+
+        let summary = ast_replace(
+            &root,
+            "function target() {}",
+            "function renamed() {}",
+            "ts",
+            Some(""),
+        )
+        .unwrap();
+        assert_eq!(summary.files_applied, 1);
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "function renamed() {}\n"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replace_preserves_pure_crlf_line_endings() {
+        let root = test_root("replace_crlf");
+        let file = root.join("src").join("app.ts");
+        let original = "function greet(name) {\r\n  return name;\r\n}\r\n";
+        fs::write(&file, original).unwrap();
+
+        let summary = ast_replace(
+            &root,
+            "function greet($NAME) { $$$BODY }",
+            "function greet($NAME) {\n  console.log($NAME);\n  $$$BODY\n}",
+            "ts",
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.files_applied, 1);
+
+        let updated = fs::read_to_string(&file).unwrap();
+        assert!(updated.contains("\r\n"), "updated file should use CRLF");
+        assert!(
+            !updated.replace("\r\n", "").contains('\n'),
+            "pure CRLF file must not introduce bare LF: {updated:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_caps_at_max_matches_25() {
+        let root = test_root("search_cap_25");
+        let file = root.join("src").join("many.rs");
+        let src = (0..40)
+            .map(|i| format!("fn f_{i:02}() {{}}\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        fs::write(&file, src).unwrap();
+
+        let matches = ast_search(&root, "fn $NAME() {}", "rs", None).unwrap();
+        assert_eq!(matches.len(), 25, "ast_search must cap matches at 25");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

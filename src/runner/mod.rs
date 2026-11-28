@@ -229,7 +229,7 @@ pub struct SessionOptions {
     pub max_turn_reasoning_tokens: Option<u32>,
     /// Maximum bytes of a single tool output before it is spilled
     /// to disk (keeping only a head/tail preview in the conversation).
-    /// `None` means "use the default" ([`SPILL_THRESHOLD_BYTES`] = 16384).
+    /// `None` means "use the default" ([`SPILL_THRESHOLD_BYTES`] = 8192).
     pub tool_spill_bytes: Option<usize>,
 }
 

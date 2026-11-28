@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SPILL_THRESHOLD_BYTES: usize = 16384;
+pub const SPILL_THRESHOLD_BYTES: usize = 8192;
 
 pub fn spill_tool_output(
     output: &str,

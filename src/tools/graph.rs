@@ -215,88 +215,96 @@ impl CodePropertyGraph {
         }
     }
 
-    fn collect_declarations(
-        node: &Node<ast_grep_core::tree_sitter::StrDoc<SupportLang>>,
+    fn collect_declarations<'a>(
+        node: &Node<'a, ast_grep_core::tree_sitter::StrDoc<SupportLang>>,
         file_path: &Path,
         out: &mut Vec<SymbolNode>,
     ) {
-        if node.is_error()
-            || node.is_missing()
-            || node.kind() == "ERROR"
-            || node.kind() == "UNDEFINED"
-            || node.kind() == "MISSING"
-        {
-            return;
-        }
-
-        let kind_str = node.kind();
-        let kind_str = kind_str.as_ref();
-        if OUTLINE_DECL_KINDS.contains(&kind_str) {
-            let start_line = node.start_pos().line() + 1;
-            let end_line = node.end_pos().line() + 1;
-
-            let sym_kind = match kind_str {
-                "function_item"
-                | "fn_item"
-                | "function_definition"
-                | "function_declaration"
-                | "method_definition" => SymbolKind::Function,
-                "struct_item" => SymbolKind::Struct,
-                "class_definition" | "class_declaration" => SymbolKind::Class,
-                "enum_item" => SymbolKind::Enum,
-                "trait_item" => SymbolKind::Trait,
-                "impl_item" => SymbolKind::Impl,
-                "mod_item" => SymbolKind::Module,
-                _ => SymbolKind::Other,
-            };
-
-            // Extract name from child identifier node or signature line.
-            let name = Self::extract_symbol_name(node, kind_str);
-            let signature = Self::first_line_signature(node.text().as_ref());
-
-            let rel_str = file_path.to_string_lossy().replace('\\', "/");
-            let id = format!("{rel_str}#{name}");
-
-            out.push(SymbolNode {
-                id,
-                file: file_path.to_path_buf(),
-                name,
-                kind: sym_kind,
-                start_line,
-                end_line,
-                signature,
-            });
-
-            // For leaf declarations (functions/methods), stop recursing into statements.
-            if kind_str == "function_item"
-                || kind_str == "fn_item"
-                || kind_str == "function_definition"
-                || kind_str == "function_declaration"
-                || kind_str == "method_definition"
+        let rel_str = file_path.to_string_lossy().replace('\\', "/");
+        let mut stack: Vec<Node<'a, ast_grep_core::tree_sitter::StrDoc<SupportLang>>> =
+            vec![node.clone()];
+        while let Some(current) = stack.pop() {
+            if current.is_error()
+                || current.is_missing()
+                || current.kind() == "ERROR"
+                || current.kind() == "UNDEFINED"
+                || current.kind() == "MISSING"
             {
-                return;
+                continue;
             }
-        }
 
-        let mut pending_test_attr = false;
-        for child in node.children() {
-            let ck = child.kind();
-            let ck = ck.as_ref();
-            if ck == "attribute_item" {
-                if is_test_attribute(child.text().as_ref()) {
-                    pending_test_attr = true;
+            let kind_str = current.kind();
+            let kind_str = kind_str.as_ref();
+            if OUTLINE_DECL_KINDS.contains(&kind_str) {
+                let start_line = current.start_pos().line() + 1;
+                let end_line = current.end_pos().line() + 1;
+
+                let sym_kind = match kind_str {
+                    "function_item"
+                    | "fn_item"
+                    | "function_definition"
+                    | "function_declaration"
+                    | "method_definition" => SymbolKind::Function,
+                    "struct_item" => SymbolKind::Struct,
+                    "class_definition" | "class_declaration" => SymbolKind::Class,
+                    "enum_item" => SymbolKind::Enum,
+                    "trait_item" => SymbolKind::Trait,
+                    "impl_item" => SymbolKind::Impl,
+                    "mod_item" => SymbolKind::Module,
+                    _ => SymbolKind::Other,
+                };
+
+                // Extract name from child identifier node or signature line.
+                let name = Self::extract_symbol_name(&current, kind_str);
+                let signature = Self::first_line_signature(current.text().as_ref());
+                let id = format!("{rel_str}#{name}");
+
+                out.push(SymbolNode {
+                    id,
+                    file: file_path.to_path_buf(),
+                    name,
+                    kind: sym_kind,
+                    start_line,
+                    end_line,
+                    signature,
+                });
+
+                // For leaf declarations (functions/methods), stop descending into statements.
+                if kind_str == "function_item"
+                    || kind_str == "fn_item"
+                    || kind_str == "function_definition"
+                    || kind_str == "function_declaration"
+                    || kind_str == "method_definition"
+                {
+                    continue;
                 }
-                continue;
             }
-            if ck == "line_comment" || ck == "block_comment" {
-                continue;
+
+            let mut pending_test_attr = false;
+            let mut children_to_visit = Vec::new();
+            for child in current.children() {
+                let ck = child.kind();
+                let ck = ck.as_ref();
+                if ck == "attribute_item" {
+                    if is_test_attribute(child.text().as_ref()) {
+                        pending_test_attr = true;
+                    }
+                    continue;
+                }
+                if ck == "line_comment" || ck == "block_comment" {
+                    continue;
+                }
+                let skip_test_item = pending_test_attr;
+                pending_test_attr = false;
+                if skip_test_item {
+                    continue;
+                }
+                children_to_visit.push(child);
             }
-            let skip_test_item = pending_test_attr;
-            pending_test_attr = false;
-            if skip_test_item {
-                continue;
+            // Push in reverse order so the first kept sibling is popped first (DFS pre-order).
+            for child in children_to_visit.into_iter().rev() {
+                stack.push(child);
             }
-            Self::collect_declarations(&child, file_path, out);
         }
     }
 
@@ -888,7 +896,11 @@ impl PromptQuery {
 fn is_cpg_lang(lang: SupportLang) -> bool {
     !matches!(
         lang,
-        SupportLang::Html | SupportLang::Css | SupportLang::Json | SupportLang::Yaml
+        SupportLang::Html
+            | SupportLang::Css
+            | SupportLang::Json
+            | SupportLang::Yaml
+            | SupportLang::Markdown
     )
 }
 
@@ -1557,5 +1569,48 @@ mod tests {
             explicit_eval[0].file,
             Path::new("evals/tasks/canary/fixture/legacy.js")
         );
+    }
+
+    #[test]
+    fn markdown_skipped_and_deep_containers_do_not_overflow() {
+        assert!(!is_cpg_lang(SupportLang::Markdown));
+
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path();
+        fs::write(
+            root.join("README.md"),
+            "# Documentation\n\n```rust\nfn markdown_fake() {}\n```\n",
+        )
+        .unwrap();
+        fs::write(root.join("lib.rs"), "pub fn real_code() {}\n").unwrap();
+
+        let graph = CodePropertyGraph::build_from_workspace(root, 100);
+        assert!(graph.nodes.iter().any(|n| n.name == "real_code"));
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|n| n.file.extension().and_then(|e| e.to_str()) == Some("md")),
+            "Markdown files must not be indexed: {:?}",
+            graph.nodes
+        );
+
+        let depth = 2500;
+        let mut deep_src = String::new();
+        for i in 0..depth {
+            deep_src.push_str(&format!("mod m{i} {{\n"));
+        }
+        deep_src.push_str("pub fn deep_leaf() {}\n");
+        for _ in 0..depth {
+            deep_src.push_str("}\n");
+        }
+
+        let mut deep_graph = CodePropertyGraph::new();
+        deep_graph.add_file(Path::new("src/deep.rs"), &deep_src);
+        assert!(
+            deep_graph.nodes.iter().any(|n| n.name == "deep_leaf"),
+            "deeply nested function should still be collected without stack overflow"
+        );
+        assert_eq!(deep_graph.nodes.len(), depth + 1);
     }
 }

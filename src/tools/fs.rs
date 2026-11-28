@@ -33,6 +33,52 @@ pub fn base64_encode(data: &[u8]) -> String {
     BASE64_STANDARD.encode(data)
 }
 
+/// Append `outline` to `out` while keeping the combined output strictly below
+/// the 8192-byte tool spill threshold (capped at 8000 bytes). Truncates
+/// trailing outline item lines if needed, or omits the outline when even the
+/// header and truncation footer cannot fit.
+#[cfg(feature = "ast")]
+fn append_outline_within_budget(out: &mut String, outline: &str) {
+    const MAX_TOTAL_READ_BYTES: usize = 8_000;
+    let remaining = MAX_TOTAL_READ_BYTES.saturating_sub(out.len());
+    if remaining == 0 {
+        return;
+    }
+    if outline.len() <= remaining {
+        out.push_str(outline);
+        return;
+    }
+    let Some((header, body_with_close)) = outline.split_once(":\n") else {
+        return;
+    };
+    let header_prefix = format!("{header}:\n");
+    let footer = "\n  ... (outline truncated to fit byte budget)\n]";
+    if header_prefix.len() + footer.len() > remaining {
+        return;
+    }
+    let body = body_with_close
+        .strip_suffix("\n]")
+        .unwrap_or(body_with_close);
+    let mut built = header_prefix;
+    let mut items_added = 0usize;
+    for line in body.lines() {
+        let sep = usize::from(items_added > 0);
+        if built.len() + sep + line.len() + footer.len() > remaining {
+            break;
+        }
+        if sep == 1 {
+            built.push('\n');
+        }
+        built.push_str(line);
+        items_added += 1;
+    }
+    if items_added == 0 {
+        return;
+    }
+    built.push_str(footer);
+    out.push_str(&built);
+}
+
 /// Search context shared by the two `fallback_search` passes: the query, a
 /// pre-folded ASCII lowercase form used by the case-insensitive pass (empty
 /// on the exact-case pass), the result cap, and the base directory from
@@ -242,7 +288,7 @@ impl FsExecutor {
             }
             None => {
                 let s = start_line.max(1);
-                (s, s.saturating_add(800).saturating_sub(1))
+                (s, s.saturating_add(300).saturating_sub(1))
             }
         };
         let start = raw_start.saturating_sub(1).min(total);
@@ -257,7 +303,7 @@ impl FsExecutor {
         // middle-deleting spill (see `spill_tool_output`) — the tool now returns
         // a cleanly truncated window plus, under the `ast` feature, an outline
         // of the unread tail instead of a raw oversized blob.
-        const MAX_READ_OUTPUT_BYTES: usize = 13_500;
+        const MAX_READ_OUTPUT_BYTES: usize = 4_800;
         let mut numbered: Vec<String> = Vec::new();
         let mut acc: usize = 0;
         for (i, line) in slice.iter().enumerate() {
@@ -300,7 +346,7 @@ impl FsExecutor {
                 && let Some(outline) =
                     crate::tools::ast::outline_after_line(&resolved, &content, actual_end + 1)
             {
-                out.push_str(&outline);
+                append_outline_within_budget(&mut out, &outline);
             }
             out
         };
@@ -1370,7 +1416,7 @@ impl ToolExecutor for FsExecutor {
                 let max_results = args
                     .get("max_results")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(50) as usize;
+                    .unwrap_or(25) as usize;
                 self.search_code(query, path, max_results)
             }
             _ => Err(FsError::InvalidArgs(format!("unknown tool: {name}"))),
@@ -2030,10 +2076,14 @@ mod tests {
     fn read_file_byte_budget_stops_cleanly_without_spilling() {
         let root = test_root("read_byte_budget");
         let file = root.join("big.rs");
-        // 800 short function lines whose raw content totals well over 25 KB, so
-        // the default 800-line window would far exceed the 13.5 KB byte budget.
-        let content = (1..=800)
-            .map(|i| format!("pub fn f{i}(a: u64, b: u64) -> u64 {{ a.wrapping_add(b) }}"))
+        // 400 function lines whose raw content totals well over 25 KB, so the
+        // default 300-line window would far exceed the 4.8 KB byte budget.
+        let content = (1..=400)
+            .map(|i| {
+                format!(
+                    "pub fn fn_{i:03}_with_a_long_descriptive_name(alpha_param: u64, beta_param: u64) -> u64 {{ alpha_param.wrapping_add(beta_param) }}"
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -2046,19 +2096,19 @@ mod tests {
 
         let out = ex.read_file("big.rs", 1, None).unwrap();
 
-        // The byte budget stops the numbered window well before line 800.
+        // The byte budget stops the numbered window well before line 300.
         let actual_end = showing_end(&out);
         assert!(
-            actual_end < 800,
+            actual_end < 300,
             "byte budget must truncate the window: actual_end={actual_end}"
         );
         assert!(actual_end >= 1, "at least one line must always be returned");
-        // The whole output (header + numbered lines + outline) stays under the
-        // 16 KiB spill threshold, so a read can never trigger a middle-deleting
-        // spill of its own output.
+        // The whole output (header + numbered lines + outline) stays strictly
+        // under the 8 KiB (8192) spill threshold, so a read can never trigger a
+        // middle-deleting spill of its own output.
         assert!(
-            out.len() < 16_384,
-            "output of {} bytes must stay below the 16 KiB spill threshold",
+            out.len() < 8_192,
+            "output of {} bytes must stay strictly below the 8192-byte spill threshold",
             out.len()
         );
         // The numbered lines are contiguous from 1..=actual_end with no gaps:
@@ -2077,13 +2127,33 @@ mod tests {
             actual_end + 1
         );
         // Under the `ast` feature, the unread tail is surfaced as an outline
-        // starting at `actual_end + 1` (no raw middle-deletion).
+        // starting at `actual_end + 1` (no raw middle-deletion), truncated if
+        // necessary to stay below 8192 bytes.
         if cfg!(feature = "ast") {
             assert!(
                 out.contains(&format!("[Outline of unread lines {}..", actual_end + 1)),
                 "outline must start at actual_end+1; got: {out}"
             );
         }
+    }
+
+    #[test]
+    fn read_file_omitted_end_line_defaults_to_300_lines() {
+        let root = test_root("read_default_300");
+        let file = root.join("lines.txt");
+        let content = (1..=400)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&file, &content).unwrap();
+        let ex = executor(&root);
+
+        let out = ex.read_file("lines.txt", 1, None).unwrap();
+        assert_eq!(showing_end(&out), 300, "omitted end_line must cap at 300");
+        assert!(out.contains("showing: 1-300"), "got: {out}");
+        assert!(out.contains("\n300: l300"));
+        assert!(!out.contains("\n301: "));
+        assert!(out.len() < 8_192, "output len {} >= 8192", out.len());
     }
 
     #[test]
@@ -2476,6 +2546,29 @@ mod tests {
             fs::read_to_string(&file).unwrap(),
             "before\nafter\n",
             "deleting a multi-line block via Tier 2/3 must leave no stray blank line"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn search_code_default_max_results_is_25() {
+        let root = test_root("search_default_25");
+        let content = (1..=40)
+            .map(|i| format!("match_token_{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(root.join("many.txt"), content).unwrap();
+        let ex = executor(&root);
+
+        let out = ex
+            .execute("search_code", r#"{"query":"match_token"}"#)
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.starts_with("25 match(es) for 'match_token':"),
+            "default search_code max_results must be 25, got: {out}"
         );
 
         let _ = fs::remove_dir_all(&root);
