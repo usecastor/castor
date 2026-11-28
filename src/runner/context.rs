@@ -12,7 +12,13 @@ use crate::state::StateDir;
 use super::messages::strip_think_tags;
 
 pub(crate) const CONTEXT_CEILING_DIRECTIVE: &str = "[System: Working context budget has reached 90%. Do not execute further workspace tools. \
-     Call finish(summary) or synthesize your final conclusions and response immediately.]";
+     Keep reasoning minimal so your complete finish(summary) or final synthesis fits inside the remaining 10% headroom, and respond immediately.]";
+
+pub(crate) const MAX_IN_FLIGHT_COMPACTIONS: u32 = 2;
+
+pub(crate) const IN_FLIGHT_COMPACTION_PROMPT: &str = "[System: Working context budget has reached 85%. Do NOT call any workspace tools. \
+     Write a concise, dense engineering checkpoint preserving all verified findings, exact `file:line` coordinates, \
+     files created or modified, passing and failing tests/checks, and the remaining checklist so execution can continue cleanly.]";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PersistedMessage {
@@ -223,8 +229,158 @@ pub(crate) fn prior_session_summary_block(history: &[Message]) -> Option<String>
     Some(block)
 }
 
+pub(crate) fn mask_watermark_tokens(max_context: usize) -> usize {
+    (max_context as u64 * 60 / 100) as usize
+}
+
+/// Compute an explicit per-turn `max_tokens` ceiling when `max_context > 0`.
+/// Caps completions to remaining context headroom (`max_context - current_tokens`)
+/// with a small floor (`512`, or `max_context` when smaller), and further bounds
+/// by `max_turn_reasoning_tokens + 8192` when a per-turn reasoning budget is set.
+pub(crate) fn compute_turn_max_tokens(
+    max_context: usize,
+    current_tokens: usize,
+    max_turn_reasoning_tokens: u32,
+) -> Option<u32> {
+    if max_context == 0 {
+        return None;
+    }
+    const MIN_MAX_TOKENS_FLOOR: usize = 512;
+    const OUTPUT_HEADROOM_TOKENS: usize = 8_192;
+    let headroom = max_context.saturating_sub(current_tokens);
+    let floor = MIN_MAX_TOKENS_FLOOR.min(max_context);
+    let capped = if max_turn_reasoning_tokens > 0 {
+        let turn_cap = (max_turn_reasoning_tokens as usize).saturating_add(OUTPUT_HEADROOM_TOKENS);
+        headroom.min(turn_cap)
+    } else {
+        headroom
+    };
+    let effective = capped.max(floor).min(max_context);
+    Some(effective.min(u32::MAX as usize) as u32)
+}
+
+pub(crate) fn compaction_watermark_tokens(max_context: usize) -> usize {
+    (max_context as u64 * 85 / 100) as usize
+}
+
 pub(crate) fn in_flight_ceiling_tokens(max_context: usize) -> usize {
     (max_context as u64 * 90 / 100) as usize
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct MaskOutcome {
+    pub(crate) masked_count: usize,
+    pub(crate) freed_chars: usize,
+}
+
+/// Tier 1 observation masking: replace verbose `role: "tool"` outputs older
+/// than the most recent `keep_recent_turns` assistant turns with a compact
+/// single-line anchor. Preserves `messages[0..2]` (`system` + initial `user`),
+/// `role`, `tool_call_id`, short (`<= 256` bytes) outputs, already-masked
+/// outputs, and error outputs (so `mutated_file_paths` stays accurate).
+pub(crate) fn mask_old_observations(
+    messages: &mut [Message],
+    keep_recent_turns: usize,
+) -> MaskOutcome {
+    if messages.len() <= 2 || keep_recent_turns == 0 {
+        return MaskOutcome::default();
+    }
+    let total_assistants = messages.iter().filter(|m| m.role == "assistant").count();
+    if total_assistants <= keep_recent_turns {
+        return MaskOutcome::default();
+    }
+    let mut seen = 0usize;
+    let mut cutoff = None;
+    for (idx, m) in messages.iter().enumerate().rev() {
+        if m.role == "assistant" {
+            seen += 1;
+            if seen == keep_recent_turns {
+                cutoff = Some(idx);
+                break;
+            }
+        }
+    }
+    let Some(cutoff_idx) = cutoff else {
+        return MaskOutcome::default();
+    };
+    if cutoff_idx <= 2 {
+        return MaskOutcome::default();
+    }
+
+    let mut outcome = MaskOutcome::default();
+    for m in &mut messages[2..cutoff_idx] {
+        if m.role != "tool" {
+            continue;
+        }
+        if m.content.len() <= 256
+            || m.content.starts_with("[Observation masked")
+            || m.content.starts_with("Error")
+            || m.content.starts_with("error")
+        {
+            continue;
+        }
+        let orig_chars = m.content.chars().count();
+        let first_line_raw = m
+            .content
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("tool output");
+        let first_line = if first_line_raw.chars().count() > 120 {
+            let prefix: String = first_line_raw.chars().take(119).collect();
+            format!("{prefix}…")
+        } else {
+            first_line_raw.to_string()
+        };
+        let replacement = format!(
+            "[Observation masked: {first_line} — {orig_chars} chars omitted; re-read if needed]"
+        );
+        let new_chars = replacement.chars().count();
+        m.content = replacement;
+        outcome.masked_count += 1;
+        outcome.freed_chars += orig_chars.saturating_sub(new_chars);
+    }
+    outcome
+}
+
+/// Tier 2 in-flight checkpoint compaction: preserves `messages[0]` (`system`)
+/// and the original `user` prompt from `messages[1]` (stripping any prior
+/// `[In-Flight Checkpoint #...]` block so repeated compactions do not stack),
+/// attaches a ground-truth `Mutated files:` receipt from `mutated_file_paths`,
+/// and resets `messages` to `[system, compacted_user]`.
+pub(crate) fn apply_in_flight_compaction(
+    messages: &mut Vec<Message>,
+    checkpoint_summary: &str,
+    compaction_index: u32,
+) {
+    if messages.len() < 2 {
+        return;
+    }
+    let raw_user = &messages[1].content;
+    let original_user = match raw_user.find("\n\n[In-Flight Checkpoint #") {
+        Some(pos) => &raw_user[..pos],
+        None => raw_user.as_str(),
+    };
+    let mutated = mutated_file_paths(messages);
+    let mut compacted_user =
+        format!("{original_user}\n\n[In-Flight Checkpoint #{compaction_index}]\n");
+    if !mutated.is_empty() {
+        compacted_user.push_str("Mutated files: ");
+        compacted_user.push_str(&mutated.join(", "));
+        compacted_user.push('\n');
+    }
+    compacted_user.push_str(checkpoint_summary.trim());
+
+    let system_msg = messages[0].clone();
+    *messages = vec![
+        system_msg,
+        Message {
+            role: "user".into(),
+            content: compacted_user,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        },
+    ];
 }
 
 /// Conservative token estimate for newly appended messages not yet measured by
@@ -393,8 +549,8 @@ mod tests {
 
     #[test]
     fn watermark_aligns_with_in_flight_ceiling() {
-        // The resume watermark must equal the in-flight ceiling at every
-        // `max_context` value so no warm session between 75% and 90% is wiped.
+        // The resume watermark equals the 90% in-flight ceiling at every
+        // `max_context` value so any warm session below the ceiling resumes.
         for max_context in [0, 1, 79, 100, 150_000] {
             assert_eq!(
                 watermark_tokens(max_context),
@@ -402,14 +558,13 @@ mod tests {
                 "watermark must align with the in-flight ceiling at {max_context}"
             );
         }
-        // A history between 75% and 90% of max_context resumes (not rolled over).
-        // 1800 chars = 450 tokens: 45% of 1000 < 900 watermark, and 75% of 1000
-        // would have been 750 — the distinguishing case is 80%: 800 chars =
-        // 200 tokens against max_context = 250 (90% = 225, old 75% = 187).
+        // A history at 80% of max_context (800 chars = 200 tokens against
+        // max_context = 250, 90% watermark = 225) stays within the 90%
+        // ceiling and resumes without rolling over.
         let history = vec![msg("user", "a".repeat(800))];
         assert!(
             should_resume(&history, "p", 250),
-            "a warm session between the old 75% and the 90% ceiling must resume"
+            "a warm session below the 90% ceiling must resume"
         );
     }
 
@@ -592,5 +747,209 @@ mod tests {
         let no_mut = vec![msg("user", "u"), msg("assistant", "final answer")];
         let block3 = prior_session_summary_block(&no_mut).expect("summary block");
         assert_eq!(block3, "[Prior Session Summary]\nfinal answer\n");
+    }
+
+    #[test]
+    fn watermark_helpers_match_60_85_90_percent() {
+        assert_eq!(mask_watermark_tokens(1_000), 600);
+        assert_eq!(compaction_watermark_tokens(1_000), 850);
+        assert_eq!(in_flight_ceiling_tokens(1_000), 900);
+        assert_eq!(mask_watermark_tokens(0), 0);
+        assert_eq!(compaction_watermark_tokens(0), 0);
+    }
+
+    #[test]
+    fn compute_turn_max_tokens_bounds_by_headroom_floor_and_reasoning_budget() {
+        assert_eq!(compute_turn_max_tokens(0, 0, 16_384), None);
+        assert_eq!(
+            compute_turn_max_tokens(150_000, 10_000, 16_384),
+            Some(24_576)
+        );
+        assert_eq!(
+            compute_turn_max_tokens(150_000, 135_000, 16_384),
+            Some(15_000)
+        );
+        assert_eq!(compute_turn_max_tokens(150_000, 149_900, 16_384), Some(512));
+        assert_eq!(compute_turn_max_tokens(150_000, 50_000, 0), Some(100_000));
+        assert_eq!(compute_turn_max_tokens(256, 250, 0), Some(256));
+    }
+
+    #[test]
+    fn mask_old_observations_preserves_prefix_recent_turns_errors_and_ids() {
+        let long_ok = format!("src/lib.rs (total: 400 lines)\n{}", "x".repeat(400));
+        let long_err = format!("Error: file not found\n{}", "y".repeat(400));
+        let short_ok = "short output".to_string();
+        let long_first_line = format!("{}\nrest", "z".repeat(160));
+
+        // Only 4 assistant turns -> nothing masked.
+        let mut four_turns = vec![
+            msg("system", "SYS"),
+            msg("user", "task"),
+            Message {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: vec![tc("c1", "read_file", "{}")],
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: long_ok.clone(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("c1".into()),
+            },
+            msg("assistant", "t2"),
+            msg("assistant", "t3"),
+            msg("assistant", "t4"),
+        ];
+        assert_eq!(mask_old_observations(&mut four_turns, 4).masked_count, 0);
+        assert_eq!(four_turns[3].content, long_ok);
+
+        // 7 assistant turns -> turns 1..=3 are strictly before the last 4 turns.
+        let mut messages = vec![
+            msg("system", "SYS"),
+            msg("user", "original user prompt"),
+            // Turn 1: verbose read (>256 bytes) -> masked
+            Message {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: vec![tc("c1", "read_file", "{}")],
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: long_ok.clone(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("c1".into()),
+            },
+            // Turn 2: error (>256 bytes) + short (<=256 bytes) -> both preserved
+            Message {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: vec![tc("c2", "edit_file", "{}"), tc("c3", "bash", "{}")],
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: long_err.clone(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("c2".into()),
+            },
+            Message {
+                role: "tool".into(),
+                content: short_ok.clone(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("c3".into()),
+            },
+            // Turn 3: long first line (>120 chars) + >256 bytes -> masked with truncated anchor
+            Message {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: vec![tc("c4", "bash", "{}")],
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: format!("{long_first_line}\n{}", "w".repeat(200)),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("c4".into()),
+            },
+            // Last 4 assistant turns (turns 4..=7) -> all preserved verbatim
+            Message {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: vec![tc("c5", "read_file", "{}")],
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: long_ok.clone(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("c5".into()),
+            },
+            msg("assistant", "t5"),
+            msg("assistant", "t6"),
+            msg("assistant", "t7"),
+        ];
+
+        let outcome = mask_old_observations(&mut messages, 4);
+        assert_eq!(outcome.masked_count, 2);
+        assert!(outcome.freed_chars > 0);
+        assert_eq!(messages[0].content, "SYS");
+        assert_eq!(messages[1].content, "original user prompt");
+        assert!(
+            messages[3]
+                .content
+                .starts_with("[Observation masked: src/lib.rs (total: 400 lines) — ")
+        );
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(messages[5].content, long_err);
+        assert_eq!(messages[6].content, short_ok);
+        assert!(messages[8].content.starts_with("[Observation masked: "));
+        assert!(messages[8].content.contains('…'));
+        assert_eq!(messages[8].tool_call_id.as_deref(), Some("c4"));
+        assert_eq!(messages[10].content, long_ok);
+
+        // Idempotent when invoked again immediately.
+        let second = mask_old_observations(&mut messages, 4);
+        assert_eq!(second, MaskOutcome::default());
+    }
+
+    #[test]
+    fn apply_in_flight_compaction_preserves_prompt_receipt_and_does_not_stack() {
+        let mut messages = vec![
+            msg("system", "SYS"),
+            msg("user", "fix the bug"),
+            Message {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: vec![
+                    tc("e1", "edit_file", r#"{"path":"src/a.rs"}"#),
+                    tc("e2", "edit_file", r#"{"path":"src/b.rs"}"#),
+                ],
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: "Edited src/a.rs".into(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("e1".into()),
+            },
+            Message {
+                role: "tool".into(),
+                content: "Error: target not found".into(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("e2".into()),
+            },
+        ];
+
+        apply_in_flight_compaction(&mut messages, "Found root cause in src/a.rs:10.", 1);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "SYS");
+        assert_eq!(
+            messages[1].content,
+            "fix the bug\n\n[In-Flight Checkpoint #1]\nMutated files: src/a.rs\nFound root cause in src/a.rs:10."
+        );
+
+        // Second compaction strips `[In-Flight Checkpoint #1]` instead of stacking.
+        messages.push(Message {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: vec![tc("w1", "write_file", r#"{"path":"src/c.rs"}"#)],
+            tool_call_id: None,
+        });
+        messages.push(Message {
+            role: "tool".into(),
+            content: "Wrote src/c.rs".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("w1".into()),
+        });
+        apply_in_flight_compaction(&mut messages, "Added test in src/c.rs:1.", 2);
+        assert_eq!(messages.len(), 2);
+        assert!(!messages[1].content.contains("[In-Flight Checkpoint #1]"));
+        assert_eq!(
+            messages[1].content,
+            "fix the bug\n\n[In-Flight Checkpoint #2]\nMutated files: src/c.rs\nAdded test in src/c.rs:1."
+        );
     }
 }

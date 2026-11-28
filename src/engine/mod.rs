@@ -12,5 +12,7 @@ pub use backend::{
     ReasoningWireFormat, StreamSentinel,
 };
 pub use lifecycle::{EngineLifecycle, LifecycleError};
-pub use provider::{Completion, EngineClient, EngineError, Message, Metrics, ToolCall, ToolSchema};
+pub use provider::{
+    ChatOptions, Completion, EngineClient, EngineError, Message, Metrics, ToolCall, ToolSchema,
+};
 pub use sanitize::{Repetition, RepetitionDetector};

@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::engine::{EngineClient, EngineError, Message, ToolSchema};
+use crate::engine::{ChatOptions, EngineClient, EngineError, Message, ToolSchema};
 use crate::state::StateDir;
 
 #[async_trait]
@@ -69,6 +69,20 @@ pub trait ChatEngine: Send + Sync {
         reasoning_effort: Option<&str>,
     ) -> Result<crate::engine::Completion, EngineError>;
 
+    /// One chat turn with explicit completion and reasoning-budget options.
+    /// Defaults to forwarding to [`Self::chat`] for mock compatibility.
+    async fn chat_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        stream: bool,
+        reasoning_effort: Option<&str>,
+        options: ChatOptions,
+    ) -> Result<crate::engine::Completion, EngineError> {
+        let _ = options;
+        self.chat(messages, tools, stream, reasoning_effort).await
+    }
+
     /// Exact prompt token count via the engine's tokenizer endpoint when
     /// available; `None` falls back to `usage.prompt_tokens` / local sizing.
     async fn count_tokens(&self, _messages: &[Message], _tools: &[ToolSchema]) -> Option<usize> {
@@ -86,6 +100,18 @@ impl ChatEngine for EngineClient {
         reasoning_effort: Option<&str>,
     ) -> Result<crate::engine::Completion, EngineError> {
         EngineClient::chat(self, messages, tools, stream, reasoning_effort).await
+    }
+
+    async fn chat_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        stream: bool,
+        reasoning_effort: Option<&str>,
+        options: ChatOptions,
+    ) -> Result<crate::engine::Completion, EngineError> {
+        EngineClient::chat_with_options(self, messages, tools, stream, reasoning_effort, options)
+            .await
     }
 
     async fn count_tokens(&self, messages: &[Message], tools: &[ToolSchema]) -> Option<usize> {
@@ -158,10 +184,11 @@ pub struct SessionOptions {
     pub reasoning_effort: Option<String>,
     /// The engine's max context (in tokens). Drives two in-session gates:
     ///
-    /// - **75% resume watermark** — a resumed session rolls to a fresh
+    /// - **90% resume watermark** — a resumed session rolls to a fresh
     ///   `[system, user]` pair when the loaded history plus the new prompt
-    ///   would exceed 75% of this budget (checked once, at resume, in
-    ///   [`should_resume`], tokens approximated as `chars / 4`).
+    ///   would exceed 90% of this budget (checked once, at resume, in
+    ///   [`should_resume`], aligned with the in-flight ceiling; tokens
+    ///   approximated as `chars / 4`).
     /// - **90% in-flight ceiling** — while a session runs, [`run_session`]
     ///   checks the accumulated context (preferring engine-reported
     ///   `prompt_tokens` plus uncounted tail tokens) against 90% of this

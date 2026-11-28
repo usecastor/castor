@@ -2,7 +2,7 @@
 
 use tracing::warn;
 
-use crate::engine::{Completion, EngineError, Message, ToolSchema};
+use crate::engine::{ChatOptions, Completion, EngineError, Message, Metrics, ToolSchema};
 use crate::runner::ChatEngine;
 use crate::runner::events::EventLogger;
 use crate::runner::messages::msg;
@@ -19,6 +19,7 @@ async fn retry_with_nudge(
     messages: &[Message],
     tools: &[ToolSchema],
     effort: Option<&str>,
+    chat_options: ChatOptions,
     turn_timeout_secs: u64,
     logger: &EventLogger,
     turn: u32,
@@ -40,7 +41,7 @@ async fn retry_with_nudge(
     let _ = logger.append(event);
     let mut retry_messages = messages.to_vec();
     retry_messages.push(msg("user", nudge));
-    let retry = engine.chat(&retry_messages, tools, true, effort);
+    let retry = engine.chat_with_options(&retry_messages, tools, true, effort, chat_options);
     if turn_timeout_secs > 0 {
         match tokio::time::timeout(std::time::Duration::from_secs(turn_timeout_secs), retry).await {
             Ok(r) => r,
@@ -62,8 +63,13 @@ async fn retry_with_nudge(
 
 pub(crate) const REPETITION_RETRY_NUDGE: &str = "[System: Previous response entered a repetition loop. Stop repeating prior phrasing and immediately emit your next tool call or final response.]";
 
+const REASONING_BUDGET_RETRY_NUDGE: &str = "[System: Previous deliberation exceeded the single-turn reasoning \
+     budget. Be concise and emit your next tool call or final response \
+     immediately.]";
+
 /// Chat with watchdog: wraps `engine.chat` in a wall-clock timeout, aborts
 /// and retries runaway repetition loops, and monitors reasoning token ceilings.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // each argument is a distinct watchdog input
 pub(crate) async fn chat_with_watchdog(
     engine: &dyn ChatEngine,
@@ -75,11 +81,44 @@ pub(crate) async fn chat_with_watchdog(
     logger: &EventLogger,
     turn: u32,
 ) -> Result<Completion, EngineError> {
+    chat_with_watchdog_bounded(
+        engine,
+        messages,
+        tools,
+        effort,
+        turn_timeout_secs,
+        max_turn_reasoning_tokens,
+        None,
+        logger,
+        turn,
+    )
+    .await
+}
+
+/// Bounded variant of [`chat_with_watchdog`] forwarding an optional `max_tokens`
+/// completion ceiling and mid-stream `max_turn_reasoning_tokens` cutoff.
+#[allow(clippy::too_many_arguments)] // each argument is a distinct watchdog input
+pub(crate) async fn chat_with_watchdog_bounded(
+    engine: &dyn ChatEngine,
+    messages: &[Message],
+    tools: &[ToolSchema],
+    effort: Option<&str>,
+    turn_timeout_secs: u64,
+    max_turn_reasoning_tokens: u32,
+    max_tokens: Option<u32>,
+    logger: &EventLogger,
+    turn: u32,
+) -> Result<Completion, EngineError> {
+    let chat_options = ChatOptions {
+        max_tokens,
+        max_turn_reasoning_tokens: Some(max_turn_reasoning_tokens),
+    };
+
     // 1. Issue the primary call, optionally under a wall-clock timeout.
     let first = if turn_timeout_secs > 0 {
         match tokio::time::timeout(
             std::time::Duration::from_secs(turn_timeout_secs),
-            engine.chat(messages, tools, true, effort),
+            engine.chat_with_options(messages, tools, true, effort, chat_options),
         )
         .await
         {
@@ -95,6 +134,7 @@ pub(crate) async fn chat_with_watchdog(
                     messages,
                     tools,
                     effort,
+                    chat_options,
                     turn_timeout_secs,
                     logger,
                     turn,
@@ -106,7 +146,9 @@ pub(crate) async fn chat_with_watchdog(
             }
         }
     } else {
-        engine.chat(messages, tools, true, effort).await
+        engine
+            .chat_with_options(messages, tools, true, effort, chat_options)
+            .await
     };
 
     let completion = match first {
@@ -127,6 +169,7 @@ pub(crate) async fn chat_with_watchdog(
                 messages,
                 tools,
                 effort,
+                chat_options,
                 turn_timeout_secs,
                 logger,
                 turn,
@@ -140,14 +183,56 @@ pub(crate) async fn chat_with_watchdog(
             )
             .await;
         }
+        Err(EngineError::ReasoningBudgetExceeded { tokens, limit }) => {
+            warn!(
+                turn = turn,
+                reasoning_tokens = tokens,
+                limit = limit,
+                "turn aborted mid-stream at reasoning-token budget ({}); retrying once (prefix preserved, effort = {effort:?})",
+                limit
+            );
+            let retry_res = retry_with_nudge(
+                engine,
+                messages,
+                tools,
+                effort,
+                chat_options,
+                turn_timeout_secs,
+                logger,
+                turn,
+                "reasoning_token_budget",
+                serde_json::json!({
+                    "reasoning_tokens": tokens,
+                    "max_turn_reasoning_tokens": limit,
+                    "mid_stream_abort": true,
+                }),
+                REASONING_BUDGET_RETRY_NUDGE,
+            )
+            .await;
+            return match retry_res {
+                Err(EngineError::ReasoningBudgetExceeded {
+                    tokens: retry_tokens,
+                    ..
+                }) => Ok(Completion {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: Some("length".into()),
+                    metrics: Metrics {
+                        reasoning_tokens: Some(retry_tokens),
+                        ..Default::default()
+                    },
+                }),
+                other => other,
+            };
+        }
         Err(err) => return Err(err),
     };
 
-    // 2. Reasoning-token budget stall: `length` finish, no tool calls, and the
-    //    model burned at least the budget in reasoning tokens.
+    // 2. Reasoning-token budget stall: `length` finish and the model burned at
+    //    least the budget in reasoning tokens (even if tool calls were pending).
     let stalled = max_turn_reasoning_tokens > 0
         && completion.finish_reason.as_deref() == Some("length")
-        && completion.tool_calls.is_empty()
         && completion.metrics.reasoning_tokens.unwrap_or(0) >= u64::from(max_turn_reasoning_tokens);
 
     if stalled {
@@ -162,6 +247,7 @@ pub(crate) async fn chat_with_watchdog(
             messages,
             tools,
             effort,
+            chat_options,
             turn_timeout_secs,
             logger,
             turn,
@@ -170,9 +256,7 @@ pub(crate) async fn chat_with_watchdog(
                 "reasoning_tokens": completion.metrics.reasoning_tokens,
                 "max_turn_reasoning_tokens": max_turn_reasoning_tokens,
             }),
-            "[System: Previous deliberation exceeded the single-turn reasoning \
-             budget. Be concise and emit your next tool call or final response \
-             immediately.]",
+            REASONING_BUDGET_RETRY_NUDGE,
         )
         .await;
     }

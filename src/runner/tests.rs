@@ -1223,7 +1223,7 @@ fn build_workspace_skeleton_is_deterministic_sorted_and_excludes_build_state() {
 fn spill_tool_output_respects_custom_threshold() {
     let state = tmp_state();
     // A payload that exceeds a *custom* low threshold but is well below the
-    // default 16 KiB — proves the caller's `threshold` overrides the default.
+    // default 8 KiB — proves the caller's `threshold` overrides the default.
     let custom = 100usize;
     let payload = "y".repeat(300);
     assert!(payload.len() > custom && payload.len() < SPILL_THRESHOLD_BYTES);
@@ -1253,7 +1253,7 @@ fn spill_tool_output_respects_custom_threshold() {
     let _ = std::fs::remove_dir_all(state.root());
 }
 
-// --- Session-history persistence & 75% watermark ----------------------
+// --- Session-history persistence & 90% watermark ----------------------
 
 #[test]
 fn save_and_load_round_trips_sanitized_non_system_history() {
@@ -1327,28 +1327,28 @@ fn load_messages_absent_file_is_none() {
 
 #[test]
 fn watermark_within_budget_resumes() {
-    // max_context = 1000 → 75% watermark = 750 tokens.
+    // max_context = 1000 → 90% watermark = 900 tokens.
     // history: 1 message of 400 chars = 100 tokens; new prompt 100 chars = 25.
-    // 100 + 25 = 125 <= 750 → resume.
+    // 100 + 25 = 125 <= 900 → resume.
     let history = vec![msg("user", "a".repeat(400))];
     let mut opts = SessionOptions::with_state(tmp_state());
     opts.max_context = 1000;
     assert!(
         should_resume(&history, &"b".repeat(100), Some(&opts)),
-        "history within the 75% watermark must resume"
+        "history within the 90% watermark must resume"
     );
 }
 
 #[test]
 fn watermark_over_budget_rolls_over() {
-    // max_context = 100 → 75% watermark = 75 tokens.
-    // history: 400 chars = 100 tokens; new prompt 100 chars = 25 → 125 > 75.
+    // max_context = 100 → 90% watermark = 90 tokens.
+    // history: 400 chars = 100 tokens; new prompt 100 chars = 25 → 125 > 90.
     let history = vec![msg("user", "a".repeat(400))];
     let mut opts = SessionOptions::with_state(tmp_state());
     opts.max_context = 100;
     assert!(
         !should_resume(&history, &"b".repeat(100), Some(&opts)),
-        "history over the 75% watermark must roll over"
+        "history over the 90% watermark must roll over"
     );
 }
 
@@ -1480,14 +1480,14 @@ async fn second_dispatch_rolls_over_when_over_watermark() {
     .await
     .unwrap();
 
-    // Second dispatch with a tiny max_context → history exceeds 75% →
+    // Second dispatch with a tiny max_context → history exceeds 90% →
     // roll over to a fresh [system, user] (no prior history resumed).
     let logger2 = EventLogger::new(&state, sid);
     let recorder2 = std::sync::Arc::new(CallRecorder::default());
     let engine2 = RecordingEngine::new(vec![comp("Second done.", Vec::new())], recorder2.clone());
     let executor2 = MockExecutor::new(Vec::new());
     let mut opts2 = SessionOptions::with_state(state.clone());
-    opts2.max_context = 100; // 75% = 75 tokens; prior history ~1000+ tokens
+    opts2.max_context = 100; // 90% = 90 tokens; prior history ~1000+ tokens
 
     let res2 = run_session(
         &engine2,
@@ -1924,13 +1924,14 @@ async fn watchdog_repetition_loop_persistent_failure_does_not_infinite_loop() {
 /// Finding 5 — true cooperative yield handoff, end-to-end (overcommit-only
 /// gate).
 ///
-/// The pool is token-budgeted at 100. An *older* worker claims one slot at
-/// 60 context tokens and holds it ~80ms. The session runs as a *younger*
-/// worker (a 2nd slot) that, after its first turn, records 60 context
-/// tokens of its own — pushing the pool to 120 > 100 (overcommit). The
-/// yield gate then fires: the runner releases its slot and re-acquires
-/// through the standard token-budgeted acquire, which (the pool still
-/// overcommitted) waits in the FIFO queue until the older lease frees
+/// The pool is token-budgeted at 100 (soft limit 90). An *older* worker claims
+/// one slot at 80 context tokens (<= 90 soft limit) and holds it ~80ms. The
+/// session runs as a *younger* worker (a 2nd slot) that, after its first turn,
+/// records its prompt tokens (60) plus uncounted tool/assistant tail (~5) —
+/// pushing the pool above 90 while remaining lighter than the older worker
+/// (65 < 80). The yield gate then fires: the runner releases its slot and
+/// re-acquires through the standard token-budgeted acquire, which (the pool
+/// still overcommitted) waits in the FIFO queue until the older lease frees
 /// capacity, then runs Turn 2. We prove the handoff by asserting the older
 /// release instant lands strictly between the Turn-1 and Turn-2 engine
 /// calls.
@@ -1946,14 +1947,15 @@ async fn cooperative_yield_waits_for_release_before_next_turn() {
     // budgeted at 100 so the yield gate (driven by overcommit) can fire.
     let sem = TaskSemaphore::with_poll_interval(&state, 2, 5).with_token_budget(100);
 
-    // The older worker: claim a slot at 60 context tokens (under the 100
-    // budget, so admitted freely), hold it ~80ms, then release it.
+    // The older worker: claim a slot at 80 context tokens (under the 90
+    // soft limit, so the 2nd worker at 0 is admitted freely), hold it ~80ms,
+    // then release it.
     let older_release_at: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let rel = older_release_at.clone();
     let sem_old = sem.clone();
     let older = tokio::spawn(async move {
-        let lease = sem_old.acquire_with_tokens("task_old", 60).await;
+        let lease = sem_old.acquire_with_tokens("task_old", 80).await;
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         let _ = sem_old.release(&lease);
         *rel.lock().unwrap() = Some(std::time::Instant::now());
@@ -1963,7 +1965,7 @@ async fn cooperative_yield_waits_for_release_before_next_turn() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // The younger worker (this session) claims the 2nd slot at 0 (pool
-    // committed is 60, under budget, so it is admitted).
+    // committed is 80 <= 90, under budget, so it is admitted).
     let younger = sem.acquire_with_tokens("task_young", 0).await;
     let ctx = LeaseYieldContext {
         sem: std::sync::Arc::new(sem.clone()),
@@ -1976,9 +1978,10 @@ async fn cooperative_yield_waits_for_release_before_next_turn() {
     options.max_context = 100_000;
 
     // Turn 1: a tool call (so the turn is not final). The engine reports
-    // 60 prompt tokens, which the runner records on the younger's lease →
-    // pool committed becomes 60 (old) + 60 (young) = 120 > 100 → overcommit
-    // → yield. Turn 2: a final (tool-free) completion.
+    // 60 prompt tokens plus the Turn-1 assistant/tool tail (~5 tokens), which
+    // the runner records on the younger's lease → pool committed becomes
+    // 80 (old) + ~65 (young) > 90 while 65 < 80 → yield. Turn 2: a final
+    // (tool-free) completion.
     let engine = ScriptedEngine {
         responses: tokio::sync::Mutex::new(
             vec![
@@ -2206,5 +2209,461 @@ async fn in_flight_context_ceiling_blocks_slipped_tool_calls() {
         executor.calls().await.is_empty(),
         "slipped tool calls on ceiling turn must never execute"
     );
+    let _ = std::fs::remove_dir_all(&state_root);
+}
+
+#[tokio::test]
+async fn in_flight_context_ceiling_preserves_effort_and_falls_back_on_length() {
+    // Part A: Initial 90% ceiling call keeps the original reasoning effort
+    // (0 KV invalidation) when it produces a valid response.
+    for configured in [Some("xhigh"), Some("high"), Some("medium")] {
+        let state = tmp_state();
+        let state_root = state.root().to_path_buf();
+        let logger = logger_for(&state);
+
+        let engine = EffortRecordingEngine {
+            responses: tokio::sync::Mutex::new(
+                vec![
+                    comp_metrics("", vec![tc("c1", "bash", r#"{"cmd":"ls"}"#)], 910),
+                    comp_metrics("Final synthesis.", Vec::new(), 940),
+                ]
+                .into(),
+            ),
+            efforts: tokio::sync::Mutex::new(Vec::new()),
+            messages: tokio::sync::Mutex::new(Vec::new()),
+        };
+        let executor = MockExecutor::new(vec!["ok".into()]);
+
+        let mut options = SessionOptions::with_state(state);
+        options.max_context = 1_000;
+        options.reasoning_effort = configured.map(str::to_string);
+
+        let res = run_session(
+            &engine,
+            &executor,
+            &logger,
+            "sys",
+            "go",
+            &[tool_schema("bash")],
+            Some(&options),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.status, "completed");
+        assert_eq!(res.turns, 2);
+        assert_eq!(res.final_text, "Final synthesis.");
+
+        let efforts = engine.efforts.lock().await.clone();
+        assert_eq!(
+            efforts,
+            vec![
+                configured.map(str::to_string),
+                configured.map(str::to_string),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    // Part B: If the ceiling call at original `xhigh` effort returns empty
+    // `length`, the empty assistant message is popped and retried once with
+    // `Some("low")`.
+    let state = tmp_state();
+    let state_root = state.root().to_path_buf();
+    let logger = logger_for(&state);
+
+    let big_prompt = "x".repeat(3_700);
+    let exhausted = Completion {
+        content: String::new(),
+        reasoning_content: Some("truncated thinking".into()),
+        tool_calls: Vec::new(),
+        finish_reason: Some("length".into()),
+        metrics: Metrics {
+            ttft_ms: None,
+            total_ms: 1.0,
+            tokens_per_sec: None,
+            prompt_tokens: Some(950),
+            cached_tokens: None,
+            completion_tokens: None,
+            reasoning_tokens: Some(50),
+        },
+    };
+    let engine = EffortRecordingEngine {
+        responses: tokio::sync::Mutex::new(
+            vec![
+                exhausted,
+                comp_metrics("Recovered at low.", Vec::new(), 950),
+            ]
+            .into(),
+        ),
+        efforts: tokio::sync::Mutex::new(Vec::new()),
+        messages: tokio::sync::Mutex::new(Vec::new()),
+    };
+    let executor = MockExecutor::new(Vec::new());
+
+    let mut options = SessionOptions::with_state(state);
+    options.max_context = 1_000;
+    options.reasoning_effort = Some("xhigh".into());
+
+    let res = run_session(
+        &engine,
+        &executor,
+        &logger,
+        "sys",
+        &big_prompt,
+        &[tool_schema("bash")],
+        Some(&options),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(res.status, "completed");
+    assert_eq!(res.final_text, "Recovered at low.");
+
+    let efforts = engine.efforts.lock().await.clone();
+    assert_eq!(
+        efforts,
+        vec![Some("xhigh".to_string()), Some("low".to_string())]
+    );
+    let sent_msgs = engine.messages.lock().await.clone();
+    assert_eq!(sent_msgs.len(), 2);
+    assert!(
+        !sent_msgs[1].iter().any(|m| m.role == "assistant"),
+        "the popped empty assistant message must not appear in the low retry: {:?}",
+        sent_msgs[1]
+    );
+    let _ = std::fs::remove_dir_all(&state_root);
+}
+
+#[tokio::test]
+async fn in_flight_context_ceiling_reasoning_exhausted_not_completed() {
+    let state = tmp_state();
+    let state_root = state.root().to_path_buf();
+    let logger = logger_for(&state);
+
+    let big_prompt = "x".repeat(3_700);
+    let exhausted = Completion {
+        content: String::new(),
+        reasoning_content: Some("truncated internal thinking trace".into()),
+        tool_calls: Vec::new(),
+        finish_reason: Some("length".into()),
+        metrics: Metrics {
+            ttft_ms: None,
+            total_ms: 1.0,
+            tokens_per_sec: None,
+            prompt_tokens: Some(950),
+            cached_tokens: None,
+            completion_tokens: None,
+            reasoning_tokens: Some(50),
+        },
+    };
+    let engine = EffortRecordingEngine {
+        responses: tokio::sync::Mutex::new(vec![exhausted.clone(), exhausted.clone()].into()),
+        efforts: tokio::sync::Mutex::new(Vec::new()),
+        messages: tokio::sync::Mutex::new(Vec::new()),
+    };
+    let executor = MockExecutor::new(Vec::new());
+
+    let mut options = SessionOptions::with_state(state);
+    options.max_context = 1_000;
+    options.reasoning_effort = Some("xhigh".into());
+
+    let res = run_session(
+        &engine,
+        &executor,
+        &logger,
+        "sys",
+        &big_prompt,
+        &[tool_schema("bash")],
+        Some(&options),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(res.status, "reasoning_budget_exhausted");
+    assert!(
+        !res.final_text.contains("truncated internal thinking trace"),
+        "raw truncated reasoning_content must not be surfaced as final_text: {}",
+        res.final_text
+    );
+    let efforts = engine.efforts.lock().await.clone();
+    assert_eq!(
+        efforts,
+        vec![Some("xhigh".to_string()), Some("low".to_string())]
+    );
+
+    let events = logger.read_all();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "ceiling_reasoning_exhausted"),
+        "expected ceiling_reasoning_exhausted event: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&state_root);
+
+    // When already `Some("low")`, no redundant retry is issued.
+    let state_low = tmp_state();
+    let state_low_root = state_low.root().to_path_buf();
+    let logger_low = logger_for(&state_low);
+    let engine_low = EffortRecordingEngine {
+        responses: tokio::sync::Mutex::new(vec![exhausted].into()),
+        efforts: tokio::sync::Mutex::new(Vec::new()),
+        messages: tokio::sync::Mutex::new(Vec::new()),
+    };
+    let mut options_low = SessionOptions::with_state(state_low);
+    options_low.max_context = 1_000;
+    options_low.reasoning_effort = Some("low".into());
+
+    let res_low = run_session(
+        &engine_low,
+        &MockExecutor::new(Vec::new()),
+        &logger_low,
+        "sys",
+        &big_prompt,
+        &[tool_schema("bash")],
+        Some(&options_low),
+    )
+    .await
+    .unwrap();
+    assert_eq!(res_low.status, "reasoning_budget_exhausted");
+    assert_eq!(
+        *engine_low.efforts.lock().await,
+        vec![Some("low".to_string())]
+    );
+    let _ = std::fs::remove_dir_all(&state_low_root);
+}
+
+#[tokio::test]
+async fn tier1_observation_masking_at_60_percent_keeps_running_without_ceiling() {
+    let state = tmp_state();
+    let state_root = state.root().to_path_buf();
+    let logger = logger_for(&state);
+
+    // max_context = 2_000 -> mask at 1_200 (60%), compact at 1_700, ceiling at 1_800.
+    // Turn 1 produces a large (~2,600-byte) read_file output (~870 tokens,
+    // staying below the 1_200 mask watermark until Turn 5 reports
+    // prompt_tokens = 1_250). At top of Turn 6, Tier 1 masks Turn 1's output,
+    // resetting accounted_msgs so history_tokens drops well below 1_200 and
+    // Turn 6 runs cleanly without triggering compaction or context_ceiling.
+    let engine = ScriptedEngine {
+        responses: tokio::sync::Mutex::new(
+            vec![
+                comp_metrics(
+                    "",
+                    vec![tc("t1", "read_file", r#"{"path":"src/a.rs"}"#)],
+                    200,
+                ),
+                comp_metrics("", vec![tc("t2", "bash", r#"{"cmd":"echo 2"}"#)], 1_050),
+                comp_metrics("", vec![tc("t3", "bash", r#"{"cmd":"echo 3"}"#)], 1_100),
+                comp_metrics("", vec![tc("t4", "bash", r#"{"cmd":"echo 4"}"#)], 1_150),
+                comp_metrics("", vec![tc("t5", "bash", r#"{"cmd":"echo 5"}"#)], 1_250),
+                comp_metrics("Completed after masking.", Vec::new(), 400),
+            ]
+            .into(),
+        ),
+        calls: tokio::sync::Mutex::new(Vec::new()),
+    };
+    let large_read = format!("src/a.rs (total: 100 lines)\n{}", "x".repeat(2_600));
+    let executor = MockExecutor::new(vec![
+        large_read,
+        "ok2".into(),
+        "ok3".into(),
+        "ok4".into(),
+        "ok5".into(),
+    ]);
+
+    let mut options = SessionOptions::with_state(state);
+    options.max_context = 2_000;
+
+    let res = run_session(
+        &engine,
+        &executor,
+        &logger,
+        "sys",
+        "inspect and verify",
+        &[tool_schema("read_file"), tool_schema("bash")],
+        Some(&options),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(res.status, "completed");
+    assert_eq!(res.final_text, "Completed after masking.");
+    assert_eq!(res.turns, 6);
+
+    let calls = engine.calls.lock().await;
+    assert_eq!(calls.len(), 6);
+    let turn6_msgs = &calls[5].1;
+    let masked_tool = turn6_msgs
+        .iter()
+        .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("t1"))
+        .expect("t1 tool message must remain present");
+    assert!(
+        masked_tool
+            .content
+            .starts_with("[Observation masked: src/a.rs (total: 100 lines) — "),
+        "Turn 1 observation must be masked before Turn 6: {}",
+        masked_tool.content
+    );
+    // Recent 4 turns (t2..t5) stay unmasked.
+    for id in ["t2", "t3", "t4", "t5"] {
+        let m = turn6_msgs
+            .iter()
+            .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some(id))
+            .unwrap();
+        assert!(!m.content.starts_with("[Observation masked"));
+    }
+
+    let events = logger.read_all();
+    assert!(
+        events.iter().any(|e| e["type"] == "observation_mask"),
+        "expected observation_mask event: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e["type"] == "context_compaction"),
+        "must not compact when masking resolved pressure: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e["type"] == "context_ceiling"),
+        "must not trigger context_ceiling: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&state_root);
+}
+
+#[tokio::test]
+async fn tier2_in_flight_compaction_at_85_percent_runs_up_to_twice_and_continues() {
+    let state = tmp_state();
+    let state_root = state.root().to_path_buf();
+    let logger = logger_for(&state);
+
+    // max_context = 1_000 -> compact at 850, ceiling at 900.
+    // All tool outputs are <= 256 bytes so Tier 1 masking frees 0 messages.
+    // Cycle 1 (Turns 1..5): hits 855 >= 850 with 5 assistant turns (> 4) ->
+    //   Compaction #1 call + Turn 6 continues.
+    // Cycle 2 (Turns 6..10): hits 855 >= 850 with 5 assistant turns (> 4) ->
+    //   Compaction #2 call + Turn 11 finishes.
+    // Cycle 3 (Turns 11..15): if it hits 850+ again after 2 compactions,
+    //   compaction_count == 2 caps Tier 2, and 90% ceiling handles 900+.
+    let engine = ScriptedEngine {
+        responses: tokio::sync::Mutex::new(
+            vec![
+                // Cycle 1 (turns 1..5)
+                comp_metrics(
+                    "",
+                    vec![tc("e1", "edit_file", r#"{"path":"src/lib.rs"}"#)],
+                    200,
+                ),
+                comp_metrics("", vec![tc("b2", "bash", r#"{"cmd":"t2"}"#)], 350),
+                comp_metrics("", vec![tc("b3", "bash", r#"{"cmd":"t3"}"#)], 500),
+                comp_metrics("", vec![tc("b4", "bash", r#"{"cmd":"t4"}"#)], 650),
+                comp_metrics("", vec![tc("b5", "bash", r#"{"cmd":"t5"}"#)], 855),
+                // Tier 2 Compaction #1 response
+                comp_metrics("Checkpoint 1: edited src/lib.rs.", Vec::new(), 860),
+                // Cycle 2 (turns 6..10)
+                comp_metrics(
+                    "",
+                    vec![tc("e2", "write_file", r#"{"path":"src/main.rs"}"#)],
+                    200,
+                ),
+                comp_metrics("", vec![tc("b7", "bash", r#"{"cmd":"t7"}"#)], 350),
+                comp_metrics("", vec![tc("b8", "bash", r#"{"cmd":"t8"}"#)], 500),
+                comp_metrics("", vec![tc("b9", "bash", r#"{"cmd":"t9"}"#)], 650),
+                comp_metrics("", vec![tc("b10", "bash", r#"{"cmd":"t10"}"#)], 855),
+                // Tier 2 Compaction #2 response
+                comp_metrics("Checkpoint 2: wrote src/main.rs.", Vec::new(), 860),
+                // Cycle 3 (turns 11..15): hits 855 (>= 850) then 910 (>= 900)
+                comp_metrics("", vec![tc("b11", "bash", r#"{"cmd":"t11"}"#)], 200),
+                comp_metrics("", vec![tc("b12", "bash", r#"{"cmd":"t12"}"#)], 350),
+                comp_metrics("", vec![tc("b13", "bash", r#"{"cmd":"t13"}"#)], 500),
+                comp_metrics("", vec![tc("b14", "bash", r#"{"cmd":"t14"}"#)], 650),
+                comp_metrics("", vec![tc("b15", "bash", r#"{"cmd":"t15"}"#)], 855),
+                // At top of turn 16: compaction_count == 2 -> no 3rd compaction;
+                // 855 < 900 so turn 16 runs normally and pushes to 910 -> ceiling at turn 17.
+                comp_metrics("", vec![tc("b16", "bash", r#"{"cmd":"t16"}"#)], 910),
+                comp_metrics("Finished at ceiling after 2 compactions.", Vec::new(), 920),
+            ]
+            .into(),
+        ),
+        calls: tokio::sync::Mutex::new(Vec::new()),
+    };
+    let executor = MockExecutor::new(vec![
+        "Edited src/lib.rs".into(),
+        "ok2".into(),
+        "ok3".into(),
+        "ok4".into(),
+        "ok5".into(),
+        "Wrote src/main.rs".into(),
+        "ok7".into(),
+        "ok8".into(),
+        "ok9".into(),
+        "ok10".into(),
+        "ok11".into(),
+        "ok12".into(),
+        "ok13".into(),
+        "ok14".into(),
+        "ok15".into(),
+        "ok16".into(),
+    ]);
+
+    let mut options = SessionOptions::with_state(state);
+    options.max_context = 1_000;
+
+    let res = run_session(
+        &engine,
+        &executor,
+        &logger,
+        "sys",
+        "original task prompt",
+        &[
+            tool_schema("edit_file"),
+            tool_schema("write_file"),
+            tool_schema("bash"),
+        ],
+        Some(&options),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(res.status, "completed");
+    assert_eq!(res.final_text, "Finished at ceiling after 2 compactions.");
+
+    let calls = engine.calls.lock().await;
+    // Call 5 (index 5) is Compaction #1: passes full tools & IN_FLIGHT_COMPACTION_PROMPT.
+    assert_eq!(calls[5].2.len(), 3, "compaction call preserves tools");
+    assert!(
+        calls[5]
+            .1
+            .last()
+            .unwrap()
+            .content
+            .contains("Working context budget has reached 85%")
+    );
+    // Call 6 (index 6) is Turn 6 after Compaction #1.
+    assert_eq!(calls[6].1.len(), 2);
+    assert_eq!(
+        calls[6].1[1].content,
+        "original task prompt\n\n[In-Flight Checkpoint #1]\nMutated files: src/lib.rs\nCheckpoint 1: edited src/lib.rs."
+    );
+    // Call 12 (index 12) is Turn 11 after Compaction #2: prior Checkpoint #1 stripped.
+    assert_eq!(calls[12].1.len(), 2);
+    assert!(!calls[12].1[1].content.contains("[In-Flight Checkpoint #1]"));
+    assert_eq!(
+        calls[12].1[1].content,
+        "original task prompt\n\n[In-Flight Checkpoint #2]\nMutated files: src/main.rs\nCheckpoint 2: wrote src/main.rs."
+    );
+
+    let events = logger.read_all();
+    let compactions: Vec<_> = events
+        .iter()
+        .filter(|e| e["type"] == "context_compaction")
+        .collect();
+    assert_eq!(
+        compactions.len(),
+        2,
+        "must cap at 2 compactions: {events:?}"
+    );
+    assert_eq!(compactions[0]["compaction_index"], 1);
+    assert_eq!(compactions[1]["compaction_index"], 2);
+    assert!(events.iter().any(|e| e["type"] == "context_ceiling"));
     let _ = std::fs::remove_dir_all(&state_root);
 }

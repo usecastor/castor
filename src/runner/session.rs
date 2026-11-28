@@ -4,11 +4,14 @@ use futures_util::future::join_all;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use crate::engine::{Completion, Message, ToolCall, ToolSchema};
+use crate::engine::{ChatOptions, Message, ToolCall, ToolSchema};
 use crate::runner::budget::{LOOP_THRESHOLD, LOOP_WINDOW};
 use crate::runner::context::{
-    CONTEXT_CEILING_DIRECTIVE, history_tokens, in_flight_ceiling_tokens, in_flight_context_tokens,
-    load_messages, prior_session_summary_block, save_messages, should_resume, watermark_tokens,
+    CONTEXT_CEILING_DIRECTIVE, IN_FLIGHT_COMPACTION_PROMPT, MAX_IN_FLIGHT_COMPACTIONS,
+    apply_in_flight_compaction, compaction_watermark_tokens, compute_turn_max_tokens,
+    in_flight_ceiling_tokens, in_flight_context_tokens, last_non_empty_assistant, load_messages,
+    mask_old_observations, mask_watermark_tokens, prior_session_summary_block, save_messages,
+    should_resume, watermark_tokens,
 };
 use crate::runner::events::EventLogger;
 use crate::runner::loop_detector::{LoopDetector, LoopState};
@@ -20,7 +23,7 @@ use crate::runner::salvage::{
     run_reasoning_ceiling_salvage,
 };
 use crate::runner::skeleton::spill_tool_output;
-use crate::runner::watchdog::chat_with_watchdog;
+use crate::runner::watchdog::chat_with_watchdog_bounded;
 use crate::runner::{
     ChatEngine, RunnerError, SessionOptions, SessionResult, ToolExecutor, ToolOutcome,
 };
@@ -58,19 +61,16 @@ fn persist_and_record_turn(
     options: Option<&SessionOptions>,
     session_id: &str,
     messages: &[Message],
-    completion: &Completion,
+    accounted_msgs: usize,
+    last_prompt_tokens: Option<usize>,
 ) {
     if let Some(state) = options.and_then(|o| o.state.as_ref()) {
         save_messages(state, session_id, messages);
     }
 
     if let Some(ctx) = options.and_then(|o| o.lease_context.as_ref()) {
-        let prompt_tokens = completion.metrics.prompt_tokens;
-        let completion_tokens = completion.metrics.completion_tokens;
-        let turn_tokens = prompt_tokens
-            .map(|p| p as u32)
-            .unwrap_or_else(|| history_tokens(messages) as u32)
-            .saturating_add(completion_tokens.map(|c| c as u32).unwrap_or(0));
+        let turn_tokens = in_flight_context_tokens(messages, accounted_msgs, last_prompt_tokens)
+            .min(u32::MAX as usize) as u32;
         ctx.sem.update_context_tokens(&ctx.task_id, turn_tokens);
     }
 }
@@ -426,6 +426,48 @@ fn dedup_tool_content(messages: &[Message], tc: &ToolCall, sanitized: &str) -> S
     sanitized.to_string()
 }
 
+/// Execute one `chat_with_watchdog_bounded` turn with a single transient-SSE retry.
+#[allow(clippy::too_many_arguments)]
+async fn chat_turn_with_sse_retry(
+    engine: &dyn ChatEngine,
+    messages: &[Message],
+    tools: &[ToolSchema],
+    effort: Option<&str>,
+    wd_timeout: u64,
+    wd_max_reasoning: u32,
+    max_tokens: Option<u32>,
+    logger: &EventLogger,
+    turns: u32,
+) -> Result<crate::engine::Completion, RunnerError> {
+    let primary = chat_with_watchdog_bounded(
+        engine,
+        messages,
+        tools,
+        effort,
+        wd_timeout,
+        wd_max_reasoning,
+        max_tokens,
+        logger,
+        turns,
+    )
+    .await;
+    match primary {
+        Ok(c) => Ok(c),
+        Err(crate::engine::EngineError::Sse(err)) => {
+            tracing::warn!("Transient SSE stream error on turn {turns}: {err}; retrying once");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let chat_options = ChatOptions {
+                max_tokens,
+                max_turn_reasoning_tokens: Some(wd_max_reasoning),
+            };
+            Ok(engine
+                .chat_with_options(messages, tools, true, effort, chat_options)
+                .await?)
+        }
+        Err(err) => Err(RunnerError::Engine(err)),
+    }
+}
+
 /// Run a multi-turn agent session.
 ///
 /// Builds the message list (tool schemas last, for the vLLM APC contract),
@@ -545,11 +587,19 @@ pub async fn run_session(
         .map(|o| o.effective_close_tag())
         .unwrap_or_else(|| concat!("</th", "ink>").to_string());
 
-    // In-flight 90% context ceiling (re-checked every turn). When accumulated
-    // context reaches 90% of `max_context`, the next turn disables tool
-    // dispatch, appends `CONTEXT_CEILING_DIRECTIVE`, and lands the final
-    // completion in the remaining 10% headroom. `0` disables the gate.
-    let ceiling_tokens = in_flight_ceiling_tokens(options.map(|o| o.max_context).unwrap_or(0));
+    // Tiered in-flight context management (re-checked every turn):
+    // - Tier 1 (60%): mask old `role: "tool"` outputs beyond the last 4 turns
+    //   (subject to a 4-turn cooldown so masking batches cleanly without KV thrash).
+    // - Tier 2 (85%): in-flight checkpoint compaction (up to 2 times).
+    // - Tier 3 (90%): hard ceiling — disable tool dispatch, append
+    //   `CONTEXT_CEILING_DIRECTIVE`, and land the final completion.
+    // `0` disables all three gates.
+    let max_context = options.map(|o| o.max_context).unwrap_or(0);
+    let mask_tokens = mask_watermark_tokens(max_context);
+    let compact_tokens = compaction_watermark_tokens(max_context);
+    let ceiling_tokens = in_flight_ceiling_tokens(max_context);
+    let mut last_mask_turn: Option<u32> = None;
+    let mut compaction_count: u32 = 0;
     let mut ceiling_triggered = false;
     let mut break_after_turn = false;
     // Post-mutation verification guard state (see [`is_verifiable_code_mutation`]).
@@ -590,6 +640,20 @@ pub async fn run_session(
     } else {
         0
     };
+    if let Some(ctx) = options.and_then(|o| o.lease_context.as_ref())
+        && let Some(pt) = last_prompt_tokens
+    {
+        let pt_u32 = pt.min(u32::MAX as usize) as u32;
+        let current = ctx
+            .lease
+            .lock()
+            .ok()
+            .and_then(|g| crate::task::semaphore::lease::read_lease(&g.file))
+            .map(|l| l.context_tokens);
+        if current != Some(pt_u32) {
+            ctx.sem.update_context_tokens(&ctx.task_id, pt_u32);
+        }
+    }
 
     loop {
         turns += 1;
@@ -622,8 +686,118 @@ pub async fn run_session(
                 last_prompt_tokens = Some(exact);
                 accounted_msgs = messages.len();
             }
-            let current_tokens =
+            let mut current_tokens =
                 in_flight_context_tokens(&messages, accounted_msgs, last_prompt_tokens);
+
+            // Tier 1 (60%): Watermarked observation masking with 4-turn cooldown
+            // so masking batches cleanly instead of invalidating the KV prefix every turn.
+            const MASK_COOLDOWN_TURNS: u32 = 4;
+            let mask_cooldown_ok =
+                last_mask_turn.is_none_or(|prev| turns.saturating_sub(prev) >= MASK_COOLDOWN_TURNS);
+            if current_tokens >= mask_tokens && mask_cooldown_ok {
+                let mask_res = mask_old_observations(&mut messages, 4);
+                if mask_res.masked_count > 0 {
+                    last_mask_turn = Some(turns);
+                    accounted_msgs = 0;
+                    last_prompt_tokens = None;
+                    if let Some(exact) = engine.count_tokens(&messages, tools).await {
+                        last_prompt_tokens = Some(exact);
+                        accounted_msgs = messages.len();
+                    }
+                    current_tokens =
+                        in_flight_context_tokens(&messages, accounted_msgs, last_prompt_tokens);
+                    tracing::info!(
+                        session = %session_id,
+                        turn = turns,
+                        masked_count = mask_res.masked_count,
+                        freed_chars = mask_res.freed_chars,
+                        context_tokens = current_tokens,
+                        "Tier 1 observation masking applied"
+                    );
+                    let _ = logger.append(serde_json::json!({
+                        "type": "observation_mask",
+                        "turn": turns,
+                        "masked_count": mask_res.masked_count,
+                        "freed_chars": mask_res.freed_chars,
+                        "context_tokens": current_tokens,
+                    }));
+                    if let Some(ctx) = options.and_then(|o| o.lease_context.as_ref()) {
+                        ctx.sem.update_context_tokens(
+                            &ctx.task_id,
+                            current_tokens.min(u32::MAX as usize) as u32,
+                        );
+                    }
+                }
+            }
+
+            // Tier 2 (85%): In-flight LLM checkpoint compaction fallback.
+            let assistant_count = messages.iter().filter(|m| m.role == "assistant").count();
+            if current_tokens >= compact_tokens
+                && compaction_count < MAX_IN_FLIGHT_COMPACTIONS
+                && assistant_count > 4
+            {
+                let mut compaction_messages = messages.clone();
+                compaction_messages.push(msg("user", IN_FLIGHT_COMPACTION_PROMPT));
+                let raw_summary = match engine
+                    .chat(&compaction_messages, tools, false, effort)
+                    .await
+                {
+                    Ok(c) => {
+                        let text = strip_reasoning_tags(&c.content, &open_tag, &close_tag);
+                        if text.trim().is_empty() {
+                            None
+                        } else {
+                            Some(text)
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            turn = turns,
+                            "in-flight checkpoint compaction call failed: {err}"
+                        );
+                        None
+                    }
+                };
+                let summary = raw_summary.unwrap_or_else(|| {
+                    last_non_empty_assistant(&messages)
+                        .unwrap_or_else(|| "Continue remaining task checklist.".to_string())
+                });
+                let tokens_before = current_tokens;
+                compaction_count += 1;
+                apply_in_flight_compaction(&mut messages, &summary, compaction_count);
+                accounted_msgs = 0;
+                last_prompt_tokens = None;
+                if let Some(exact) = engine.count_tokens(&messages, tools).await {
+                    last_prompt_tokens = Some(exact);
+                    accounted_msgs = messages.len();
+                }
+                current_tokens =
+                    in_flight_context_tokens(&messages, accounted_msgs, last_prompt_tokens);
+                tracing::info!(
+                    session = %session_id,
+                    turn = turns,
+                    compaction_index = compaction_count,
+                    tokens_before,
+                    context_tokens = current_tokens,
+                    "Tier 2 in-flight checkpoint compaction applied"
+                );
+                let _ = logger.append(serde_json::json!({
+                    "type": "context_compaction",
+                    "turn": turns,
+                    "compaction_index": compaction_count,
+                    "tokens_before": tokens_before,
+                    "context_tokens": current_tokens,
+                }));
+                if let Some(ctx) = options.and_then(|o| o.lease_context.as_ref()) {
+                    ctx.sem.update_context_tokens(
+                        &ctx.task_id,
+                        current_tokens.min(u32::MAX as usize) as u32,
+                    );
+                }
+            }
+
+            // Tier 3 (90%): Hard in-flight context ceiling.
             if current_tokens >= ceiling_tokens {
                 tracing::info!(
                     session = %session_id,
@@ -650,31 +824,23 @@ pub async fn run_session(
         // On that turn, any tool call the engine still emits is never executed
         // (the loop lands the completion and breaks below).
         let active_tools: &[ToolSchema] = tools;
+        let pre_call_tokens =
+            in_flight_context_tokens(&messages, accounted_msgs, last_prompt_tokens);
+        let turn_max_tokens =
+            compute_turn_max_tokens(max_context, pre_call_tokens, wd_max_reasoning);
         accounted_msgs = messages.len();
-        let completion = {
-            let primary = chat_with_watchdog(
-                engine,
-                &messages,
-                active_tools,
-                effort,
-                wd_timeout,
-                wd_max_reasoning,
-                logger,
-                turns,
-            )
-            .await;
-            match primary {
-                Ok(c) => c,
-                Err(crate::engine::EngineError::Sse(err)) => {
-                    tracing::warn!(
-                        "Transient SSE stream error on turn {turns}: {err}; retrying once"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    engine.chat(&messages, active_tools, true, effort).await?
-                }
-                Err(err) => return Err(RunnerError::Engine(err)),
-            }
-        };
+        let completion = chat_turn_with_sse_retry(
+            engine,
+            &messages,
+            active_tools,
+            effort,
+            wd_timeout,
+            wd_max_reasoning,
+            turn_max_tokens,
+            logger,
+            turns,
+        )
+        .await?;
 
         // Record the dispatch event (with the engine's per-turn token usage,
         // so current Rust runs contribute to the telemetry token totals).
@@ -715,14 +881,70 @@ pub async fn run_session(
 
         if break_after_turn {
             // The in-flight 90% context ceiling: no workspace tool is executed
-            // on this turn. If the model still emitted tool calls, close every
-            // one with a well-formed `role: "tool"` result so a resumed session
-            // never carries a dangling, unanswered `tool_call` (a hard
-            // provider rejection on reload). `finish` is acknowledged as
-            // completed; any workspace tool is recorded as skipped. The final
-            // text prefers an explicit `finish(summary)` argument, else the
-            // turn's own synthesis. `status` stays `"completed"` — this path
-            // lands the completion in the remaining headroom and never nudges.
+            // on this turn. The initial ceiling call preserves the session's
+            // `effort` for zero KV invalidation; only if it returns empty
+            // `length` (`is_reasoning_ceiling` with empty content) and `effort`
+            // was not already `Some("low")`, pop the empty assistant message
+            // and retry once at `Some("low")`. If still empty `length`, record
+            // `ceiling_reasoning_exhausted` and terminate honestly as
+            // `"reasoning_budget_exhausted"`.
+            let mut completion = completion;
+            if completion.tool_calls.is_empty()
+                && is_reasoning_ceiling(&completion)
+                && completion.content.trim().is_empty()
+                && effort != Some("low")
+            {
+                tracing::warn!(
+                    session = %session_id,
+                    turn = turns,
+                    "90% context ceiling turn exhausted remaining headroom inside reasoning; \
+                     retrying once with low effort"
+                );
+                messages.pop();
+                let fallback_tokens =
+                    in_flight_context_tokens(&messages, accounted_msgs, last_prompt_tokens);
+                let fallback_max_tokens =
+                    compute_turn_max_tokens(max_context, fallback_tokens, wd_max_reasoning);
+                completion = chat_turn_with_sse_retry(
+                    engine,
+                    &messages,
+                    active_tools,
+                    Some("low"),
+                    wd_timeout,
+                    wd_max_reasoning,
+                    fallback_max_tokens,
+                    logger,
+                    turns,
+                )
+                .await?;
+                logger
+                    .append(serde_json::json!({
+                        "type": "dispatch",
+                        "turn": turns,
+                        "finish_reason": completion.finish_reason,
+                        "content": completion.content,
+                        "tool_calls": completion
+                            .tool_calls
+                            .iter()
+                            .map(|tc| serde_json::json!({
+                                "id": tc.id,
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "metrics": metrics_json(&completion.metrics),
+                    }))
+                    .map_err(RunnerError::Io)?;
+                let sanitized_retry =
+                    strip_reasoning_tags(&completion.content, &open_tag, &close_tag);
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: sanitized_retry,
+                    tool_calls: completion.tool_calls.clone(),
+                    tool_call_id: None,
+                });
+            }
+
             if !completion.tool_calls.is_empty() {
                 let finish_summary = completion
                     .tool_calls
@@ -752,6 +974,21 @@ pub async fn run_session(
                     }));
                 }
                 final_text = finish_summary.unwrap_or_else(|| completion_text(&completion));
+            } else if is_reasoning_ceiling(&completion) && completion.content.trim().is_empty() {
+                tracing::warn!(
+                    session = %session_id,
+                    turn = turns,
+                    "90% context ceiling turn exhausted remaining headroom inside reasoning with empty content"
+                );
+                let _ = logger.append(serde_json::json!({
+                    "type": "ceiling_reasoning_exhausted",
+                    "turn": turns,
+                }));
+                final_text = "The session terminated at the 90% working-context ceiling \
+                              (reasoning_budget_exhausted) before producing final output; \
+                              the conversation history is preserved in the session event ledger."
+                    .to_string();
+                status = "reasoning_budget_exhausted".to_string();
             } else {
                 final_text = completion_text(&completion);
             }
@@ -1012,7 +1249,13 @@ impasse, state your findings and ask for alignment rather than continuing to re-
                      verification via bash. Run verification now, then call finish(summary).",
                 );
                 push_image_attachments(&mut messages, pending_image_attachments);
-                persist_and_record_turn(options, session_id, &messages, &completion);
+                persist_and_record_turn(
+                    options,
+                    session_id,
+                    &messages,
+                    accounted_msgs,
+                    last_prompt_tokens,
+                );
                 continue;
             }
 
@@ -1034,7 +1277,13 @@ impasse, state your findings and ask for alignment rather than continuing to re-
                     "Finish rejected: provide a non-empty grounded `summary` argument.",
                 );
                 push_image_attachments(&mut messages, pending_image_attachments);
-                persist_and_record_turn(options, session_id, &messages, &completion);
+                persist_and_record_turn(
+                    options,
+                    session_id,
+                    &messages,
+                    accounted_msgs,
+                    last_prompt_tokens,
+                );
                 continue;
             }
 
@@ -1075,7 +1324,13 @@ impasse, state your findings and ask for alignment rather than continuing to re-
         // End of turn: persist the sanitized history so a later dispatch can
         // resume it (subject to the 90% ceiling-aligned resume watermark on load),
         // and record the turn's token footprint on the held lease.
-        persist_and_record_turn(options, session_id, &messages, &completion);
+        persist_and_record_turn(
+            options,
+            session_id,
+            &messages,
+            accounted_msgs,
+            last_prompt_tokens,
+        );
     }
 
     // Record the final event.

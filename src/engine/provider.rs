@@ -36,6 +36,18 @@ pub enum EngineError {
     /// finished. A clean, typed engine failure — never improvised content.
     #[error("trace exhausted: no more recorded responses")]
     TraceExhausted,
+    #[error("turn reasoning budget exceeded ({tokens} > {limit} tokens)")]
+    ReasoningBudgetExceeded { tokens: u64, limit: u32 },
+}
+
+/// Per-request completion and reasoning-budget overrides passed to
+/// [`EngineClient::chat_with_options`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChatOptions {
+    /// Explicit `max_tokens` ceiling serialized on `/chat/completions` when `Some(n)` (`n > 0`).
+    pub max_tokens: Option<u32>,
+    /// Mid-stream reasoning-token cutoff (`Some(0)` disables; `None` uses the client's configured budget).
+    pub max_turn_reasoning_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -185,6 +197,7 @@ pub struct EngineClient {
     base_url: String,
     model: String,
     api_key: Option<String>,
+    max_turn_reasoning_tokens: u32,
     pub backend: super::backend::Backend,
     pub capabilities: super::backend::EngineCapabilities,
 }
@@ -213,6 +226,7 @@ impl EngineClient {
             base_url,
             model,
             api_key: cfg.api_key.clone(),
+            max_turn_reasoning_tokens: cfg.max_turn_reasoning_tokens,
             backend,
             capabilities,
         })
@@ -228,12 +242,35 @@ impl EngineClient {
         stream: bool,
         reasoning_effort: Option<&str>,
     ) -> Result<Completion, EngineError> {
+        self.chat_with_options(
+            messages,
+            tools,
+            stream,
+            reasoning_effort,
+            ChatOptions::default(),
+        )
+        .await
+    }
+
+    /// Send one chat-completion request with explicit completion and
+    /// mid-stream reasoning-budget options.
+    pub async fn chat_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        stream: bool,
+        reasoning_effort: Option<&str>,
+        options: ChatOptions,
+    ) -> Result<Completion, EngineError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let mut body = json!({
             "model": self.model,
             "messages": messages.iter().map(|m| m.to_json()).collect::<Vec<_>>(),
             "stream": stream,
         });
+        if let Some(max_tokens) = options.max_tokens.filter(|&n| n > 0) {
+            body["max_tokens"] = json!(max_tokens);
+        }
         if !tools.is_empty() {
             body["tools"] = json!(tools.iter().map(|t| t.to_json()).collect::<Vec<_>>());
             body["tool_choice"] = json!("auto");
@@ -274,8 +311,11 @@ impl EngineClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(EngineError::Http { status, body });
         }
+        let reasoning_limit = options
+            .max_turn_reasoning_tokens
+            .unwrap_or(self.max_turn_reasoning_tokens);
         if stream {
-            self.consume_stream(resp, t0).await
+            self.consume_stream(resp, t0, reasoning_limit).await
         } else {
             self.parse_non_stream(resp, t0).await
         }
@@ -313,6 +353,7 @@ impl EngineClient {
         &self,
         resp: reqwest::Response,
         t0: Instant,
+        max_turn_reasoning_tokens: u32,
     ) -> Result<Completion, EngineError> {
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
@@ -376,6 +417,11 @@ impl EngineClient {
                     if let Some(k) = parsed.cached_tokens {
                         cached_tokens = Some(k);
                     }
+                    check_reasoning_budget(
+                        reasoning_tokens,
+                        &reasoning_content,
+                        max_turn_reasoning_tokens,
+                    )?;
                 }
                 for choice in frame
                     .get("choices")
@@ -407,6 +453,11 @@ impl EngineClient {
                             return Err(repetition_loop_err(rep));
                         }
                         reasoning_content.push_str(r);
+                        check_reasoning_budget(
+                            reasoning_tokens,
+                            &reasoning_content,
+                            max_turn_reasoning_tokens,
+                        )?;
                     }
                     if let Some(c) = delta
                         .get("content")
@@ -601,6 +652,25 @@ fn repetition_loop_err(rep: crate::engine::sanitize::Repetition) -> EngineError 
         pattern: preview,
         count: rep.count,
     }
+}
+
+fn check_reasoning_budget(
+    reasoning_tokens: Option<u64>,
+    reasoning_content: &str,
+    limit: u32,
+) -> Result<(), EngineError> {
+    if limit == 0 {
+        return Ok(());
+    }
+    let est_tokens = (reasoning_content.len() / 3) as u64;
+    let observed = reasoning_tokens.unwrap_or(0).max(est_tokens);
+    if observed > u64::from(limit) {
+        return Err(EngineError::ReasoningBudgetExceeded {
+            tokens: observed,
+            limit,
+        });
+    }
+    Ok(())
 }
 
 static RE_THINK: LazyLock<regex::Regex> =

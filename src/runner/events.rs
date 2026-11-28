@@ -1,9 +1,10 @@
 //! Append-only JSONL session event ledger.
 //!
-//! One event per turn is appended to `<state>/sessions/<id>/events.jsonl`:
-//! a `dispatch` event (the model's turn: tool calls + finish reason), a
-//! `tool_result` event per executed tool call, and a `final` event when the
-//! session ends.
+//! Session events are appended to `<state>/sessions/<id>/events.jsonl`:
+//! `session_start` (emitted by the worker at launch with task/session metadata
+//! and git provenance), a `dispatch` event per turn (the model's turn: tool
+//! calls + finish reason), a `tool_result` event per executed tool call, and a
+//! `final` event when the session ends.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
