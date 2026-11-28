@@ -44,6 +44,7 @@ pub struct StatusServer {
 }
 
 struct Inner {
+    state: StateDir,
     registry: TaskRegistry,
     locks: Locks,
 }
@@ -53,15 +54,18 @@ impl StatusServer {
         let registry = TaskRegistry::new(state);
         let locks = Locks::from_state(state);
         Self {
-            inner: Arc::new(Inner { registry, locks }),
+            inner: Arc::new(Inner {
+                state: state.clone(),
+                registry,
+                locks,
+            }),
         }
     }
 
     /// Acquire the singleton lock. Returns `true` if we own it, `false` if
     /// another live process holds it (caller should exit 0).
     pub fn try_acquire_lock(&self) -> bool {
-        let ttl = 30_000; // 30 s TTL; liveness-checked against active holder pid.
-        match self.inner.locks.acquire_live("status", ttl) {
+        match self.try_acquire_lock_result() {
             Ok(AcquireResult::Acquired) => true,
             Ok(AcquireResult::HeldBy { .. }) => false,
             Err(e) => {
@@ -69,6 +73,11 @@ impl StatusServer {
                 false
             }
         }
+    }
+
+    fn try_acquire_lock_result(&self) -> std::io::Result<AcquireResult> {
+        let ttl = 30_000; // 30 s TTL; liveness-checked against active holder pid.
+        self.inner.locks.acquire_live("status", ttl)
     }
 
     /// Acquire the singleton lock, retrying up to `retries` times with `delay_ms`
@@ -112,7 +121,7 @@ impl StatusServer {
         // reclaim orphaned slot leases (dead owner or bound task terminal) and
         // reconcile orphaned tasks. This is what keeps slots from staying
         // locked indefinitely after a worker that died without releasing them.
-        {
+        let reaper_handle = {
             let registry = self.inner.registry.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(30));
@@ -125,12 +134,43 @@ impl StatusServer {
                         eprintln!("[castor-status] reaper reclaimed {reclaimed} orphaned slot(s)");
                     }
                 }
-            });
-        }
+            })
+        };
+
+        // Periodic lock heartbeat: refresh `"status"` lock every 10 s (30 s TTL)
+        // so other instances never reclaim it as stale while we are alive.
+        let heartbeat_handle = {
+            let server = self.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(10));
+                ticker.tick().await; // skip the first (immediate) tick
+                loop {
+                    ticker.tick().await;
+                    match server.inner.locks.refresh("status", 30_000) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = server.try_acquire_lock();
+                        }
+                        Err(e) => {
+                            eprintln!("[castor-status] lock refresh error: {e}");
+                        }
+                    }
+                }
+            })
+        };
 
         let candidate_ports = [port, 18023, 18024, 18025, 0];
         let mut bound_listener = None;
         for &p in &candidate_ports {
+            if p != 0
+                && probe_status_port(p).await
+                && !probe_status_port_for_state(&self.inner.state, p).await
+            {
+                eprintln!(
+                    "[castor-status] port {p} is serving a different state_dir, trying next candidate"
+                );
+                continue;
+            }
             let addr = SocketAddr::from(([127, 0, 0, 1], p));
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(l) => {
@@ -141,26 +181,47 @@ impl StatusServer {
                     eprintln!("[castor-status] port {p} in use, trying next candidate");
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    heartbeat_handle.abort();
+                    reaper_handle.abort();
+                    return Err(e);
+                }
             }
         }
-        let listener = bound_listener.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrInUse,
-                "all candidate status ports in use",
-            )
-        })?;
+        let listener = match bound_listener {
+            Some(l) => l,
+            None => {
+                heartbeat_handle.abort();
+                reaper_handle.abort();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "all candidate status ports in use",
+                ));
+            }
+        };
         let bound_addr = listener.local_addr()?;
         let bound_port = bound_addr.port();
         eprintln!("[castor-status] listening on {bound_addr}");
 
-        // Record active port into <state>/ports/status.port
+        // Record active port atomically into <state>/ports/status.port.
         let ports_dir = self.inner.registry.state_dir().ports();
         let _ = std::fs::create_dir_all(&ports_dir);
         let port_file = ports_dir.join("status.port");
-        let _ = std::fs::write(&port_file, bound_port.to_string());
+        let tmp_port_file = ports_dir.join(format!(".status.port.tmp.{}", std::process::id()));
+        if std::fs::write(&tmp_port_file, bound_port.to_string()).is_ok() {
+            if std::fs::rename(&tmp_port_file, &port_file).is_err() {
+                let _ = std::fs::remove_file(&tmp_port_file);
+                let _ = std::fs::write(&port_file, bound_port.to_string());
+            }
+        } else {
+            let _ = std::fs::write(&port_file, bound_port.to_string());
+        }
 
-        axum::serve(listener, self.router()).await
+        let res = axum::serve(listener, self.router()).await;
+        heartbeat_handle.abort();
+        reaper_handle.abort();
+        let _ = std::fs::remove_file(&port_file);
+        res
     }
 
     /// Listen on an ephemeral port (for tests). Returns the bound address.
@@ -430,28 +491,102 @@ pub fn active_status_port(state: &StateDir, default_port: u16) -> u16 {
 pub async fn ensure_status_server(state: &StateDir, port: u16) {
     let server = StatusServer::new(state);
 
-    // 1. lock.
-    let acquired = server.try_acquire_lock();
-
-    // 2. probe: is a status server already listening on the port?
-    let target_port = active_status_port(state, port);
-    let already_up = probe_status_port(target_port).await;
-
-    if acquired && !already_up {
-        // Release our lock before spawning so the child process can acquire
-        // it cleanly without a TOCTOU race.
-        server.release_lock();
-        // 3. spawn (detached child re-acquires the lock).
-        spawn_detached(state, port);
-    } else {
-        // We either don't own the lock (another live process does) or the
-        // port is already serving. Release our lock if we hold it; do not
-        // spawn.
-        if acquired {
-            server.release_lock();
+    // 1. probe: check recorded active port first; if stale and different from
+    //    the configured default port, remove the stale file and probe `port`.
+    let recorded_port = active_status_port(state, port);
+    let mut active_port = recorded_port;
+    let mut already_up = probe_status_port_for_state(state, recorded_port).await;
+    if !already_up && recorded_port != port {
+        let _ = std::fs::remove_file(state.ports().join("status.port"));
+        if probe_status_port_for_state(state, port).await {
+            active_port = port;
+            already_up = true;
         }
-        eprintln!("[castor] status server already up (port {target_port}); not spawning");
     }
+    if already_up {
+        eprintln!("[castor] status server already up (port {active_port}); not spawning");
+        return;
+    }
+
+    // 2. lock & spawn if down.
+    match server.try_acquire_lock_result() {
+        Ok(AcquireResult::Acquired) => {
+            // Re-probe in case another process finished booting right before lock acquire.
+            let p = active_status_port(state, port);
+            if probe_status_port_for_state(state, p).await
+                || (p != port && probe_status_port_for_state(state, port).await)
+            {
+                server.release_lock();
+                return;
+            }
+            // Release our lock before spawning so the child process can acquire
+            // it cleanly without a TOCTOU race.
+            server.release_lock();
+            spawn_and_wait(state, port).await;
+        }
+        Ok(AcquireResult::HeldBy { pid }) => {
+            eprintln!(
+                "[castor] status server unreachable on port {recorded_port}, lock held by pid {pid}; waiting briefly to retry"
+            );
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let p = active_status_port(state, port);
+                if probe_status_port_for_state(state, p).await
+                    || (p != port && probe_status_port_for_state(state, port).await)
+                {
+                    return;
+                }
+            }
+            match server.try_acquire_lock_result() {
+                Ok(AcquireResult::Acquired) => {
+                    server.release_lock();
+                    spawn_and_wait(state, port).await;
+                }
+                Ok(AcquireResult::HeldBy { pid: holder_pid }) => {
+                    eprintln!(
+                        "[castor] status server still unreachable on port {recorded_port} (lock held by pid {holder_pid})"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[castor] status lock retry error: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[castor] status lock acquire error: {e}");
+        }
+    }
+}
+
+async fn spawn_and_wait(state: &StateDir, port: u16) {
+    let Some(mut child) = spawn_detached(state, port) else {
+        return;
+    };
+    for _ in 0..20 {
+        let p = active_status_port(state, port);
+        if probe_status_port_for_state(state, p).await
+            || (p != port && probe_status_port_for_state(state, port).await)
+        {
+            return;
+        }
+        if let Ok(Some(exit_status)) = child.try_wait() {
+            let p = active_status_port(state, port);
+            if !probe_status_port_for_state(state, p).await
+                && (p == port || !probe_status_port_for_state(state, port).await)
+            {
+                eprintln!(
+                    "[castor] status server child exited early ({exit_status}); see {}",
+                    state.logs().join("status_server.log").display()
+                );
+            }
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eprintln!(
+        "[castor] status server did not become ready within 2s (port {port}); see {}",
+        state.logs().join("status_server.log").display()
+    );
 }
 
 /// Lock-guarded boot-time orphan reconciliation.
@@ -501,24 +636,74 @@ pub async fn boot_reap(state: &StateDir) {
     }
 }
 
-/// Probe the status port with a short-timeout TCP connect. Returns `true` if
-/// something is listening (a live keeper), `false` if the port is dark.
-async fn probe_status_port(port: u16) -> bool {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let res = tokio::time::timeout(
-        Duration::from_millis(500),
-        tokio::net::TcpStream::connect(addr),
-    )
-    .await;
-    matches!(res, Ok(Ok(_)))
+async fn send_context_probe(port: u16) -> Option<reqwest::Response> {
+    if port == 0 {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(800))
+        .build()
+        .ok()?;
+    let url = format!("http://127.0.0.1:{port}/api/context");
+    let resp = client.get(&url).send().await.ok()?;
+    resp.status().is_success().then_some(resp)
+}
+
+fn state_dirs_match(expected: &std::path::Path, reported: &str) -> bool {
+    if reported.is_empty() {
+        return false;
+    }
+    let reported_path = std::path::Path::new(reported);
+    if let (Ok(a), Ok(b)) = (
+        dunce::canonicalize(expected),
+        dunce::canonicalize(reported_path),
+    ) {
+        return a == b;
+    }
+    let normalize = |s: &str| -> String {
+        let replaced = s.replace('\\', "/");
+        let trimmed = if replaced.len() > 1 {
+            replaced.trim_end_matches('/')
+        } else {
+            &replaced
+        };
+        if cfg!(windows) {
+            trimmed.to_ascii_lowercase()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    normalize(&expected.to_string_lossy()) == normalize(reported)
+}
+
+/// Probe the status port with a short-timeout HTTP GET on `/api/context`.
+/// Returns `true` only if a Castor status server responds with 2xx.
+pub async fn probe_status_port(port: u16) -> bool {
+    send_context_probe(port).await.is_some()
+}
+
+/// Probe the status port with `/api/context` and return `true` iff it responds
+/// with 2xx and its reported `stateDir` matches `state.root()`.
+pub async fn probe_status_port_for_state(state: &StateDir, port: u16) -> bool {
+    let Some(resp) = send_context_probe(port).await else {
+        return false;
+    };
+    let Ok(val) = resp.json::<serde_json::Value>().await else {
+        return false;
+    };
+    let Some(reported) = val.get("stateDir").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    state_dirs_match(state.root(), reported)
 }
 
 /// Spawn the status server as a fully detached child process (new process
-/// group on Unix, stdio nulled). Never waits for the child.
-fn spawn_detached(state: &StateDir, port: u16) {
+/// group on Unix, detached console on Windows, stdout/stderr appended to
+/// `<state>/logs/status_server.log`). Never waits for the child.
+fn spawn_detached(state: &StateDir, port: u16) -> Option<std::process::Child> {
     let Some(exe) = std::env::current_exe().ok() else {
         eprintln!("[castor] cannot determine current exe; skipping status server spawn");
-        return;
+        return None;
     };
     let state_str = state.root().to_string_lossy().into_owned();
     let mut cmd = std::process::Command::new(&exe);
@@ -527,9 +712,31 @@ fn spawn_detached(state: &StateDir, port: u16) {
         .arg(&state_str)
         .arg("--port")
         .arg(port.to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null());
+
+    let logs_dir = state.logs();
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let log_path = logs_dir.join("status_server.log");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => {
+            if let Ok(dup) = file.try_clone() {
+                cmd.stdout(dup);
+            } else {
+                cmd.stdout(std::process::Stdio::null());
+            }
+            cmd.stderr(file);
+        }
+        Err(e) => {
+            eprintln!("[castor] failed to open {}: {e}", log_path.display());
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+
     // Detach: put the child in its own process group (pgid 0 = the child's
     // own pid) so it survives the parent and is not reaped with it.
     #[cfg(unix)]
@@ -540,15 +747,19 @@ fn spawn_detached(state: &StateDir, port: u16) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW (0x08000000) | CREATE_NEW_PROCESS_GROUP (0x00000200) | DETACHED_PROCESS (0x00000008)
-        cmd.creation_flags(0x08000208);
+        // CREATE_NO_WINDOW (0x08000000) | CREATE_NEW_PROCESS_GROUP (0x00000200).
+        // Do not combine with DETACHED_PROCESS (0x00000008), which is mutually
+        // exclusive with CREATE_NO_WINDOW on CreateProcessW.
+        cmd.creation_flags(0x0800_0200);
     }
     match cmd.spawn() {
-        Ok(_) => {
+        Ok(child) => {
             eprintln!("[castor] status server spawned (port {port})");
+            Some(child)
         }
         Err(e) => {
             eprintln!("[castor] failed to spawn status server: {e}");
+            None
         }
     }
 }
@@ -1438,5 +1649,67 @@ mod tests {
             .expect("a transport error on candidate 1 must continue to candidate 2");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn probe_status_port_requires_http_2xx_context() {
+        assert!(!probe_status_port(0).await);
+
+        // Raw TCP listener (accepts TCP without serving HTTP /api/context) must fail probe.
+        let raw_tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raw_port = raw_tcp.local_addr().unwrap().port();
+        let raw_accept = tokio::spawn(async move {
+            let _ = raw_tcp.accept().await;
+        });
+        assert!(
+            !probe_status_port(raw_port).await,
+            "raw TCP listener without HTTP /api/context must not pass readiness probe"
+        );
+        raw_accept.abort();
+
+        // Live StatusServer must pass readiness probe on /api/context.
+        let state = tmp_state();
+        let addr = StatusServer::new(&state).serve_ephemeral().await.unwrap();
+        assert!(
+            probe_status_port(addr.port()).await,
+            "live StatusServer must pass HTTP /api/context readiness probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_status_server_cleans_stale_status_port_and_finds_default_port() {
+        let state = tmp_state();
+        let live_addr = StatusServer::new(&state).serve_ephemeral().await.unwrap();
+        let live_port = live_addr.port();
+
+        // Write a stale port into <state>/ports/status.port pointing at an unreachable port.
+        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stale_port = unused.local_addr().unwrap().port();
+        drop(unused);
+        let port_file = state.ports().join("status.port");
+        std::fs::write(&port_file, stale_port.to_string()).unwrap();
+
+        ensure_status_server(&state, live_port).await;
+        assert!(
+            !port_file.exists(),
+            "stale status.port must be removed when configured default port is live"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_status_port_for_state_distinguishes_state_dirs() {
+        let state_a = tmp_state();
+        let state_b = tmp_state();
+        let addr = StatusServer::new(&state_a).serve_ephemeral().await.unwrap();
+
+        assert!(!probe_status_port_for_state(&state_a, 0).await);
+        assert!(
+            probe_status_port_for_state(&state_a, addr.port()).await,
+            "probe_status_port_for_state must return true for matching StateDir"
+        );
+        assert!(
+            !probe_status_port_for_state(&state_b, addr.port()).await,
+            "probe_status_port_for_state must return false for a different StateDir"
+        );
     }
 }

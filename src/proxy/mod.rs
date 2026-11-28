@@ -15,6 +15,7 @@ pub mod sanitize;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +46,7 @@ pub struct ProxyServer {
 struct Inner {
     upstream_root: String,
     locks: Locks,
+    state_dir: PathBuf,
     client: reqwest::Client,
 }
 
@@ -61,6 +63,7 @@ impl ProxyServer {
             inner: Arc::new(Inner {
                 upstream_root: root,
                 locks,
+                state_dir: state.root().to_path_buf(),
                 client,
             }),
         }
@@ -69,7 +72,7 @@ impl ProxyServer {
     /// Acquire the singleton lock. Returns `true` if we own it, `false` if
     /// another live process holds it (caller should exit 0).
     pub fn try_acquire_lock(&self) -> bool {
-        match self.inner.locks.acquire_live("proxy", LOCK_TTL_MS) {
+        match self.try_acquire_lock_result() {
             Ok(AcquireResult::Acquired) => true,
             Ok(AcquireResult::HeldBy { .. }) => false,
             Err(e) => {
@@ -77,6 +80,10 @@ impl ProxyServer {
                 false
             }
         }
+    }
+
+    fn try_acquire_lock_result(&self) -> std::io::Result<AcquireResult> {
+        self.inner.locks.acquire_live("proxy", LOCK_TTL_MS)
     }
 
     /// Acquire the singleton lock with short backoff to absorb startup races
@@ -106,15 +113,88 @@ impl ProxyServer {
             .with_state(self.clone())
     }
 
-    /// Listen on the given port. Blocks until the server is dropped.
+    /// Listen on the given port (falling back to candidate ports if in use).
+    /// Blocks until the server is dropped.
     pub async fn serve(self, port: u16) -> std::io::Result<()> {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        // Periodic lock heartbeat: refresh `"proxy"` lock every 10 s so other
+        // instances never reclaim it as stale while we are alive.
+        let heartbeat_handle = {
+            let server = self.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(10));
+                ticker.tick().await; // skip immediate tick
+                loop {
+                    ticker.tick().await;
+                    match server.inner.locks.refresh("proxy", LOCK_TTL_MS) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = server.try_acquire_lock();
+                        }
+                        Err(e) => {
+                            eprintln!("[castor-proxy] lock refresh error: {e}");
+                        }
+                    }
+                }
+            })
+        };
+
+        let candidates = if port == 0 {
+            vec![0]
+        } else {
+            vec![port, port.saturating_add(4), port.saturating_add(5), 0]
+        };
+        let mut bound_listener = None;
+        for &p in &candidates {
+            let addr = SocketAddr::from(([127, 0, 0, 1], p));
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => {
+                    bound_listener = Some(l);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    eprintln!("[castor-proxy] port {p} in use, trying next candidate");
+                    continue;
+                }
+                Err(e) => {
+                    heartbeat_handle.abort();
+                    return Err(e);
+                }
+            }
+        }
+        let listener = match bound_listener {
+            Some(l) => l,
+            None => {
+                heartbeat_handle.abort();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "all candidate proxy ports in use",
+                ));
+            }
+        };
+        let bound_addr = listener.local_addr()?;
+        let bound_port = bound_addr.port();
         eprintln!(
-            "[castor-proxy] listening on {addr} -> {}",
+            "[castor-proxy] listening on {bound_addr} -> {}",
             self.inner.upstream_root
         );
-        axum::serve(listener, self.router()).await
+
+        let ports_dir = self.inner.state_dir.join("ports");
+        let _ = std::fs::create_dir_all(&ports_dir);
+        let port_file = ports_dir.join("proxy.port");
+        let tmp_port_file = ports_dir.join(format!(".proxy.port.tmp.{}", std::process::id()));
+        if std::fs::write(&tmp_port_file, bound_port.to_string()).is_ok() {
+            if std::fs::rename(&tmp_port_file, &port_file).is_err() {
+                let _ = std::fs::remove_file(&tmp_port_file);
+                let _ = std::fs::write(&port_file, bound_port.to_string());
+            }
+        } else {
+            let _ = std::fs::write(&port_file, bound_port.to_string());
+        }
+
+        let res = axum::serve(listener, self.router()).await;
+        heartbeat_handle.abort();
+        let _ = std::fs::remove_file(&port_file);
+        res
     }
 
     /// Listen on an ephemeral port (for tests). Returns the bound address.
@@ -342,6 +422,16 @@ pub async fn ensure_proxy_server(state: &StateDir, proxy_port: u16, engine_port:
     .await;
 }
 
+/// Read the active proxy port recorded by a running proxy server, falling back
+/// to `default_port` if absent or invalid.
+pub fn active_proxy_port(state: &StateDir, default_port: u16) -> u16 {
+    let port_file = state.ports().join("proxy.port");
+    std::fs::read_to_string(&port_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(default_port)
+}
+
 /// Same best-effort proxy bring-up using a resolved upstream URL root (supports
 /// non-default `CASTOR_BASE_URL` hosts, ports, and path prefixes).
 pub async fn ensure_proxy_server_for_upstream(
@@ -351,43 +441,126 @@ pub async fn ensure_proxy_server_for_upstream(
 ) {
     let server = ProxyServer::from_upstream_url(state, upstream_root);
 
-    // 1. lock.
-    let acquired = server.try_acquire_lock();
-
-    // 2. probe: is a proxy already listening on the port?
-    let already_up = probe_port(proxy_port).await;
-
-    if acquired && !already_up {
-        // Release before spawning so the detached child acquires cleanly
-        // without waiting on a parent hold.
-        server.release_lock();
-        // 3. spawn (detached child re-acquires the lock).
-        spawn_detached(state, proxy_port, upstream_root);
-    } else {
-        if acquired {
-            server.release_lock();
+    // 1. probe: check recorded active port first; if stale and different from
+    //    the configured default port, remove the stale file and probe `proxy_port`.
+    let recorded_port = active_proxy_port(state, proxy_port);
+    let mut active_port = recorded_port;
+    let mut already_up = probe_port(recorded_port).await;
+    if !already_up && recorded_port != proxy_port {
+        let _ = std::fs::remove_file(state.ports().join("proxy.port"));
+        if probe_port(proxy_port).await {
+            active_port = proxy_port;
+            already_up = true;
         }
-        eprintln!("[castor] proxy already up (port {proxy_port}); not spawning");
+    }
+    if already_up {
+        eprintln!("[castor] proxy already up (port {active_port}); not spawning");
+        return;
+    }
+
+    // 2. lock & spawn if down.
+    match server.try_acquire_lock_result() {
+        Ok(AcquireResult::Acquired) => {
+            let p = active_proxy_port(state, proxy_port);
+            if probe_port(p).await || (p != proxy_port && probe_port(proxy_port).await) {
+                server.release_lock();
+                return;
+            }
+            // Release before spawning so the detached child acquires cleanly
+            // without waiting on a parent hold.
+            server.release_lock();
+            spawn_and_wait(state, proxy_port, upstream_root).await;
+        }
+        Ok(AcquireResult::HeldBy { pid }) => {
+            eprintln!(
+                "[castor] proxy unreachable on port {recorded_port}, lock held by pid {pid}; waiting briefly to retry"
+            );
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let p = active_proxy_port(state, proxy_port);
+                if probe_port(p).await || (p != proxy_port && probe_port(proxy_port).await) {
+                    return;
+                }
+            }
+            match server.try_acquire_lock_result() {
+                Ok(AcquireResult::Acquired) => {
+                    server.release_lock();
+                    spawn_and_wait(state, proxy_port, upstream_root).await;
+                }
+                Ok(AcquireResult::HeldBy { pid: holder_pid }) => {
+                    eprintln!(
+                        "[castor] proxy still unreachable on port {recorded_port} (lock held by pid {holder_pid})"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[castor] proxy lock retry error: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[castor] proxy lock acquire error: {e}");
+        }
     }
 }
 
-/// Probe the proxy port with a short-timeout TCP connect.
-async fn probe_port(port: u16) -> bool {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let res = tokio::time::timeout(
-        Duration::from_millis(500),
-        tokio::net::TcpStream::connect(addr),
-    )
-    .await;
-    matches!(res, Ok(Ok(_)))
+async fn spawn_and_wait(state: &StateDir, proxy_port: u16, upstream_root: &str) {
+    let Some(mut child) = spawn_detached(state, proxy_port, upstream_root) else {
+        return;
+    };
+    for _ in 0..20 {
+        let p = active_proxy_port(state, proxy_port);
+        if probe_port(p).await || (p != proxy_port && probe_port(proxy_port).await) {
+            return;
+        }
+        if let Ok(Some(exit_status)) = child.try_wait() {
+            let p = active_proxy_port(state, proxy_port);
+            if !probe_port(p).await && (p == proxy_port || !probe_port(proxy_port).await) {
+                eprintln!(
+                    "[castor] proxy child exited early ({exit_status}); see {}",
+                    state.logs().join("proxy.log").display()
+                );
+            }
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eprintln!(
+        "[castor] proxy did not become ready within 2s (port {proxy_port}); see {}",
+        state.logs().join("proxy.log").display()
+    );
+}
+
+/// Probe the proxy port with a short-timeout HTTP GET on `/health`.
+/// Returns `true` only if a Castor proxy responds with 2xx.
+pub async fn probe_port(port: u16) -> bool {
+    if port == 0 {
+        return false;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_millis(800))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let url = format!("http://127.0.0.1:{port}/health");
+    match client.get(&url).send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
 }
 
 /// Spawn the proxy as a fully detached child process (new process group on
-/// Unix, stdio nulled). Never waits for the child.
-fn spawn_detached(state: &StateDir, proxy_port: u16, upstream_root: &str) {
+/// Unix, detached console on Windows, stdout/stderr appended to
+/// `<state>/logs/proxy.log`). Never waits for the child.
+fn spawn_detached(
+    state: &StateDir,
+    proxy_port: u16,
+    upstream_root: &str,
+) -> Option<std::process::Child> {
     let Some(exe) = std::env::current_exe().ok() else {
         eprintln!("[castor] cannot determine current exe; skipping proxy spawn");
-        return;
+        return None;
     };
     let state_str = state.root().to_string_lossy().into_owned();
     let mut cmd = std::process::Command::new(&exe);
@@ -398,20 +571,50 @@ fn spawn_detached(state: &StateDir, proxy_port: u16, upstream_root: &str) {
         .arg(proxy_port.to_string())
         .arg("--upstream")
         .arg(upstream_root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null());
+
+    let logs_dir = state.logs();
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let log_path = logs_dir.join("proxy.log");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => {
+            if let Ok(dup) = file.try_clone() {
+                cmd.stdout(dup);
+            } else {
+                cmd.stdout(std::process::Stdio::null());
+            }
+            cmd.stderr(file);
+        }
+        Err(e) => {
+            eprintln!("[castor] failed to open {}: {e}", log_path.display());
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW (0x08000000) | CREATE_NEW_PROCESS_GROUP (0x00000200).
+        cmd.creation_flags(0x0800_0200);
+    }
     match cmd.spawn() {
-        Ok(_) => {
+        Ok(child) => {
             eprintln!("[castor] proxy spawned (port {proxy_port})");
+            Some(child)
         }
         Err(e) => {
             eprintln!("[castor] failed to spawn proxy: {e}");
+            None
         }
     }
 }
@@ -777,6 +980,56 @@ mod tests {
         assert!(
             content_str.contains("Image file omitted") || content_str.contains("image_url"),
             "unexpected upstream echo: {content_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_port_requires_http_2xx_health() {
+        assert!(!probe_port(0).await);
+
+        let raw_tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raw_port = raw_tcp.local_addr().unwrap().port();
+        let raw_accept = tokio::spawn(async move {
+            let _ = raw_tcp.accept().await;
+        });
+        assert!(
+            !probe_port(raw_port).await,
+            "raw TCP listener without HTTP /health must not pass proxy probe"
+        );
+        raw_accept.abort();
+
+        let state = tmp_state();
+        let upstream = SocketAddr::from(([127, 0, 0, 1], 18020));
+        let proxy_addr = ProxyServer::new(&state, upstream)
+            .serve_ephemeral()
+            .await
+            .unwrap();
+        assert!(
+            probe_port(proxy_addr.port()).await,
+            "live ProxyServer must pass HTTP /health probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_proxy_cleans_stale_proxy_port_and_finds_default_port() {
+        let state = tmp_state();
+        let upstream = SocketAddr::from(([127, 0, 0, 1], 18020));
+        let live_addr = ProxyServer::new(&state, upstream)
+            .serve_ephemeral()
+            .await
+            .unwrap();
+        let live_port = live_addr.port();
+
+        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stale_port = unused.local_addr().unwrap().port();
+        drop(unused);
+        let port_file = state.ports().join("proxy.port");
+        std::fs::write(&port_file, stale_port.to_string()).unwrap();
+
+        ensure_proxy_server_for_upstream(&state, live_port, "http://127.0.0.1:18020").await;
+        assert!(
+            !port_file.exists(),
+            "stale proxy.port must be removed when configured proxy port is live"
         );
     }
 }

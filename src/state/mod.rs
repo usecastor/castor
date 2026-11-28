@@ -16,6 +16,9 @@
 //!     <name>.lock.tombstone# inert, left in place
 //!     <name>.count         # wedge counter (integer)
 //!   evo/
+//!   logs/
+//!     status_server.log   # daemon stdout/stderr (append)
+//!     proxy.log           # daemon stdout/stderr (append)
 //! ```
 
 use std::fs::{self, File, OpenOptions};
@@ -79,6 +82,10 @@ impl StateDir {
         self.root.join("evo")
     }
 
+    pub fn logs(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+
     /// Create the full directory layout on demand (idempotent).
     pub fn ensure(&self) -> io::Result<()> {
         for p in [
@@ -89,6 +96,7 @@ impl StateDir {
             self.locks(),
             self.ports(),
             self.evo(),
+            self.logs(),
         ] {
             fs::create_dir_all(&p)?;
         }
@@ -307,6 +315,39 @@ impl Locks {
         }
     }
 
+    /// Refresh the `held_at` timestamp of lock `name` if owned by this
+    /// process, keeping a long-lived daemon's lock fresh (never stale) so
+    /// other instances' `acquire_live`/`acquire` never reclaim it while the
+    /// holder is alive. Returns `Ok(true)` when refreshed, or `Ok(false)` if
+    /// the lock is absent or currently owned by another pid.
+    pub fn refresh(&self, name: &str, ttl_ms: u64) -> io::Result<bool> {
+        let path = self.path(name);
+        let Some(info) = read_lock(&path)? else {
+            return Ok(false);
+        };
+        if info.pid != std::process::id() {
+            return Ok(false);
+        }
+        let seq = LOCK_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .dir
+            .join(format!(".{name}.lock.refresh.{}.{seq}", std::process::id()));
+        let mut f = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+        if let Err(err) = write_lock(&mut f, info.pid, now_millis(), ttl_ms) {
+            drop(f);
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+        drop(f);
+        match fs::rename(&tmp, &path) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    }
+
     /// Remove any tombstone files in the locks directory whose TTL has expired.
     pub fn cleanup_expired_tombstones(&self, now: u64) -> usize {
         let mut cleaned = 0;
@@ -475,7 +516,9 @@ mod tests {
         assert!(s.sessions().is_dir());
         assert!(s.telemetry().is_dir());
         assert!(s.locks().is_dir());
+        assert!(s.ports().is_dir());
         assert!(s.evo().is_dir());
+        assert!(s.logs().is_dir());
         assert_eq!(s.task_slots(), root.join("tasks").join("slots"));
     }
 
@@ -685,6 +728,34 @@ mod tests {
             ReleaseError::NotHeld {
                 name: "ghost".into()
             }
+        );
+    }
+
+    #[test]
+    fn refresh_updates_held_at_when_owned() {
+        let dir = tmp_dir();
+        let locks = Locks::new(&dir);
+        let old_ts = now_millis().saturating_sub(25_000);
+        write_lock_file(&locks.path("status"), std::process::id(), old_ts, 30_000).unwrap();
+        assert!(locks.refresh("status", 30_000).unwrap());
+        let info = read_lock(&locks.path("status")).unwrap().unwrap();
+        assert_eq!(info.pid, std::process::id());
+        assert_eq!(info.ttl_ms, 30_000);
+        assert!(info.held_at > old_ts, "held_at must advance on refresh");
+    }
+
+    #[test]
+    fn refresh_returns_false_when_missing_or_foreign() {
+        let dir = tmp_dir();
+        let locks = Locks::new(&dir);
+        assert!(!locks.refresh("missing", 30_000).unwrap());
+
+        write_lock_file(&locks.path("foreign"), 999_999, now_millis(), 30_000).unwrap();
+        assert!(!locks.refresh("foreign", 30_000).unwrap());
+        let info = read_lock(&locks.path("foreign")).unwrap().unwrap();
+        assert_eq!(
+            info.pid, 999_999,
+            "foreign lock must remain intact on failed refresh"
         );
     }
 

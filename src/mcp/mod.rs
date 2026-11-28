@@ -250,6 +250,8 @@ impl CastorMcpServer {
             ))]);
         }
 
+        ensure_daemons_alive(&state, &loaded.config).await;
+
         let cwd = params.cwd.trim().to_string();
         if cwd.is_empty() {
             return CallToolResult::error(vec![ContentBlock::text(
@@ -311,6 +313,8 @@ impl CastorMcpServer {
         }
         #[cfg(unix)]
         cmd.process_group(0);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0200);
 
         match cmd.spawn() {
             Ok(mut child) => {
@@ -383,6 +387,21 @@ impl CastorMcpServer {
             }
         }
 
+        // Re-verify the status server is healthy right before returning background wait URLs.
+        if !daemons_disabled() {
+            let active_status =
+                crate::task::wait::active_status_port(&state, loaded.config.ports.status);
+            if !crate::task::wait::probe_status_port_for_state(&state, active_status).await
+                && (active_status == loaded.config.ports.status
+                    || !crate::task::wait::probe_status_port_for_state(
+                        &state,
+                        loaded.config.ports.status,
+                    )
+                    .await)
+            {
+                crate::task::wait::ensure_status_server(&state, loaded.config.ports.status).await;
+            }
+        }
         let status_port = crate::task::wait::active_status_port(&state, loaded.config.ports.status);
         let (wait_cmd_win, wait_cmd_wsl) = wait_commands(status_port, &task_id);
         let status_cmd = format!(
@@ -397,7 +416,7 @@ impl CastorMcpServer {
              > [!TIP]\n\
              > **Castor Engine Status: ACTIVELY EXECUTING**\n\
              > Task `{task_id}` dispatched to background worker.\n\
-             - **CLI Wait**: `castor wait {task_id}`\n\
+             - **CLI Wait (Fallback)**: `castor wait {task_id}`\n\
              - **Wait Command**: `{wait_cmd_win}` (WSL: `{wait_cmd_wsl}`)\n\
              - **Status Command**: `{status_cmd}`"
         );
@@ -492,7 +511,8 @@ impl CastorMcpServer {
                         ))]);
                     }
                 };
-                let status_port = loaded.config.ports.status;
+                let status_port =
+                    crate::task::wait::active_status_port(&state, loaded.config.ports.status);
                 let text = match rec.status {
                     crate::task::registry::TaskStatus::Completed
                     | crate::task::registry::TaskStatus::CompletedWithSalvage => {
@@ -524,7 +544,7 @@ impl CastorMcpServer {
                             text.push_str(&live);
                         }
                         text.push_str(&format!(
-                            "\nWait (CLI): castor wait {}\nWait (Windows): {wait_win}\nWait (WSL): {wait_wsl}",
+                            "\nWait (CLI fallback): castor wait {}\nWait (Windows): {wait_win}\nWait (WSL): {wait_wsl}",
                             rec.id
                         ));
                         text
@@ -735,8 +755,47 @@ pub async fn serve(prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn daemons_disabled() -> bool {
+    std::env::var("CASTOR_DISABLE_DAEMONS").as_deref() == Ok("1")
+}
+
+/// Ensure both the status server (`:18021`) and stream proxy (`:18022`) are
+/// alive before dispatching or returning wait instructions. Uses fast HTTP
+/// probes when both are already healthy and self-heals either daemon if down.
+async fn ensure_daemons_alive(state: &StateDir, config: &crate::config::Config) {
+    if daemons_disabled() {
+        return;
+    }
+    let status_fut = async {
+        let active = crate::task::wait::active_status_port(state, config.ports.status);
+        let ok = crate::task::wait::probe_status_port_for_state(state, active).await
+            || (active != config.ports.status
+                && crate::task::wait::probe_status_port_for_state(state, config.ports.status)
+                    .await);
+        if !ok {
+            crate::task::wait::ensure_status_server(state, config.ports.status).await;
+        }
+    };
+    let proxy_fut = async {
+        let active = crate::proxy::active_proxy_port(state, config.ports.proxy);
+        let ok = crate::proxy::probe_port(active).await
+            || (active != config.ports.proxy && crate::proxy::probe_port(config.ports.proxy).await);
+        if !ok {
+            let upstream_root = crate::proxy::resolve_upstream_root(config, None);
+            crate::proxy::ensure_proxy_server_for_upstream(
+                state,
+                config.ports.proxy,
+                &upstream_root,
+            )
+            .await;
+        }
+    };
+    tokio::join!(status_fut, proxy_fut);
+}
+
 /// Build the user-facing long-poll wait commands (Windows `curl.exe` and
-/// WSL `curl`) for a dispatched task.
+/// WSL `curl`) for a dispatched task, paired with `castor wait <id>` as the
+/// CLI fallback when HTTP is unreachable.
 ///
 /// Both embed an explicit `?timeout_s=3600` (1 hour). Without it the status
 /// server falls back to its 30 s default and returns
@@ -1104,6 +1163,7 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&state_dir);
         cmd.env("CASTOR_STATE_DIR", state_dir.to_str().unwrap());
+        cmd.env("CASTOR_DISABLE_DAEMONS", "1");
         for (k, v) in extra_env {
             cmd.env(k, v);
         }

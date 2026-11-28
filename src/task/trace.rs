@@ -113,6 +113,8 @@ pub struct TaskTraceResponse {
 pub struct ContextConfigResponse {
     #[serde(rename = "maxContext")]
     pub max_context: Option<u32>,
+    #[serde(rename = "stateDir")]
+    pub state_dir: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +562,7 @@ pub fn read_context_config(state: &StateDir) -> Option<u32> {
 async fn context_handler(State(state): State<StateDir>) -> impl IntoResponse {
     let resp = ContextConfigResponse {
         max_context: read_context_config(&state),
+        state_dir: state.root().to_string_lossy().into_owned(),
     };
     (default_headers(), Json(resp))
 }

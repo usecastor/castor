@@ -1,7 +1,7 @@
 //! Cross-platform command spawning, stream capture, and process tree lifecycle management.
 
 use std::path::Path;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -96,6 +96,12 @@ pub fn semantic_truncate_output(
     let (clean_stderr, err_trunc) = truncate_head_tail(stderr, err_head, err_tail, "stderr");
 
     (clean_stdout, clean_stderr, out_trunc || err_trunc)
+}
+
+/// Decode captured stream bytes as lossy UTF-8 and normalize Windows `\r\n`
+/// line endings to `\n` so `\r` noise does not leak into tool output.
+fn decode_stream_output(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).replace("\r\n", "\n")
 }
 
 /// Result of a sandboxed shell execution.
@@ -361,6 +367,52 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
         }
     }
 
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd_builder.creation_flags(CREATE_NO_WINDOW);
+
+        let cargo_bin = std::env::var_os("CARGO_HOME")
+            .filter(|v| !v.is_empty())
+            .map(|h| PathBuf::from(h).join("bin"))
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .filter(|v| !v.is_empty())
+                    .map(|u| PathBuf::from(u).join(".cargo").join("bin"))
+            });
+        if let Some(cargo_bin) = cargo_bin
+            && cargo_bin.is_dir()
+        {
+            let current_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut entries: Vec<PathBuf> = std::env::split_paths(&current_path).collect();
+            let cargo_norm = cargo_bin
+                .to_string_lossy()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_ascii_lowercase();
+            let already_present = entries.iter().any(|p| {
+                p.to_string_lossy()
+                    .replace('/', "\\")
+                    .trim_end_matches('\\')
+                    .to_ascii_lowercase()
+                    == cargo_norm
+            });
+            if !already_present {
+                entries.insert(0, cargo_bin);
+                if let Ok(joined) = std::env::join_paths(entries) {
+                    cmd_builder.env("PATH", joined);
+                }
+            }
+        }
+
+        let scratch_tmp = cwd.join(".scratch").join("tmp");
+        if std::fs::create_dir_all(&scratch_tmp).is_ok() {
+            cmd_builder.env("TMP", &scratch_tmp);
+            cmd_builder.env("TEMP", &scratch_tmp);
+            cmd_builder.env("TMPDIR", &scratch_tmp);
+        }
+    }
+
     let mut child = cmd_builder.spawn()?;
     #[cfg(windows)]
     let _job = child
@@ -417,8 +469,7 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
         Some(status) => {
             let _ = tokio::join!(out_task, err_task);
             let out = std::mem::take(&mut *out_buf.lock().unwrap());
-            let mut err = String::from_utf8_lossy(&std::mem::take(&mut *err_buf.lock().unwrap()))
-                .into_owned();
+            let mut err = decode_stream_output(&std::mem::take(&mut *err_buf.lock().unwrap()));
             if status.code().is_none() {
                 err.push_str("\n[Process terminated by signal]");
             }
@@ -446,10 +497,13 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
                 if let Some(ref job) = _job {
                     job.terminate(124);
                 }
-                if pid > 0 {
-                    crate::platform::kill_process_tree(pid);
+                if _job.is_none() || crate::platform::pid_alive(pid) {
+                    if pid > 0 {
+                        crate::platform::kill_process_tree(pid);
+                    }
+                    let _ = child.kill().await;
                 }
-                let _ = child.kill().await;
+                let _ = child.wait().await;
             }
             #[cfg(not(any(unix, windows)))]
             {
@@ -468,15 +522,14 @@ pub async fn execute(cmd: &str, cwd: &Path, timeout: Duration) -> Result<ShellOu
                 let _ = err_task.await;
             }
             let out = std::mem::take(&mut *out_buf.lock().unwrap());
-            let mut err = String::from_utf8_lossy(&std::mem::take(&mut *err_buf.lock().unwrap()))
-                .into_owned();
+            let mut err = decode_stream_output(&std::mem::take(&mut *err_buf.lock().unwrap()));
             use std::fmt::Write;
             let _ = write!(err, "\n[Command timed out after {}ms]", timeout.as_millis());
             (124, out, err)
         }
     };
 
-    let raw_stdout = String::from_utf8_lossy(&out).into_owned();
+    let raw_stdout = decode_stream_output(&out);
     let (clean_stdout, clean_stderr, sem_truncated) =
         semantic_truncate_output(&raw_stdout, &err, exit_code);
     let was_truncated =
@@ -520,9 +573,18 @@ mod tests {
         );
         task.abort();
 
-        let captured = String::from_utf8_lossy(&out_buf.lock().unwrap()).into_owned();
+        let captured = decode_stream_output(&out_buf.lock().unwrap());
         assert_eq!(captured, "CAPTURED_BEFORE_HANG\n");
         drop(writer);
+    }
+
+    #[test]
+    fn decode_stream_output_normalizes_crlf() {
+        assert_eq!(
+            decode_stream_output(b"line1\r\nline2\r\n"),
+            "line1\nline2\n"
+        );
+        assert_eq!(decode_stream_output(b"line1\nline2\n"), "line1\nline2\n");
     }
 
     #[test]

@@ -591,18 +591,62 @@ pub async fn run_with(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Boot reaper (lock-guarded, runs once): reconcile orphans left by a
             // reboot/crash and reclaim stale slots before anything else serves.
             task::wait::boot_reap(&state).await;
-            // Best-effort, non-blocking bring-up of the status server
-            // (lock → probe → spawn if down → release). Never blocks serve.
-            task::wait::ensure_status_server(&state, loaded.config.ports.status).await;
-            // Best-effort, non-blocking bring-up of the stream proxy.
-            let upstream_root = proxy::resolve_upstream_root(&loaded.config, None);
-            proxy::ensure_proxy_server_for_upstream(
-                &state,
-                loaded.config.ports.proxy,
-                &upstream_root,
-            )
-            .await;
-            mcp::serve(&loaded.config.tool_prefix).await?;
+            let disable_daemons = std::env::var("CASTOR_DISABLE_DAEMONS").as_deref() == Ok("1");
+            let supervisor = if disable_daemons {
+                None
+            } else {
+                // Best-effort, non-blocking bring-up of the status server
+                // (lock → probe → spawn if down → release). Never blocks serve.
+                task::wait::ensure_status_server(&state, loaded.config.ports.status).await;
+                // Best-effort, non-blocking bring-up of the stream proxy.
+                let upstream_root = proxy::resolve_upstream_root(&loaded.config, None);
+                proxy::ensure_proxy_server_for_upstream(
+                    &state,
+                    loaded.config.ports.proxy,
+                    &upstream_root,
+                )
+                .await;
+                let state = state.clone();
+                let status_port = loaded.config.ports.status;
+                let proxy_port = loaded.config.ports.proxy;
+                let upstream_root = upstream_root.clone();
+                Some(tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                    ticker.tick().await; // skip immediate tick
+                    loop {
+                        ticker.tick().await;
+                        let active_status = task::wait::active_status_port(&state, status_port);
+                        let status_up =
+                            task::wait::probe_status_port_for_state(&state, active_status).await
+                                || (active_status != status_port
+                                    && task::wait::probe_status_port_for_state(
+                                        &state,
+                                        status_port,
+                                    )
+                                    .await);
+                        if !status_up {
+                            task::wait::ensure_status_server(&state, status_port).await;
+                        }
+
+                        let active_proxy = proxy::active_proxy_port(&state, proxy_port);
+                        let proxy_up = proxy::probe_port(active_proxy).await
+                            || (active_proxy != proxy_port && proxy::probe_port(proxy_port).await);
+                        if !proxy_up {
+                            proxy::ensure_proxy_server_for_upstream(
+                                &state,
+                                proxy_port,
+                                &upstream_root,
+                            )
+                            .await;
+                        }
+                    }
+                }))
+            };
+            let res = mcp::serve(&loaded.config.tool_prefix).await;
+            if let Some(supervisor) = supervisor {
+                supervisor.abort();
+            }
+            res?;
         }
         Command::Proxy {
             state_dir,
@@ -612,7 +656,7 @@ pub async fn run_with(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let loaded = config::load().map_err(|e| format!("config: {e}"))?;
             let state = match state_dir {
-                Some(dir) => state::StateDir::new(dir),
+                Some(dir) => state::StateDir::new(crate::platform::to_host_path(dir)),
                 None => state::StateDir::from_config(&loaded.config),
             };
             let _ = state.ensure();
@@ -627,6 +671,7 @@ pub async fn run_with(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             let res = server.clone().serve(port).await;
+            let _ = std::fs::remove_file(state.ports().join("proxy.port"));
             server.release_lock();
             res?;
         }
@@ -646,6 +691,7 @@ pub async fn run_with(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             let res = server.clone().serve(port).await;
+            let _ = std::fs::remove_file(state.ports().join("status.port"));
             server.release_lock();
             res?;
         }
@@ -668,7 +714,7 @@ pub async fn run_with(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Trace { state_dir, port } => {
             let loaded = config::load().map_err(|e| format!("config: {e}"))?;
             let state = match state_dir {
-                Some(dir) => state::StateDir::new(dir),
+                Some(dir) => state::StateDir::new(crate::platform::to_host_path(dir)),
                 None => state::StateDir::from_config(&loaded.config),
             };
             let _ = state.ensure();
@@ -848,7 +894,9 @@ pub async fn run_with(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let prev_hook = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
                 let err_msg = format!("Worker panicked: {info}");
-                let task_file = state_clone.tasks().join(format!("{task_id_clone}.json"));
+                let task_file = state_clone
+                    .tasks()
+                    .join(format!("task_{task_id_clone}.json"));
                 if let Ok(raw) = std::fs::read_to_string(&task_file)
                     && let Ok(mut rec) = serde_json::from_str::<serde_json::Value>(&raw)
                 {

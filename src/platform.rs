@@ -93,9 +93,25 @@ pub fn kill_process_tree(pid: u32) {
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        match std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output();
+            .output()
+        {
+            Ok(out) => {
+                if !out.status.success() && pid_alive(pid) {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    tracing::warn!(
+                        pid,
+                        status = ?out.status.code(),
+                        stderr = %stderr.trim(),
+                        "taskkill failed while process is still alive"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(pid, error = %e, "failed to spawn taskkill");
+            }
+        }
     }
 }
 
@@ -128,6 +144,8 @@ impl ProcessJob {
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if job.is_null() {
+                let err = std::io::Error::last_os_error();
+                tracing::warn!(error = %err, "CreateJobObjectW failed when attaching ProcessJob");
                 return None;
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
@@ -138,8 +156,22 @@ impl ProcessJob {
                 (&raw const info).cast(),
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             );
-            if ok == 0 || AssignProcessToJobObject(job, process_handle as _) == 0 {
+            if ok == 0 {
+                let err = std::io::Error::last_os_error();
                 CloseHandle(job);
+                tracing::warn!(
+                    error = %err,
+                    "SetInformationJobObject failed when attaching ProcessJob"
+                );
+                return None;
+            }
+            if AssignProcessToJobObject(job, process_handle as _) == 0 {
+                let err = std::io::Error::last_os_error();
+                CloseHandle(job);
+                tracing::warn!(
+                    error = %err,
+                    "AssignProcessToJobObject failed when attaching ProcessJob"
+                );
                 return None;
             }
             Some(Self { handle: job })
@@ -272,6 +304,75 @@ const WINDOWS_GIT_BASH_CANDIDATES: [&str; 4] = [
     r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
 ];
 
+#[cfg(any(windows, test))]
+fn env_git_bash_candidates_from(
+    var_fn: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    for var in [
+        "LOCALAPPDATA",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+    ] {
+        let Some(val) = var_fn(var) else {
+            continue;
+        };
+        if val.is_empty() {
+            continue;
+        }
+        let base = std::path::PathBuf::from(val);
+        let git_dir = if var == "LOCALAPPDATA" {
+            base.join("Programs").join("Git")
+        } else {
+            base.join("Git")
+        };
+        candidates.push(git_dir.join("bin").join("bash.exe"));
+        candidates.push(git_dir.join("usr").join("bin").join("bash.exe"));
+    }
+    candidates
+}
+
+/// Returns candidate Git for Windows `bash.exe` paths derived from
+/// `%LOCALAPPDATA%\Programs\Git`, `%ProgramFiles%\Git`,
+/// `%ProgramFiles(x86)%\Git`, and `%ProgramW6432%\Git`
+/// (`bin\bash.exe` and `usr\bin\bash.exe` for each).
+#[cfg(any(windows, test))]
+fn env_git_bash_candidates() -> Vec<std::path::PathBuf> {
+    env_git_bash_candidates_from(|k| std::env::var_os(k))
+}
+
+/// Returns `true` when `path` is the Windows WSL stub
+/// (`System32\bash.exe` or `SysWOW64\bash.exe`).
+#[cfg(any(windows, test))]
+fn is_wsl_bash_stub(path: &std::path::Path) -> bool {
+    let lower = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    lower.ends_with(r"\system32\bash.exe") || lower.ends_with(r"\syswow64\bash.exe")
+}
+
+/// Selects the first non-stub, existing `bash.exe` path from `where.exe bash.exe`
+/// output, skipping `System32\bash.exe` and `SysWOW64\bash.exe`.
+#[cfg(any(windows, test))]
+fn select_bash_from_where_output_with(
+    stdout: &str,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let candidate = std::path::Path::new(trimmed);
+        if !is_wsl_bash_stub(candidate) && exists(candidate) {
+            return Some(candidate.to_path_buf());
+        }
+    }
+    None
+}
+
 /// Resolves `bash.exe` relative to a discovered `git.exe` path
 /// (`<git_dir>\<subdir>\git.exe`), preferring `bin\bash.exe` and falling back
 /// to `usr\bin\bash.exe`.
@@ -294,6 +395,11 @@ fn bash_from_git_exe(git_path: &std::path::Path) -> Option<std::path::PathBuf> {
 pub fn bash_path() -> std::path::PathBuf {
     #[cfg(windows)]
     {
+        for candidate in env_git_bash_candidates() {
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
         for candidate in WINDOWS_GIT_BASH_CANDIDATES {
             let p = std::path::Path::new(candidate);
             if p.is_file() {
@@ -311,6 +417,16 @@ pub fn bash_path() -> std::path::PathBuf {
                 if let Some(bash_bin) = bash_from_git_exe(git_path) {
                     return bash_bin;
                 }
+            }
+        }
+        if let Ok(output) = std::process::Command::new("where.exe")
+            .arg("bash.exe")
+            .output()
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(bash_bin) = select_bash_from_where_output_with(&stdout, |p| p.is_file()) {
+                return bash_bin;
             }
         }
     }
@@ -709,5 +825,87 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_env_git_bash_candidates_and_system32_filtering() {
+        let _ = env_git_bash_candidates();
+
+        let candidates = env_git_bash_candidates_from(|key| match key {
+            "LOCALAPPDATA" => Some("local_app".into()),
+            "ProgramFiles" => Some("prog_files".into()),
+            "ProgramFiles(x86)" => Some("prog_files_x86".into()),
+            "ProgramW6432" => Some("prog_w6432".into()),
+            _ => None,
+        });
+        assert_eq!(
+            candidates,
+            vec![
+                std::path::PathBuf::from("local_app")
+                    .join("Programs")
+                    .join("Git")
+                    .join("bin")
+                    .join("bash.exe"),
+                std::path::PathBuf::from("local_app")
+                    .join("Programs")
+                    .join("Git")
+                    .join("usr")
+                    .join("bin")
+                    .join("bash.exe"),
+                std::path::PathBuf::from("prog_files")
+                    .join("Git")
+                    .join("bin")
+                    .join("bash.exe"),
+                std::path::PathBuf::from("prog_files")
+                    .join("Git")
+                    .join("usr")
+                    .join("bin")
+                    .join("bash.exe"),
+                std::path::PathBuf::from("prog_files_x86")
+                    .join("Git")
+                    .join("bin")
+                    .join("bash.exe"),
+                std::path::PathBuf::from("prog_files_x86")
+                    .join("Git")
+                    .join("usr")
+                    .join("bin")
+                    .join("bash.exe"),
+                std::path::PathBuf::from("prog_w6432")
+                    .join("Git")
+                    .join("bin")
+                    .join("bash.exe"),
+                std::path::PathBuf::from("prog_w6432")
+                    .join("Git")
+                    .join("usr")
+                    .join("bin")
+                    .join("bash.exe"),
+            ]
+        );
+
+        assert!(is_wsl_bash_stub(std::path::Path::new(
+            r"C:\Windows\System32\bash.exe"
+        )));
+        assert!(is_wsl_bash_stub(std::path::Path::new(
+            r"c:\windows\syswow64\bash.exe"
+        )));
+        assert!(!is_wsl_bash_stub(std::path::Path::new(
+            r"D:\Scoop\shims\bash.exe"
+        )));
+
+        let where_stdout = "\
+C:\\Windows\\System32\\bash.exe\r\n\
+C:\\Windows\\SysWOW64\\bash.exe\r\n\
+D:\\Tools\\Git\\bin\\bash.exe\r\n";
+        let picked = select_bash_from_where_output_with(where_stdout, |_| true);
+        assert_eq!(
+            picked,
+            Some(std::path::PathBuf::from(r"D:\Tools\Git\bin\bash.exe"))
+        );
+
+        let only_stubs = "C:\\Windows\\System32\\bash.exe\nC:\\Windows\\SysWOW64\\bash.exe\n";
+        assert_eq!(
+            select_bash_from_where_output_with(only_stubs, |_| true),
+            None
+        );
     }
 }
