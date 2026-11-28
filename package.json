@@ -39,5 +39,8 @@
   "engines": {
     "node": ">=22"
   },
-  "license": "AGPL-3.0"
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org"
+  },
+  "license": "AGPL-3.0-only"
 }

@@ -6,6 +6,9 @@
 # 1. Runs the Rust test gate and clippy check.
 # 2. Creates the GitHub Release with generated release notes.
 # 3. Publishes `mcp-castor` to npm with OIDC Trusted Publishing (--provenance).
+#    An explicit triple-lock validation step fails fast unless the
+#    `package.json` version, `Cargo.toml` version, and (on tag pushes)
+#    the tag version are all identical.
 # ============================================================================
 
 name: Release
@@ -195,6 +198,28 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Triple-lock version validation
+        run: |
+          PKG_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")"
+          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | sed -e 's/version[[:space:]]*=//g' -e 's/[[:space:]]//g' -e 's/"//g')"
+          echo "package.json: $PKG_VERSION"
+          echo "Cargo.toml:   $CARGO_VERSION"
+          if [ "$PKG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Version lock broken: package.json ($PKG_VERSION) != Cargo.toml ($CARGO_VERSION)"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+            echo "git tag:      v$TAG_VERSION"
+            if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+              echo "::error::Version lock broken: package.json ($PKG_VERSION) != git tag (v$TAG_VERSION)"
+              exit 1
+            fi
+          else
+            echo "Not a tag push (workflow_dispatch on a branch); tag lock skipped."
+          fi
+          echo "Triple-lock check passed: $PKG_VERSION"
+
       - name: Create or Update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -214,10 +239,11 @@ jobs:
           fi
 
       - name: Publish to NPM via OIDC Trusted Publishing
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           if npm view "mcp-castor@${{ steps.meta.outputs.version }}" >/dev/null 2>&1; then
             echo "mcp-castor@${{ steps.meta.outputs.version }} is already published on npm, ensuring latest dist-tag..."
-            npm dist-tag add "mcp-castor@${{ steps.meta.outputs.version }}" latest || true
+            npm dist-tag add "mcp-castor@${{ steps.meta.outputs.version }}" latest
           else
             npm publish --access public --provenance --tag release
             npm dist-tag add "mcp-castor@${{ steps.meta.outputs.version }}" latest

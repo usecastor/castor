@@ -216,15 +216,16 @@ Castor uses [Semantic Versioning 2.0.0](https://semver.org/) (`MAJOR.MINOR.PATCH
 - **PATCH**: Backward-compatible bug fixes and internal stability hardening.
 
 ### Automated Release Pipeline (`.github/workflows/release.yml`)
-Releases are automatically triggered whenever a git tag matching `v*` is pushed to GitHub:
-1. Runs full test suite (`cargo test --verbose`), clippy gate (`-D warnings`), and Node.js cross-platform shim test (`node bin/castor.js --help`).
-2. Creates the GitHub Release draft with auto-generated release notes.
-3. Publishes `mcp-castor` to npm using **OIDC Trusted Publishing** (`--provenance`) with cryptographic Sigstore attestation.
+Releases in the [`usecastor/castor`](https://github.com/usecastor/castor) repository are automatically triggered whenever a git tag matching `v*` is pushed:
+1. Runs full test suite (`cargo test --all-features`), clippy gate (`-D warnings`), and Node.js cross-platform shim test (`node bin/castor.js --help`, `node --test tests/castor_shim_test.mjs`).
+2. An explicit **triple-lock version validation** step fails fast unless the `package.json` version, the `Cargo.toml` version, and (on tag pushes) the git tag version (with `v` stripped) are all identical.
+3. Creates the GitHub Release with auto-generated release notes.
+4. Publishes `mcp-castor` (unscoped) to npm using **OIDC Trusted Publishing** (`--provenance`) with cryptographic Sigstore attestation. The npm publish step is gated on a tag ref (`refs/tags/*`), so a manual `workflow_dispatch` on a branch never triggers tag-scoped OIDC or mutates the `latest` dist-tag.
 
 ### Version Invariant & Fail-Fast Guard
 - npm package releases are **immutable**. Once published, a version can never be republished or overwritten.
 - `npm publish` parses the version strictly from `package.json`. If `package.json` does not match the git tag, the publish step fails with `403 Forbidden`.
-- **`Cargo.toml` (`version`), `package.json` (`version`), and the git tag (`vX.Y.Z`) MUST remain byte-synchronized.**
+- **`Cargo.toml` (`version`), `package.json` (`version`), and the git tag (`vX.Y.Z`) MUST remain byte-synchronized.** The triple-lock validation step in `release.yml` enforces this on every release run before any artifact or package is published.
 
 ### Mandatory CI/CD Monitoring
 Pushing a release tag is an active operation, not fire-and-forget. The contributor or agent cutting a release must monitor GitHub Actions until completion:
