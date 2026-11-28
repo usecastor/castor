@@ -66,6 +66,64 @@ fn now_epoch_ms() -> u64 {
     crate::platform::now_epoch_ms()
 }
 
+/// Probe the workspace repository's HEAD commit and dirty state without blocking
+/// worker launch. Returns `(None, None)` immediately when `.git` is absent, or
+/// runs `rev-parse HEAD` and `status --porcelain --untracked-files=no`
+/// concurrently with a 1500 ms wall-clock budget.
+pub async fn probe_git_provenance(
+    workspace_root: &std::path::Path,
+) -> (Option<String>, Option<bool>) {
+    if !workspace_root.join(".git").exists() {
+        return (None, None);
+    }
+
+    let head_fut = async {
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .args(["rev-parse", "HEAD"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+    };
+    let status_fut = async {
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .args(["status", "--porcelain", "--untracked-files=no"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+    };
+
+    let Ok((head_res, status_res)) =
+        tokio::time::timeout(std::time::Duration::from_millis(1500), async {
+            tokio::join!(head_fut, status_fut)
+        })
+        .await
+    else {
+        return (None, None);
+    };
+
+    let base_commit = match head_res {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+        _ => None,
+    };
+    let git_dirty = match status_res {
+        Ok(out) if out.status.success() => {
+            Some(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+        }
+        _ => None,
+    };
+
+    (base_commit, git_dirty)
+}
+
 /// Canonicalize the workspace root by walking up from the provided path
 /// to find the repository boundary (.git, Cargo.toml, package.json).
 /// Falls back to the provided path if no root marker is found.
@@ -235,9 +293,9 @@ pub async fn run_job(spec: &JobSpec, state: &StateDir, config: &Config) -> Resul
     // `max_context`, or `engine_type` are not pinned, adopt the values
     // discovered from the live engine profile.
     let mut effective_config = config.clone();
-    if let Ok(profile) = lc.profile().await {
+    let budget = if let Ok(profile) = lc.profile().await {
         if effective_config.model.is_none() {
-            effective_config.model = Some(profile.model_id);
+            effective_config.model = Some(profile.model_id.clone());
         }
         if effective_config.max_context.is_none() {
             effective_config.max_context = profile.max_context;
@@ -245,7 +303,18 @@ pub async fn run_job(spec: &JobSpec, state: &StateDir, config: &Config) -> Resul
         if effective_config.engine_type.is_none() {
             effective_config.engine_type = Some(profile.backend.as_str().to_string());
         }
-    }
+        let budget = profile.kv_pool_budget(&effective_config);
+        if budget.pool_capacity_tokens > 0
+            && effective_config
+                .max_context
+                .is_some_and(|mc| mc > budget.pool_capacity_tokens)
+        {
+            effective_config.max_context = Some(budget.pool_capacity_tokens);
+        }
+        Some(budget)
+    } else {
+        None
+    };
 
     let engine = match EngineClient::from_config(&effective_config) {
         Ok(eng) => eng,
@@ -257,7 +326,7 @@ pub async fn run_job(spec: &JobSpec, state: &StateDir, config: &Config) -> Resul
             return Err(err_msg);
         }
     };
-    run_job_with_engine(spec, state, &effective_config, &engine).await
+    run_job_with_engine_budgeted(spec, state, &effective_config, &engine, budget).await
 }
 
 /// Execute a job specification with a provided [`ChatEngine`] (supports mock engines in tests).
@@ -266,6 +335,18 @@ pub async fn run_job_with_engine(
     state: &StateDir,
     config: &Config,
     engine: &dyn ChatEngine,
+) -> Result<String, String> {
+    run_job_with_engine_budgeted(spec, state, config, engine, None).await
+}
+
+/// Execute a job specification with a provided [`ChatEngine`] and an optional
+/// physical KV-pool budget from [`crate::engine::EngineProfile::kv_pool_budget`].
+pub async fn run_job_with_engine_budgeted(
+    spec: &JobSpec,
+    state: &StateDir,
+    config: &Config,
+    engine: &dyn ChatEngine,
+    budget: Option<crate::engine::backend::KvPoolBudget>,
 ) -> Result<String, String> {
     let registry = TaskRegistry::new(state);
     let max_slots = config.max_concurrent_tasks as usize;
@@ -400,12 +481,15 @@ pub async fn run_job_with_engine(
     };
 
     // 3. Acquire execution slot (token-budgeted). The pool's total budget is
-    //    `max_context`: the unified admission rule caps the *sum* of every
-    //    live lease's context tokens at that budget, so concurrent streams
-    //    never overcommit the engine's aggregate KV window. Include built-in
-    //    tool schemas in the pre-slot `/tokenize` count so Turn-1 admission
-    //    and resume watermarking match `run_session`.
-    let sem = TaskSemaphore::new(state, max_slots).with_token_budget(max_ctx);
+    //    `budget.pool_capacity_tokens` (or `max_ctx` when no engine budget is
+    //    provided), plus `per_slot_state_tokens` per active slot. Include
+    //    built-in tool schemas in the pre-slot `/tokenize` count so Turn-1
+    //    admission and resume watermarking match `run_session`.
+    let pool_budget = budget.map(|b| b.pool_capacity_tokens).unwrap_or(max_ctx);
+    let per_slot_state_tokens = budget.map(|b| b.per_slot_state_tokens).unwrap_or(0);
+    let sem = TaskSemaphore::new(state, max_slots)
+        .with_token_budget(pool_budget)
+        .with_per_slot_state_tokens(per_slot_state_tokens);
     let builtin_tools = crate::tools::builtin_tool_schemas();
 
     let initial_tokens = {
@@ -461,8 +545,9 @@ pub async fn run_job_with_engine(
         })
         .await;
 
-    // 5. Initialize EventLogger and record session start.
+    // 5. Initialize EventLogger and record session start (with git provenance).
     let logger = EventLogger::new(state, &spec.session_id);
+    let (base_commit, git_dirty) = probe_git_provenance(&workspace_root).await;
     // The effective tier is recorded on session_start (null when unset) so
     // the session ledger is self-explanatory: null = "server default applied".
     let _ = logger.append(json!({
@@ -472,6 +557,8 @@ pub async fn run_job_with_engine(
         "cwd": spec.cwd,
         "prompt": spec.prompt,
         "reasoning_effort": spec.reasoning_effort,
+        "base_commit": base_commit,
+        "git_dirty": git_dirty,
     }));
 
     // 6. Initialize optional extensions and composite tool executor.
@@ -1300,5 +1387,44 @@ mod tests {
             "the augmentation is a context prefix; the raw prompt is appended separately"
         );
         let _ = tmp;
+    }
+
+    #[tokio::test]
+    async fn probe_git_provenance_handles_non_git_clean_and_dirty_repos() {
+        let non_git = tempfile::tempdir().unwrap();
+        assert_eq!(probe_git_provenance(non_git.path()).await, (None, None));
+
+        let repo = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .expect("git command should run");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "castor@example.com"]);
+        run_git(&["config", "user.name", "Castor Test"]);
+        std::fs::write(repo.path().join("tracked.txt"), "v1\n").unwrap();
+        run_git(&["add", "tracked.txt"]);
+        run_git(&["commit", "-m", "initial"]);
+
+        // Untracked files do not mark git_dirty (--untracked-files=no).
+        std::fs::write(repo.path().join("untracked.txt"), "temp\n").unwrap();
+        let (head, dirty) = probe_git_provenance(repo.path()).await;
+        assert!(
+            head.as_ref()
+                .is_some_and(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())),
+            "expected 40-char SHA, got {head:?}"
+        );
+        assert_eq!(dirty, Some(false));
+
+        // Modifying a tracked file flips git_dirty to Some(true).
+        std::fs::write(repo.path().join("tracked.txt"), "v2\n").unwrap();
+        let (head2, dirty2) = probe_git_provenance(repo.path()).await;
+        assert_eq!(head2, head);
+        assert_eq!(dirty2, Some(true));
     }
 }

@@ -276,7 +276,7 @@ fn version_candidates(config: &Config) -> Vec<String> {
 /// `/health`), the model id binds to the engine's single served model when
 /// the config requests `None`/`"auto"`, and `max_context` adopts the
 /// engine-reported `max_model_len` when the config does not pin one.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EngineProfile {
     /// The backend identified by live probe evidence (falls back to the
     /// config-selected backend when no live fingerprint is available).
@@ -290,6 +290,27 @@ pub struct EngineProfile {
     pub capabilities: EngineCapabilities,
     /// Engine-reported version string (vLLM `/version`), when present.
     pub engine_version: Option<String>,
+    /// Total physical KV-cache capacity in tokens from vLLM `/metrics`
+    /// (`vllm:cache_config_info{kv_cache_size_tokens=...}`), when available.
+    pub kv_cache_size_tokens: Option<u32>,
+    /// Engine-reported max concurrency hint from vLLM `/metrics`
+    /// (`vllm:cache_config_info{kv_cache_max_concurrency=...}`), when available.
+    pub kv_cache_max_concurrency: Option<f64>,
+    /// KV/Mamba block alignment size in tokens from vLLM `/metrics`
+    /// (`mamba_block_size` or `block_size`), when available.
+    pub kv_block_size: Option<u32>,
+    /// Mamba cache mode from vLLM `/metrics` (`mamba_cache_mode`), when available.
+    pub mamba_cache_mode: Option<String>,
+}
+
+/// Physical KV-pool admission budget derived from an [`EngineProfile`] and [`Config`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvPoolBudget {
+    /// Effective aggregate token budget for the concurrent slot pool.
+    pub pool_capacity_tokens: u32,
+    /// Per-slot state token reserve (block-alignment rounding + active turn
+    /// generation headroom before `update_context_tokens` runs).
+    pub per_slot_state_tokens: u32,
 }
 
 impl EngineProfile {
@@ -411,14 +432,208 @@ impl EngineProfile {
             max_model_len = Some(len);
         }
 
+        let cache_cfg = if backend == Backend::Vllm {
+            fetch_vllm_cache_config(client, config).await
+        } else {
+            VllmCacheConfig::default()
+        };
+
         Ok(Self {
             backend,
             model_id,
             max_context: config.max_context.or(max_model_len),
             capabilities: backend.capabilities(),
             engine_version: version,
+            kv_cache_size_tokens: cache_cfg.kv_cache_size_tokens,
+            kv_cache_max_concurrency: cache_cfg.kv_cache_max_concurrency,
+            kv_block_size: cache_cfg.kv_block_size,
+            mamba_cache_mode: cache_cfg.mamba_cache_mode,
         })
     }
+
+    /// Compute the effective KV-pool concurrency budget for this engine profile.
+    pub fn kv_pool_budget(&self, config: &Config) -> KvPoolBudget {
+        let base = self
+            .kv_cache_size_tokens
+            .or(config.max_context)
+            .or(self.max_context)
+            .unwrap_or(0);
+
+        let pool_capacity_tokens = if base == 0 {
+            0
+        } else if self
+            .mamba_cache_mode
+            .as_deref()
+            .is_some_and(|m| !m.eq_ignore_ascii_case("none"))
+        {
+            let pct_90 = ((u64::from(base) * 90) / 100) as u32;
+            let block = u64::from(self.kv_block_size.unwrap_or(512));
+            let slots = u64::from(config.max_concurrent_tasks.max(1));
+            let min_reserve = 2u64.saturating_mul(block).saturating_mul(slots);
+            if min_reserve < u64::from(base) / 2 {
+                pct_90.min((u64::from(base) - min_reserve) as u32)
+            } else {
+                pct_90
+            }
+        } else {
+            base
+        };
+
+        let per_slot_state_tokens =
+            if self.backend == Backend::Vllm || self.kv_cache_size_tokens.is_some() {
+                self.kv_block_size
+                    .unwrap_or(512)
+                    .saturating_mul(2)
+                    .saturating_add(config.max_turn_reasoning_tokens.min(16_384) / 2)
+            } else {
+                0
+            };
+
+        KvPoolBudget {
+            pool_capacity_tokens,
+            per_slot_state_tokens,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct VllmCacheConfig {
+    kv_cache_size_tokens: Option<u32>,
+    kv_cache_max_concurrency: Option<f64>,
+    kv_block_size: Option<u32>,
+    mamba_cache_mode: Option<String>,
+}
+
+async fn fetch_vllm_cache_config(client: &reqwest::Client, config: &Config) -> VllmCacheConfig {
+    let Some(base) = config
+        .base_url
+        .as_deref()
+        .map(|b| b.trim_end_matches('/'))
+        .filter(|b| !b.is_empty())
+    else {
+        return VllmCacheConfig::default();
+    };
+    let Some(root) = server_root(base) else {
+        return VllmCacheConfig::default();
+    };
+    let url = format!("{}/metrics", root.trim_end_matches('/'));
+    let mut request = client.get(&url).timeout(std::time::Duration::from_secs(2));
+    if let Some(key) = &config.api_key {
+        request = request.bearer_auth(key);
+    }
+    let Ok(response) = request.send().await else {
+        return VllmCacheConfig::default();
+    };
+    if !response.status().is_success() {
+        return VllmCacheConfig::default();
+    }
+    let Ok(body) = response.text().await else {
+        return VllmCacheConfig::default();
+    };
+    parse_vllm_cache_config_info(&body)
+}
+
+fn parse_u32_label(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    if let Ok(v) = trimmed.parse::<u32>() {
+        return Some(v);
+    }
+    let f = trimmed.parse::<f64>().ok()?;
+    if f.is_finite() && f >= 0.0 && f <= f64::from(u32::MAX) && f.fract() == 0.0 {
+        Some(f as u32)
+    } else {
+        None
+    }
+}
+
+fn parse_vllm_cache_config_info(metrics_text: &str) -> VllmCacheConfig {
+    for line in metrics_text.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("vllm:cache_config_info") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(mut cursor) = rest.strip_prefix('{') else {
+            continue;
+        };
+
+        let mut cfg = VllmCacheConfig::default();
+        let mut block_size: Option<u32> = None;
+        let mut mamba_block_size: Option<u32> = None;
+
+        loop {
+            cursor = cursor.trim_start_matches(|c: char| c == ',' || c.is_whitespace());
+            if cursor.is_empty() || cursor.starts_with('}') {
+                break;
+            }
+            let Some(eq_idx) = cursor.find('=') else {
+                break;
+            };
+            let key = cursor[..eq_idx].trim();
+            cursor = cursor[eq_idx + 1..].trim_start();
+            let Some(after_quote) = cursor.strip_prefix('"') else {
+                break;
+            };
+            let mut val = String::new();
+            let mut escaped = false;
+            let mut end_idx = None;
+            for (idx, ch) in after_quote.char_indices() {
+                if escaped {
+                    match ch {
+                        'n' => val.push('\n'),
+                        '\\' => val.push('\\'),
+                        '"' => val.push('"'),
+                        other => val.push(other),
+                    }
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    end_idx = Some(idx);
+                    break;
+                } else {
+                    val.push(ch);
+                }
+            }
+            let Some(close_idx) = end_idx else {
+                break;
+            };
+            cursor = &after_quote[close_idx + 1..];
+
+            match key {
+                "kv_cache_size_tokens" => {
+                    cfg.kv_cache_size_tokens = parse_u32_label(&val);
+                }
+                "kv_cache_max_concurrency" => {
+                    cfg.kv_cache_max_concurrency =
+                        val.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+                }
+                "block_size" => {
+                    block_size = parse_u32_label(&val).filter(|&v| v > 0);
+                }
+                "mamba_block_size" => {
+                    mamba_block_size = parse_u32_label(&val).filter(|&v| v > 0);
+                }
+                "mamba_cache_mode" => {
+                    let trimmed = val.trim();
+                    if !trimmed.is_empty() {
+                        cfg.mamba_cache_mode = Some(trimmed.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        cfg.kv_block_size = match (block_size, mamba_block_size) {
+            (Some(b), Some(m)) => Some(b.max(m)),
+            (b, m) => b.or(m),
+        };
+        return cfg;
+    }
+    VllmCacheConfig::default()
 }
 
 /// Extract `max_model_len` from the first `/v1/models` entry that reports one.
@@ -647,5 +862,129 @@ mod tests {
         assert_eq!(profile.backend, Backend::Vllm);
         assert_eq!(profile.model_id, "qwen3.8-27b");
         assert_eq!(profile.max_context, Some(32768));
+    }
+
+    #[tokio::test]
+    async fn discover_vllm_parses_metrics_cache_config_and_falls_back_cleanly() {
+        let metrics_body = "\
+# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig
+# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{block_size=\"16\",cache_dtype=\"auto\",enable_prefix_caching=\"True\",kv_cache_max_concurrency=\"5.38\",kv_cache_size_tokens=\"808448\",mamba_block_size=\"512\",mamba_cache_mode=\"align\"} 1.0
+";
+        let base = serve(
+            Router::new()
+                .route("/v1/models", get(|| async { Json(vllm_models_json()) }))
+                .route(
+                    "/version",
+                    get(|| async { Json(json!({"version": "0.18.0"})) }),
+                )
+                .route("/metrics", get(move || async move { metrics_body })),
+        )
+        .await;
+        let cfg = test_config(Some(format!("{base}/v1")), Some("auto".into()));
+        let profile = EngineProfile::discover(&cfg, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(profile.backend, Backend::Vllm);
+        assert_eq!(profile.kv_cache_size_tokens, Some(808_448));
+        assert_eq!(profile.kv_cache_max_concurrency, Some(5.38));
+        assert_eq!(profile.kv_block_size, Some(512));
+        assert_eq!(profile.mamba_cache_mode.as_deref(), Some("align"));
+
+        // Non-vLLM backend skips /metrics and keeps cache fields as None.
+        let llama_base = serve(
+            Router::new()
+                .route(
+                    "/v1/health",
+                    get(|| async { Json(json!({"status": "ok"})) }),
+                )
+                .route(
+                    "/v1/models",
+                    get(|| async {
+                        Json(json!({"data": [{"id": "fixture", "max_model_len": 65536}]}))
+                    }),
+                )
+                .route("/metrics", get(move || async move { metrics_body })),
+        )
+        .await;
+        let llama_cfg = test_config(Some(format!("{llama_base}/v1")), None);
+        let llama_profile = EngineProfile::discover(&llama_cfg, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(llama_profile.backend, Backend::LlamaCpp);
+        assert_eq!(llama_profile.kv_cache_size_tokens, None);
+        assert_eq!(llama_profile.kv_block_size, None);
+        assert_eq!(llama_profile.mamba_cache_mode, None);
+    }
+
+    #[test]
+    fn parse_vllm_cache_config_info_handles_attention_only_and_missing() {
+        let parsed = parse_vllm_cache_config_info(
+            "vllm:cache_config_info{block_size=\"32\",kv_cache_size_tokens=\"131072\",mamba_cache_mode=\"none\"} 1.0\n",
+        );
+        assert_eq!(parsed.kv_cache_size_tokens, Some(131_072));
+        assert_eq!(parsed.kv_cache_max_concurrency, None);
+        assert_eq!(parsed.kv_block_size, Some(32));
+        assert_eq!(parsed.mamba_cache_mode.as_deref(), Some("none"));
+
+        let empty = parse_vllm_cache_config_info("# empty metrics\nvllm:num_requests_running 0\n");
+        assert_eq!(empty, VllmCacheConfig::default());
+    }
+
+    #[test]
+    fn kv_pool_budget_computes_mamba_headroom_and_per_slot_overhead() {
+        let mut cfg = test_config(None, None);
+        cfg.max_concurrent_tasks = 4;
+        cfg.max_turn_reasoning_tokens = 16_384;
+
+        let vllm_mamba = EngineProfile {
+            backend: Backend::Vllm,
+            model_id: "qwen3.5".into(),
+            max_context: Some(150_000),
+            capabilities: Backend::Vllm.capabilities(),
+            engine_version: Some("0.18.0".into()),
+            kv_cache_size_tokens: Some(808_448),
+            kv_cache_max_concurrency: Some(5.38),
+            kv_block_size: Some(512),
+            mamba_cache_mode: Some("align".into()),
+        };
+        let b1 = vllm_mamba.kv_pool_budget(&cfg);
+        assert_eq!(b1.pool_capacity_tokens, 727_603);
+        assert_eq!(b1.per_slot_state_tokens, 512 * 2 + 8192);
+
+        // Smaller pool where 2 * kv_block_size * max_concurrent_tasks (4096) > 10% (3276).
+        let small_mamba = EngineProfile {
+            kv_cache_size_tokens: Some(32_768),
+            ..vllm_mamba.clone()
+        };
+        let b2 = small_mamba.kv_pool_budget(&cfg);
+        assert_eq!(b2.pool_capacity_tokens, 32_768 - 4096);
+
+        // mamba_cache_mode="none" skips 10% headroom, still reserves per-slot overhead for vLLM.
+        let vllm_plain = EngineProfile {
+            mamba_cache_mode: Some("none".into()),
+            kv_block_size: Some(16),
+            ..vllm_mamba
+        };
+        let b3 = vllm_plain.kv_pool_budget(&cfg);
+        assert_eq!(b3.pool_capacity_tokens, 808_448);
+        assert_eq!(b3.per_slot_state_tokens, 16 * 2 + 8192);
+
+        // Non-vLLM uses config.max_context and 0 per-slot overhead.
+        cfg.max_context = Some(65_536);
+        let llama = EngineProfile {
+            backend: Backend::LlamaCpp,
+            model_id: "fixture".into(),
+            max_context: Some(65_536),
+            capabilities: Backend::LlamaCpp.capabilities(),
+            engine_version: None,
+            kv_cache_size_tokens: None,
+            kv_cache_max_concurrency: None,
+            kv_block_size: None,
+            mamba_cache_mode: None,
+        };
+        let b4 = llama.kv_pool_budget(&cfg);
+        assert_eq!(b4.pool_capacity_tokens, 65_536);
+        assert_eq!(b4.per_slot_state_tokens, 0);
     }
 }

@@ -37,10 +37,15 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
-use crate::state::StateDir;
+use crate::state::{AcquireResult, Locks, StateDir};
 
 /// Default poll cadence (ms) when waiting to acquire a slot.
 const DEFAULT_POLL_MS: u64 = 1000;
+/// Short-TTL cross-process lock serializing `token_budget_admits` + `try_claim`.
+const SLOT_CLAIM_LOCK: &str = "slot_claim";
+const SLOT_CLAIM_TTL_MS: u64 = 5_000;
+const SLOT_CLAIM_RETRY_ATTEMPTS: usize = 50;
+const SLOT_CLAIM_RETRY_MS: u64 = 10;
 
 /// In-process FIFO wait-queue state (guarded by a single std Mutex so that
 /// both the async `acquire` and the sync `release` can manipulate it without
@@ -72,6 +77,9 @@ struct Inner {
     /// Total token budget for the pool. `0` means the token-budget check is
     /// disabled (original slot-count-only semantics).
     pool_capacity_tokens: u32,
+    /// Per-slot state token overhead charged per active lease in admission and
+    /// yield checks (default `0`).
+    per_slot_state_tokens: u32,
 }
 
 impl TaskSemaphore {
@@ -87,6 +95,7 @@ impl TaskSemaphore {
                 waiters: Mutex::new(Waiters::default()),
                 next_id: AtomicU64::new(0),
                 pool_capacity_tokens: 0,
+                per_slot_state_tokens: 0,
             }),
         }
     }
@@ -103,6 +112,7 @@ impl TaskSemaphore {
                 waiters: Mutex::new(Waiters::default()),
                 next_id: AtomicU64::new(0),
                 pool_capacity_tokens: 0,
+                per_slot_state_tokens: 0,
             }),
         }
     }
@@ -112,11 +122,6 @@ impl TaskSemaphore {
     /// - `pool_capacity_tokens`: total token budget for the whole pool. When
     ///   `0`, the token-budget gate is disabled (original slot-count-only
     ///   semantics).
-    ///
-    /// The unified admission rule (see [`Self::acquire_with_tokens`]) is:
-    /// `sum over all live leases L of (L.context_tokens) + requested_tokens
-    /// <= pool_capacity_tokens`. There is no separate per-slot state overhead —
-    /// each lease's own `context_tokens` is its full cost.
     pub fn with_token_budget(mut self, pool_capacity_tokens: u32) -> Self {
         // `inner` is an `Arc<Inner>`; to mutate the fields we need `Arc::get_mut`
         // (which panics if there are other strong refs). In practice this is
@@ -125,6 +130,14 @@ impl TaskSemaphore {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_token_budget must be called before any clone is made");
         inner.pool_capacity_tokens = pool_capacity_tokens;
+        self
+    }
+
+    /// Set the per-slot state overhead reserved for each active lease (builder pattern).
+    pub fn with_per_slot_state_tokens(mut self, tokens: u32) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_per_slot_state_tokens must be called before any clone is made");
+        inner.per_slot_state_tokens = tokens;
         self
     }
 
@@ -221,9 +234,13 @@ impl TaskSemaphore {
         ranking::soft_pool_limit(self.inner.pool_capacity_tokens)
     }
 
-    /// Aggregate committed context tokens across all active leases.
+    /// Aggregate committed context tokens across all active leases (including
+    /// any configured `per_slot_state_tokens` per active slot).
     pub fn committed_tokens(&self) -> u64 {
-        ranking::committed_tokens(&self.list_slots())
+        ranking::committed_tokens_with_overhead(
+            &self.list_slots(),
+            self.inner.per_slot_state_tokens,
+        )
     }
 
     /// Whether the aggregate KV pool is exhausted (committed >= capacity).
@@ -234,23 +251,44 @@ impl TaskSemaphore {
     /// DRY token-budget admission gate.
     ///
     /// Halts new task admission if aggregate committed tokens exceed the soft limit,
-    /// or if the new task's initial tokens would push the pool over total capacity.
+    /// or if the new task's initial tokens plus per-slot overhead would push the
+    /// pool over total capacity.
     fn token_budget_admits(&self, initial_tokens: u32) -> bool {
-        ranking::token_budget_admits(
+        ranking::token_budget_admits_with_overhead(
             self.inner.pool_capacity_tokens,
             self.committed_tokens(),
             initial_tokens,
+            self.inner.per_slot_state_tokens,
         )
+    }
+
+    /// Acquire the short-TTL cross-process `slot_claim` lock with bounded
+    /// async backoff so parallel workers serialize `token_budget_admits` +
+    /// `try_claim`. Returns `None` if contention persists beyond the retry budget
+    /// (caller falls through to the FIFO wait path).
+    async fn acquire_slot_claim_lock(&self) -> Option<SlotClaimGuard> {
+        let locks = Locks::from_state(&self.inner.state);
+        for _ in 0..SLOT_CLAIM_RETRY_ATTEMPTS {
+            match locks.acquire(SLOT_CLAIM_LOCK, SLOT_CLAIM_TTL_MS) {
+                Ok(AcquireResult::Acquired) => return Some(SlotClaimGuard { locks }),
+                Ok(AcquireResult::HeldBy { .. }) => {
+                    sleep(Duration::from_millis(SLOT_CLAIM_RETRY_MS)).await;
+                }
+                Err(_) => return None,
+            }
+        }
+        None
     }
 
     pub async fn acquire_with_tokens(&self, task_id: &str, initial_tokens: u32) -> SlotLease {
         loop {
-            // Fast path: no alien tenant, and the token-budget gate admits
-            // this claim (checked once over all live leases, so an empty pool
-            // can never overcommit). If the gate refuses, we fall through to
-            // the FIFO waiter path and re-check here on the next loop, so a
-            // woken waiter can never overcommit either.
-            if !self.alien_tenant_active() && self.token_budget_admits(initial_tokens) {
+            // Fast path: serialize alien-tenant check, token-budget admission, and
+            // O_EXCL slot claim across OS processes using a short-TTL lock so
+            // concurrent workers cannot all admit against `committed = 0`.
+            if let Some(_claim_guard) = self.acquire_slot_claim_lock().await
+                && !self.alien_tenant_active()
+                && self.token_budget_admits(initial_tokens)
+            {
                 for i in 0..self.inner.max_slots {
                     if let ClaimOutcome::Claimed(lease) = self.try_claim(i, task_id, initial_tokens)
                     {
@@ -381,11 +419,12 @@ impl TaskSemaphore {
     /// a heavier or senior active task to finish and free its KV cache.
     pub fn should_yield(&self, lease: &SlotLease) -> bool {
         let slots = self.list_slots();
-        ranking::should_yield(
+        ranking::should_yield_with_overhead(
             &slots,
             &lease.task_id,
             lease.tenant,
             self.inner.pool_capacity_tokens,
+            self.inner.per_slot_state_tokens,
         )
     }
 
@@ -492,5 +531,110 @@ impl TaskSemaphore {
             }
         }
         reaped
+    }
+}
+
+/// RAII guard ensuring `slot_claim` is released on return, error, or panic.
+struct SlotClaimGuard {
+    locks: Locks,
+}
+
+impl Drop for SlotClaimGuard {
+    fn drop(&mut self) {
+        let _ = self.locks.release(SLOT_CLAIM_LOCK);
+    }
+}
+
+#[cfg(test)]
+mod overhead_tests {
+    use super::*;
+
+    fn test_state(tag: &str) -> (StateDir, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "castor_sem_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = StateDir::new(&dir);
+        state.ensure().unwrap();
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn per_slot_state_tokens_charges_admission_and_yield() {
+        let (state, dir) = test_state("overhead");
+        // Pool 100 (soft limit 90), overhead 20 per slot.
+        let sem = TaskSemaphore::with_poll_interval(&state, 4, 20)
+            .with_token_budget(100)
+            .with_per_slot_state_tokens(20);
+
+        // Slot A: initial 30 + overhead 20 = 50 committed.
+        let a = sem.acquire_with_tokens("task_a", 30).await;
+        assert_eq!(sem.committed_tokens(), 50);
+
+        // Slot B: initial 30 + overhead 20 => 50 + 50 = 100 <= 100 -> admitted.
+        let b = sem.acquire_with_tokens("task_b", 30).await;
+        assert_eq!(sem.committed_tokens(), 100);
+
+        // Committed = 100 > soft_limit 90: younger task_b yields to older task_a.
+        assert!(!sem.should_yield(&a));
+        assert!(sem.should_yield(&b));
+
+        // While 100 is committed, a 3rd claim (even with 0 initial) cannot admit.
+        let third = tokio::time::timeout(
+            Duration::from_millis(80),
+            sem.acquire_with_tokens("task_c", 0),
+        )
+        .await;
+        assert!(third.is_err(), "third task must block when pool is full");
+
+        sem.release(&b);
+        sem.release(&a);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn slot_claim_serializes_concurrent_admissions() {
+        let (state, dir) = test_state("claim_lock");
+        // Pool 100, overhead 20, each task requests 30 => cost 50 per slot.
+        // At most 2 of 4 concurrent tasks may be admitted at once.
+        let sem = Arc::new(
+            TaskSemaphore::with_poll_interval(&state, 4, 15)
+                .with_token_budget(100)
+                .with_per_slot_state_tokens(20),
+        );
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for idx in 0..4 {
+            let sem_c = sem.clone();
+            let active_c = active.clone();
+            let max_c = max_seen.clone();
+            handles.push(tokio::spawn(async move {
+                let lease = sem_c.acquire_with_tokens(&format!("task_{idx}"), 30).await;
+                let cur = active_c.fetch_add(1, Ordering::SeqCst) + 1;
+                max_c.fetch_max(cur, Ordering::SeqCst);
+                assert!(
+                    cur <= 2,
+                    "admitted {cur} concurrent tasks exceeding 100-token pool"
+                );
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                active_c.fetch_sub(1, Ordering::SeqCst);
+                sem_c.release(&lease);
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert!(max_seen.load(Ordering::SeqCst) <= 2);
+        assert!(!Locks::from_state(&state).path(SLOT_CLAIM_LOCK).exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
