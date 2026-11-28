@@ -140,11 +140,10 @@ pub struct Config {
     /// Secret: never print the value.
     pub openalex_api_key: Option<String>,
     pub boot_timeout_secs: u64,
-    /// DGI gatekeeper log-odds reject margin: the binary gate rejects only
-    /// when `logP(OVERLOADED) - logP(ADMIT)` exceeds this (env-only).
-    /// Calibrated on the live 1,053-prompt benchmark: `1.2` holds the
-    /// false-reject rate on single-concern ADMIT dispatches to ~2.7% while
-    /// catching ~half of the monolithic multi-subsystem REJECT class.
+    /// DGI gatekeeper log-odds reject margin: the binary gate rejects when
+    /// `logP(OVERLOADED) - logP(ADMIT)` exceeds this (env-only).
+    /// Default `0.0` rejects whenever the model assigns higher probability to
+    /// `OVERLOADED` than `ADMIT` rather than overriding its classification.
     pub dgi_reject_margin: f64,
     /// DGI warm-session bypass: skip the probe for continuations that already
     /// have a non-empty `messages.json` (env-only).
@@ -556,7 +555,7 @@ pub fn load_with(get_env: impl Fn(&str) -> Option<String>) -> Result<LoadedConfi
 
     // DGI tuning knobs: env-only settings (no config.json keys).
     let (dgi_reject_margin, src_dgi_reject_margin) =
-        pick_f64(env_f64("CASTOR_DGI_REJECT_MARGIN")?, 1.2);
+        pick_f64(env_f64("CASTOR_DGI_REJECT_MARGIN")?, 0.0);
     let (dgi_bypass_warm_session, src_dgi_bypass_warm_session) =
         pick_bool(env_bool("CASTOR_DGI_BYPASS_WARM_SESSION")?, true);
 
@@ -1450,7 +1449,7 @@ mod tests {
         let l = load_case(&[], None);
         assert_eq!(
             (l.config.dgi_reject_margin, l.sources.dgi_reject_margin),
-            (1.2, Source::Default)
+            (0.0, Source::Default)
         );
         let dir = tmp_dir();
         let err = load_with_env(&[

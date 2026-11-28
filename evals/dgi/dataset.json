@@ -2558,7 +2558,7 @@
   {
     "id": "pc_task_audit_m3_code_an_20261118_132720_266_08c80005",
     "domain": "real_session",
-    "expected": "ADMIT",
+    "expected": "REJECT",
     "prompt": "Deeply audit the M3 implementation, bridges, factorial setup, and Nov 17 diagnostic docs in `/workspace/patchwork`. Strictly obey AGENTS.md: do NOT read, parse, or touch `defense/poc/`, and do NOT modify or create any files.\n\nSpecifically read and analyze:\n1. `src/patchwork/m3_editing/__init__.py`, `compile_gate.py`, `transform.py`, and `sandbox/` (`image.py`, `outcome.py`, `run.py`). Focus on algorithmic soundness, AGENTS.md compliance (no heuristic duct tape / arbitrary magic numbers), edge cases, language/AST support, error handling, and whether `transform.py` actually does what M3 claims.\n2. `benchmarks/m3_bridge.py`, `benchmarks/mswea_bridge.py`, `benchmarks/bridge/` (all files), and `benchmarks/eval/factorial.py`, `m3_plan.py`, `runner.py`, `final1_eval.py`. Pay special attention to:\n   - How `A1_react`, `A5_context`, `A3_edit`, `A3_invisible`, `A7_patchwork`, `A7_invisible` differ in prompts, tools, interception/rewriting, edit mechanics, and evaluation.\n   - How `apply_m3_mutation` and `apply_m3_invisible_edit` actually work, what `m3_bridge_telemetry` records, and any subtle bugs, silent fallbacks, confounders, or asymmetries between arms.\n3. `docs/eval/a7-ablation-regression-diagnosis.md` and `docs/eval/multirepo-factorial-extension.md`.\n\nReturn a detailed, critical engineering report citing exact file paths, line numbers, symbol names, and concrete code defects or design flaws."
   },
   {
@@ -2936,7 +2936,7 @@
   {
     "id": "pc_task_conduct_an_adver_20261104_084020_215_086b000f",
     "domain": "real_session",
-    "expected": "ADMIT",
+    "expected": "REJECT",
     "prompt": "Conduct an adversarial code audit of the engine, runner, task, and proxy subsystems:\n- `src/runner/` (runner loop, session options, loop_detector, events ledger)\n- `src/engine/` (provider, backend, lifecycle, supervisor, detached)\n- `src/task/` (registry, disk mirroring, semaphore disk leases, wait long-poll)\n- `src/proxy/` (proxy server, sanitize, SSE framing, repetition detector)\n\nAudit Criteria:\n1. Crate-first vs custom code: Identify where custom/bespoke mechanisms reinvent standard Rust ecosystem crates (e.g. file locking, semaphore algorithms, SSE streaming, process tree supervision, telemetry).\n2. Concurrency, deadlocks, and race conditions: Check cross-process locks, semaphore leases, disk mirror synchronization, and async task cancellation.\n3. Cleanliness, idiomatic Rust, and error modeling: Audit error types (inconsistent String vs thiserror vs Box<dyn Error>), excessive allocations, and unwraps/panics.\n4. Architectural bloat: Identify dead paths, overly complex state machines, or unnecessary layers.\n\nReturn concrete file:line coordinates, specific anti-patterns found, and actionable remediation proposals."
   },
   {
@@ -4940,7 +4940,7 @@
   {
     "id": "pc_task_perform_a_mercil_20261121_204328_902_e7e60014",
     "domain": "real_session",
-    "expected": "ADMIT",
+    "expected": "REJECT",
     "prompt": "Perform a merciless line-by-line content, FAQ, accuracy, and tone audit across EVERY rendered file in `/workspace/website` (do NOT modify files yet, do NOT inspect images):\nRead every line of:\n- `src/data/telemetry.ts`\n- `src/components/v3/HeroCinema.tsx`\n- `src/components/v3/DualEngineBeam.tsx`\n- `src/components/v3/SavingsInstrument.tsx`\n- `src/components/v3/DeployDeck.tsx`\n- `src/pages/index.astro`\n- `src/pages/claude-code-local-llm.astro`\n- `src/pages/benchmarks/qwen3-8-27b-rtx-3090.astro`\n- `src/pages/enterprise/air-gapped-coding-agent.astro`\n- `src/components/Header.astro`, `Footer.astro`, `QuickstartFooter.astro`, `src/layouts/Layout.astro`\n- `public/llms.txt`, `public/llms-full.txt`\n\nReturn an exhaustive, line-cited audit report identifying:\n1. **Every single FAQ Question & Answer** across all pages (quote the exact Q & A and flag anything factually wrong, misleading, outdated, defensive, or mismatched with real engineering reality).\n2. **Every wrong/mismatched detail in `HeroCinema.tsx` animations** (e.g., filename vs test command mismatches like `CheckoutForm.tsx` running `vitest auth`, `rate_limit.py` running `test_ingest.py`, fake metrics, clunky phrasing).\n3. **Every line of AI-slop, hype, robotic phrasing, or defensive/apologetic language** across all 4 pages, citing exact `file:line` and quoting the exact bad text.\n4. **Every inconsistent or conflicting number/claim across files** (e.g., `48 hours` vs `fixed-scope`, `$6,034.36` vs `$6,044.48`, `2.77B` vs `2.71B`, `75.5` vs `70.4`, `vLLM 0.33.0`, etc.).\n5. **Every technical jargon leak or unclear explanation** that would confuse or alienate either an engineer or a CTO/engineering manager."
   },
   {

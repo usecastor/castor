@@ -358,13 +358,18 @@ pub async fn run_job_with_engine_budgeted(
     //    unadulterated error (no heuristic fallback), and an admitted dispatch
     //    proceeds with the raw prompt — the DGI injects no advisory text into
     //    the worker prompt.
+    let mut dgi_telemetry: Option<crate::mcp::dgi::DgiEvaluation> = None;
     if config.base_url.is_some() && config.model.is_some() {
         let dgi = if crate::mcp::dgi::warm_session_bypass(config, state, &spec.session_id) {
-            tracing::debug!(
+            tracing::info!(
                 session_id = %spec.session_id,
                 "[dgi] warm-session bypass: admitting without probe"
             );
-            crate::mcp::dgi::DgiVerdict::Admit
+            crate::mcp::dgi::DgiEvaluation {
+                verdict: crate::mcp::dgi::DgiVerdict::Admit,
+                margin: None,
+                source: "warm_session_bypass",
+            }
         } else {
             let probe_timeout_secs = std::env::var("CASTOR_DGI_TIMEOUT_SECS")
                 .ok()
@@ -374,10 +379,23 @@ pub async fn run_job_with_engine_budgeted(
                 .timeout(std::time::Duration::from_secs(probe_timeout_secs))
                 .build()
                 .unwrap_or_default();
-            match crate::mcp::dgi::evaluate_configured_model_probe(config, &spec.prompt, &http)
-                .await
+            match crate::mcp::dgi::evaluate_configured_model_probe_with_metrics(
+                config,
+                &spec.prompt,
+                &http,
+            )
+            .await
             {
-                Ok(v) => v,
+                Ok(eval) => {
+                    tracing::info!(
+                        session_id = %spec.session_id,
+                        verdict = if eval.verdict.is_reject() { "REJECT" } else { "ADMIT" },
+                        margin = ?eval.margin,
+                        reject_margin = config.dgi_reject_margin,
+                        "[dgi] probe completed"
+                    );
+                    eval
+                }
                 Err(err) => {
                     let err_msg = format!("DgiProbeError: {err}");
                     let _ = registry
@@ -388,7 +406,7 @@ pub async fn run_job_with_engine_budgeted(
             }
         };
 
-        if let crate::mcp::dgi::DgiVerdict::Reject(sigs) = &dgi {
+        if let crate::mcp::dgi::DgiVerdict::Reject(sigs) = &dgi.verdict {
             let body = sigs
                 .iter()
                 .map(|s| format!("  - {s}"))
@@ -407,6 +425,7 @@ pub async fn run_job_with_engine_budgeted(
                 .await;
             return Err(reject_msg);
         }
+        dgi_telemetry = Some(dgi);
     }
 
     // 2. Build the system prompt BEFORE committing to a slot lease, so the
@@ -560,6 +579,15 @@ pub async fn run_job_with_engine_budgeted(
         "base_commit": base_commit,
         "git_dirty": git_dirty,
     }));
+    if let Some(ref dgi) = dgi_telemetry {
+        let _ = logger.append(json!({
+            "type": "dgi",
+            "verdict": if dgi.verdict.is_reject() { "REJECT" } else { "ADMIT" },
+            "margin": dgi.margin,
+            "reject_margin": config.dgi_reject_margin,
+            "source": dgi.source,
+        }));
+    }
 
     // 6. Initialize optional extensions and composite tool executor.
     let ext_bridge = if let Some(ref exts) = spec.extensions {

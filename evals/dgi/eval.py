@@ -99,13 +99,21 @@ def extract_features(prompt: str):
             write_targets.append(raw_path)
             
     unique_targets = list(dict.fromkeys(write_targets))
+    unique_all_files = list(dict.fromkeys(f for f, _ in all_files))
     target_subs = set()
+    all_subs = set()
     for f in unique_targets:
         parts = [p for p in f.split("/") if p and p != "."]
         if len(parts) >= 2 and parts[0] in ("src", "core", "benchmarks", "lib", "pkg", "components", "server", "db"):
             target_subs.add(f"{parts[0]}/{parts[1]}")
         elif len(parts) >= 2 and parts[0] not in ("tests", "evals", "docs", "scripts", ".scratch"):
             target_subs.add(parts[0])
+    for f in unique_all_files:
+        parts = [p for p in f.split("/") if p and p != "."]
+        if len(parts) >= 2 and parts[0] in ("src", "core", "benchmarks", "lib", "pkg", "components", "server", "db"):
+            all_subs.add(f"{parts[0]}/{parts[1]}")
+        elif len(parts) >= 2 and parts[0] not in ("tests", "evals", "docs", "scripts", ".scratch"):
+            all_subs.add(parts[0])
 
     is_read_only = bool(re.search(
         r"\b(strictly read-only|read-only|plan mode|audit slice|investigation slice|visual pass|exemplar)\b",
@@ -119,7 +127,9 @@ def extract_features(prompt: str):
     return {
         "char_len": len(prompt),
         "target_count": len(unique_targets),
+        "all_file_count": len(unique_all_files),
         "target_subs": target_subs,
+        "all_subs": all_subs,
         "is_read_only": is_read_only,
         "is_focused_slice": is_focused_slice
     }
@@ -140,9 +150,13 @@ def decide(prompt: str, feats: dict) -> tuple[str, list[str]]:
                 reasons.append("MULTI_SUBSYSTEM_SPRAWL_CHAIN")
                 return "REJECT", reasons
 
-    # 2. Structural Subsystem Decoupling: >= 3 distinct subsystem directories targeted for mutation
+    # 2. Structural Subsystem Decoupling: >= 3 distinct subsystem directories targeted
+    # (or exhaustive >= 10 file sweep spanning >= 3 subsystems without a focused slice tag).
     if len(feats["target_subs"]) >= 3 and not feats["is_read_only"] and not feats["is_focused_slice"]:
         reasons.append(f"CROSS_SUBSYSTEM_MUTATION_SPRAWL({len(feats['target_subs'])}>=3)")
+        return "REJECT", reasons
+    if feats["all_file_count"] >= 10 and len(feats["all_subs"]) >= 3 and not feats["is_focused_slice"]:
+        reasons.append(f"MULTI_FILE_SUBSYSTEM_SWEEP({feats['all_file_count']} files/{len(feats['all_subs'])} subs)")
         return "REJECT", reasons
 
     # 3. Advisory Review: 2 distinct subsystems touched without a focused slice tag

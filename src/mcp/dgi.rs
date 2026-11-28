@@ -25,23 +25,38 @@ use serde_json::json;
 const CLASSIFY_RUBRIC: &str = concat!(
     "You are a decomposition gatekeeper. Classify the task below. ",
     "ADMIT: a cohesive, bounded single-subsystem engineering task — one coherent ",
-    "concern, even if it touches several files within that one subsystem. ",
-    "OVERLOADED: an unrelated multi-subsystem overhaul — a monolithic 'mega-prompt' ",
-    "chaining several distinct, independent subsystems (e.g. redesign A, rewrite B, ",
-    "re-architect C) with no single coherent goal, or a dispatch combining broad external ",
-    "web/paper research across multiple domains with deep codebase surgery and hardware sizing. ",
-    "The deciding test is cohesion: if all the work serves one coherent goal within ",
-    "one subsystem it is ADMIT; if it chains unrelated subsystems or disparate domains it is OVERLOADED. ",
+    "concern, even if it touches several files within that one subsystem, or a focused ",
+    "audit of a single module/subsystem. ",
+    "OVERLOADED: (1) an unrelated multi-subsystem overhaul chaining distinct, ",
+    "independent subsystems (e.g. redesign A, rewrite B, re-architect C) with no single ",
+    "coherent goal; (2) a dispatch combining broad external web/paper research across ",
+    "multiple domains with deep codebase surgery and hardware sizing; or (3) a broad ",
+    "exhaustive read/audit across 2+ independent subsystems or >5 disparate files across ",
+    "multiple unrelated review criteria (which should be split into per-subsystem slices). ",
+    "The deciding test is cohesion and scope: if all work serves one bounded subsystem ",
+    "or single concern it is ADMIT; if it spans multiple independent subsystems or an ",
+    "exhaustive multi-file sweep it is OVERLOADED. ",
     "Examples: ",
     "ADMIT — 'Add retry-with-backoff to the DGI probe in src/mcp/dgi.rs and thread the ",
     "new config knob through src/config.rs; add unit tests and run cargo test.' ",
+    "ADMIT — 'Read-only audit of src/proxy/mod.rs and src/proxy/sanitize.rs for SSE framing bugs.' ",
     "OVERLOADED — 'Rewrite the config loader, re-architect the engine client onto a new ",
     "wire protocol, and rework the task registry schema, all in one dispatch.' ",
+    "OVERLOADED — 'Conduct an exhaustive line-by-line audit across src/runner/, src/engine/, ",
+    "src/task/, and src/proxy/ across 4 orthogonal criteria, or audit 14 website files across 5 criteria.' ",
 );
 
 /// Single-token guided-choice vocabulary for the DGI probe.
 const VERDICT_ADMIT: &str = "ADMIT";
 const VERDICT_OVERLOADED: &str = "OVERLOADED";
+
+/// Structured DGI evaluation result including optional log-odds margin and source.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DgiEvaluation {
+    pub verdict: DgiVerdict,
+    pub margin: Option<f64>,
+    pub source: &'static str,
+}
 
 /// Verdict of the DGI Gatekeeper for a dispatch prompt. Strictly binary: the
 /// gate either admits a bounded single-concern spec or fails fast on a
@@ -79,11 +94,11 @@ fn verdict_from_text(token: &str) -> Result<DgiVerdict, String> {
     }
 }
 
-/// Returns `true` when `token` is a non-empty prefix of `target` of at least
-/// `min_len` characters (exact-case first, or full-word case-insensitive).
+/// Returns `true` when `token` is a non-empty case-normalized prefix of `target`
+/// of at least `min_len` characters (ignoring leading/trailing whitespace and quotes).
 fn is_choice_prefix(token: &str, target: &str, min_len: usize) -> bool {
-    let t = token.trim();
-    if t.len() >= min_len && target.starts_with(t) {
+    let t = token.trim().trim_matches('"');
+    if t.len() >= min_len && target.len() >= t.len() && target[..t.len()].eq_ignore_ascii_case(t) {
         return true;
     }
     t.eq_ignore_ascii_case(target)
@@ -130,10 +145,10 @@ fn extract_top_logprobs(top_logprobs: &serde_json::Value) -> Option<Vec<(String,
 /// (`AD`/`OVER`) via `logsumexp`, and handles one-sided top-K truncation using
 /// `min(top_logprobs)` as a strict upper bound when the losing choice falls
 /// outside top-K.
-fn verdict_from_logprobs(
+fn verdict_and_margin_from_logprobs(
     top_logprobs: &serde_json::Value,
     reject_margin: f64,
-) -> Result<DgiVerdict, String> {
+) -> Result<(DgiVerdict, f64), String> {
     let pairs = extract_top_logprobs(top_logprobs)
         .ok_or_else(|| "top_logprobs empty or unrecognized format".to_string())?;
 
@@ -143,17 +158,31 @@ fn verdict_from_logprobs(
 
     for (tok, lp) in &pairs {
         floor_lp = floor_lp.min(*lp);
-        if is_choice_prefix(tok, VERDICT_ADMIT, 2) {
+        // Restrict prefix pooling to canonical uppercase BPE prefixes (`AD`/`ADM`/`ADMIT`,
+        // `OVER`/`OVERLOADED`) so stray lowercase/partial tokens don't skew logsumexp; fall
+        // back to case-insensitive match only if exact-case yielded nothing.
+        let t = tok.trim().trim_matches('"');
+        if t.len() >= 2 && VERDICT_ADMIT.starts_with(t) {
             p_admit = Some(logsumexp(p_admit, *lp));
-        } else if is_choice_prefix(tok, VERDICT_OVERLOADED, 2) {
+        } else if t.len() >= 2 && VERDICT_OVERLOADED.starts_with(t) {
             p_over = Some(logsumexp(p_over, *lp));
+        }
+    }
+
+    if p_admit.is_none() || p_over.is_none() {
+        for (tok, lp) in &pairs {
+            if p_admit.is_none() && is_choice_prefix(tok, VERDICT_ADMIT, 2) {
+                p_admit = Some(logsumexp(p_admit, *lp));
+            } else if p_over.is_none() && is_choice_prefix(tok, VERDICT_OVERLOADED, 2) {
+                p_over = Some(logsumexp(p_over, *lp));
+            }
         }
     }
 
     // Fallback for tokenizers that split choices at a 1-char first token ("A"/"O").
     if p_admit.is_none() || p_over.is_none() {
         for (tok, lp) in &pairs {
-            let t = tok.trim();
+            let t = tok.trim().trim_matches('"');
             if p_admit.is_none() && t == "A" {
                 p_admit = Some(*lp);
             } else if p_over.is_none() && t == "O" {
@@ -166,35 +195,59 @@ fn verdict_from_logprobs(
         (Some(a), Some(o)) => {
             let delta_z = o - a;
             if delta_z > reject_margin {
-                Ok(DgiVerdict::Reject(vec![format!(
-                    "Model-classified monolithic multi-subsystem dispatch (OVERLOADED, log-odds margin {delta_z:.3} > {reject_margin})"
-                )]))
+                Ok((
+                    DgiVerdict::Reject(vec![format!(
+                        "Model-classified monolithic multi-subsystem dispatch (OVERLOADED, log-odds margin {delta_z:.3} > {reject_margin})"
+                    )]),
+                    delta_z,
+                ))
             } else {
-                Ok(DgiVerdict::Admit)
+                Ok((DgiVerdict::Admit, delta_z))
             }
         }
         // Only ADMIT appeared in top-K: OVERLOADED logprob is strictly <= floor_lp.
-        (Some(a), None) if (floor_lp - a) < -reject_margin => Ok(DgiVerdict::Admit),
+        (Some(a), None) if (floor_lp - a) < -reject_margin => Ok((DgiVerdict::Admit, floor_lp - a)),
         // Only OVERLOADED appeared in top-K: ADMIT logprob is strictly <= floor_lp.
-        (None, Some(o)) if (o - floor_lp) > reject_margin => Ok(DgiVerdict::Reject(vec![format!(
-            "Model-classified monolithic multi-subsystem dispatch (OVERLOADED, lower-bound margin {:.3} > {reject_margin})",
-            o - floor_lp
-        )])),
+        (None, Some(o)) if (o - floor_lp) > reject_margin => {
+            let lb = o - floor_lp;
+            Ok((
+                DgiVerdict::Reject(vec![format!(
+                    "Model-classified monolithic multi-subsystem dispatch (OVERLOADED, lower-bound margin {lb:.3} > {reject_margin})"
+                )]),
+                lb,
+            ))
+        }
         _ => Err("top_logprobs missing probe choices".into()),
     }
 }
 
+#[cfg(test)]
+fn verdict_from_logprobs(
+    top_logprobs: &serde_json::Value,
+    reject_margin: f64,
+) -> Result<DgiVerdict, String> {
+    verdict_and_margin_from_logprobs(top_logprobs, reject_margin).map(|(v, _)| v)
+}
+
 /// Parse the probe response: log-odds margin when `top_logprobs` is present,
 /// decoded text otherwise.
-fn decode_verdict(val: &serde_json::Value, reject_margin: f64) -> Result<DgiVerdict, String> {
+fn decode_verdict_with_margin(
+    val: &serde_json::Value,
+    reject_margin: f64,
+) -> Result<(DgiVerdict, Option<f64>), String> {
     let choice = &val["choices"][0];
     if let Some(lps) = choice["logprobs"]["top_logprobs"].as_array() {
         let first = lps.first().ok_or("empty top_logprobs")?;
-        verdict_from_logprobs(first, reject_margin)
+        verdict_and_margin_from_logprobs(first, reject_margin).map(|(v, m)| (v, Some(m)))
     } else {
         let text = choice["text"].as_str().unwrap_or("");
-        verdict_from_text(text)
+        verdict_from_text(text).map(|v| (v, None))
     }
+}
+
+#[cfg(test)]
+fn decode_verdict(val: &serde_json::Value, reject_margin: f64) -> Result<DgiVerdict, String> {
+    decode_verdict_with_margin(val, reject_margin).map(|(v, _)| v)
 }
 
 /// The one request builder for both probe shapes (the only DRY seam):
@@ -239,7 +292,10 @@ fn probe_request(
 /// on Chat Completions (`JsonSchemaChat`) responses. Locates the token step
 /// where the verdict value (`ADMIT` / `OVERLOADED`) begins and feeds its
 /// quote-trimmed `top_logprobs` array into [`verdict_from_logprobs`].
-fn decode_chat_logprobs(choice: &serde_json::Value, reject_margin: f64) -> Option<DgiVerdict> {
+fn decode_chat_logprobs_with_margin(
+    choice: &serde_json::Value,
+    reject_margin: f64,
+) -> Option<(DgiVerdict, f64)> {
     let steps = choice.get("logprobs")?.get("content")?.as_array()?;
     fn normalize(tok: &str) -> &str {
         tok.trim().trim_matches('"')
@@ -278,21 +334,21 @@ fn decode_chat_logprobs(choice: &serde_json::Value, reject_margin: f64) -> Optio
     if normalized_lps.is_empty() {
         return None;
     }
-    verdict_from_logprobs(&serde_json::Value::Array(normalized_lps), reject_margin).ok()
+    verdict_and_margin_from_logprobs(&serde_json::Value::Array(normalized_lps), reject_margin).ok()
 }
 
 /// Decode the probe response for either shape: the guided-choice shape reads
 /// the first decoded token (with a logprobs margin when available); the chat
 /// shape validates the JSON verdict field and scores `choices[0].logprobs.content`
 /// when present, falling back to the discrete JSON verdict when omitted.
-fn decode_probe_response(
+fn decode_probe_response_with_margin(
     probe_shape: crate::engine::backend::ProbeShape,
     val: &serde_json::Value,
     reject_margin: f64,
-) -> Result<DgiVerdict, String> {
+) -> Result<(DgiVerdict, Option<f64>), String> {
     match probe_shape {
         crate::engine::backend::ProbeShape::GuidedChoiceCompletion => {
-            decode_verdict(val, reject_margin)
+            decode_verdict_with_margin(val, reject_margin)
         }
         crate::engine::backend::ProbeShape::JsonSchemaChat => {
             let choice = &val["choices"][0];
@@ -316,9 +372,22 @@ fn decode_probe_response(
                 ]),
                 _ => return Err("dispatch gate verdict must be ADMIT or OVERLOADED".into()),
             };
-            Ok(decode_chat_logprobs(choice, reject_margin).unwrap_or(discrete))
+            Ok(
+                match decode_chat_logprobs_with_margin(choice, reject_margin) {
+                    Some((v, m)) => (v, Some(m)),
+                    None => (discrete, None),
+                },
+            )
         }
     }
+}
+
+fn decode_probe_response(
+    probe_shape: crate::engine::backend::ProbeShape,
+    val: &serde_json::Value,
+    reject_margin: f64,
+) -> Result<DgiVerdict, String> {
+    decode_probe_response_with_margin(probe_shape, val, reject_margin).map(|(v, _)| v)
 }
 
 /// Query the serving engine for a single-token logit probe.
@@ -362,19 +431,14 @@ pub async fn evaluate_model_probe(
 }
 
 /// Query the configured serving engine using its capability-selected probe
-/// format, retrying once on transient socket/5xx blips before failing fast.
-pub async fn evaluate_configured_model_probe(
+/// format, returning both the binary verdict and raw log-odds margin for telemetry.
+pub async fn evaluate_configured_model_probe_with_metrics(
     config: &crate::config::Config,
     prompt: &str,
     http: &reqwest::Client,
-) -> Result<DgiVerdict, String> {
+) -> Result<DgiEvaluation, String> {
     use crate::engine::backend::{Backend, ProbeShape, api_url};
     let model = config.model.as_deref().ok_or("missing model in config")?;
-    // Route on the engine's probe_shape capability (the single source of truth
-    // for the wire format) rather than on one backend's identity: any serving
-    // engine that advertises GuidedChoiceCompletion takes the single-token
-    // /completions path, and any that advertises JsonSchemaChat takes the
-    // schema-constrained chat decode.
     let shape = Backend::from_config(config).probe_shape();
     let url = match shape {
         ProbeShape::GuidedChoiceCompletion => api_url(config, "completions")?,
@@ -407,7 +471,13 @@ pub async fn evaluate_configured_model_probe(
                 }
                 let val: serde_json::Value = serde_json::from_str(&body)
                     .map_err(|e| format!("malformed probe response: {e}"))?;
-                return decode_probe_response(shape, &val, config.dgi_reject_margin);
+                let (verdict, margin) =
+                    decode_probe_response_with_margin(shape, &val, config.dgi_reject_margin)?;
+                return Ok(DgiEvaluation {
+                    verdict,
+                    margin,
+                    source: "probe",
+                });
             }
             Err(e) if attempt == 0 => {
                 attempt += 1;
@@ -419,9 +489,22 @@ pub async fn evaluate_configured_model_probe(
     }
 }
 
-/// Warm-session bypass: a session that already has a non-empty persisted
-/// message history is a *continuation*, not a fresh dispatch, so it cannot
-/// be a newly-sprayed monolithic mega-prompt — admit it without probing.
+/// Query the configured serving engine using its capability-selected probe
+/// format, retrying once on transient socket/5xx blips before failing fast.
+pub async fn evaluate_configured_model_probe(
+    config: &crate::config::Config,
+    prompt: &str,
+    http: &reqwest::Client,
+) -> Result<DgiVerdict, String> {
+    evaluate_configured_model_probe_with_metrics(config, prompt, http)
+        .await
+        .map(|eval| eval.verdict)
+}
+
+/// Warm-session bypass: a session that already contains at least one prior
+/// `assistant` turn in its persisted `messages.json` is a *continuation*,
+/// not a fresh dispatch — admit it without probing. Empty arrays (`[]`) or
+/// user-only crash stubs never bypass DGI.
 pub fn warm_session_bypass(
     config: &crate::config::Config,
     state: &crate::state::StateDir,
@@ -431,9 +514,14 @@ pub fn warm_session_bypass(
         return false;
     }
     let path = state.sessions().join(session_id).join("messages.json");
-    std::fs::metadata(&path)
-        .map(|m| m.len() > 0)
-        .unwrap_or(false)
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(msgs) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) else {
+        return false;
+    };
+    msgs.iter()
+        .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
 }
 
 #[cfg(test)]
@@ -570,12 +658,26 @@ mod tests {
 
         // Disabled flag → never bypasses.
         config.dgi_bypass_warm_session = false;
-        std::fs::write(sess_dir.join("messages.json"), "[]").unwrap();
+        std::fs::write(
+            sess_dir.join("messages.json"),
+            r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"}]"#,
+        )
+        .unwrap();
         assert!(!warm_session_bypass(&config, &state, sid));
 
-        // Enabled, file exists and non-empty → bypass.
+        // Enabled, has prior assistant turn → bypass.
         config.dgi_bypass_warm_session = true;
         assert!(warm_session_bypass(&config, &state, sid));
+
+        // Enabled, empty JSON array or user-only history → no bypass.
+        std::fs::write(sess_dir.join("messages.json"), "[]").unwrap();
+        assert!(!warm_session_bypass(&config, &state, sid));
+        std::fs::write(
+            sess_dir.join("messages.json"),
+            r#"[{"role":"user","content":"hi"}]"#,
+        )
+        .unwrap();
+        assert!(!warm_session_bypass(&config, &state, sid));
 
         // Enabled, file empty → no bypass.
         std::fs::write(sess_dir.join("messages.json"), "").unwrap();
@@ -586,6 +688,17 @@ mod tests {
         assert!(!warm_session_bypass(&config, &state, sid));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_margin_rejects_whenever_overloaded_beats_admit() {
+        let top = json!({
+            "OVER": -0.2882,
+            "AD": -1.5382,
+            "ADM": -3.5382
+        });
+        assert!(verdict_from_logprobs(&top, 0.0).unwrap().is_reject());
+        assert_eq!(verdict_from_logprobs(&top, 1.2).unwrap(), DgiVerdict::Admit);
     }
 
     async fn probe_server(response: serde_json::Value) -> (String, reqwest::Client) {
