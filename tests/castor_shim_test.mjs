@@ -244,7 +244,7 @@ test("pruneStaleCaches removes older v* dirs while keeping current version and n
 
 test("node bin/castor.js --help executes against the existing local binary", () => {
   const version = readPackageVersion(path.join(REPO_ROOT, "package.json"));
-  assert.equal(version, "1.5.0");
+  assert.equal(version, "1.6.0");
 
   const tmpState = makeTmpDir("castor-help-state-");
   try {
